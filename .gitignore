@@ -1,0 +1,19 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Python virtualenv
+.venv/
+
+# Server runtime directories
+server/uploads/
+server/preserved/
+server/outputs/
+
+# RealESRGAN model weights (large binary)
+server/scripts/*.pth

@@ -1,0 +1,6 @@
+{
+  "name": "Chromy",
+  "description": "An interactive karyotype assembly tool for cytogeneticists to learn and practice chromosome identification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
