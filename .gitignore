@@ -15,5 +15,5 @@ coverage/
 # server/preserved/
 # server/outputs/
 
-# RealESRGAN model weights (large binary)
-server/scripts/*.pth
+# # RealESRGAN model weights (large binary)
+# server/scripts/*.pth
