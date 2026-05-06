@@ -10,10 +10,10 @@ coverage/
 # Python virtualenv
 .venv/
 
-# Server runtime directories
-server/uploads/
-server/preserved/
-server/outputs/
+# # Server runtime directories
+# server/uploads/
+# server/preserved/
+# server/outputs/
 
 # RealESRGAN model weights (large binary)
 server/scripts/*.pth

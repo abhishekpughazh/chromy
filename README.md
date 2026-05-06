@@ -1,20 +1,60 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Chromy
 
-# Run and deploy your AI Studio app
+An interactive karyotype assembly tool for cytogeneticists to learn and practice chromosome identification.
 
-This contains everything you need to run your app locally.
+## Prerequisites
 
-View your app in AI Studio: https://ai.studio/apps/0b187680-a18a-455e-b6bc-ffbcd553302a
+- [Node.js](https://nodejs.org/) (v18+)
+- [Python](https://www.python.org/) 3.12+
 
-## Run Locally
+## Setup
 
-**Prerequisites:**  Node.js
+### 1. Clone the repo
 
+```bash
+git clone https://repos.roswellpark.org/ab55604/chromy_v1.git
+cd chromy_v1
+```
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+### 2. Install Node dependencies
+
+```bash
+npm install
+```
+
+### 3. Set up the Python environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # macOS/Linux
+# .venv\Scripts\activate         # Windows
+
+pip install torch Pillow realesrgan basicsr opencv-python numpy
+```
+
+### 4. Download RealESRGAN weights
+
+Download `RealESRGAN_x4plus.pth` and place it in `server/scripts/`:
+
+```bash
+curl -L -o server/scripts/RealESRGAN_x4plus.pth \
+  https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+```
+
+> The weights file is ~67MB and is not included in the repository.
+
+### 5. Run the app
+
+In one terminal, start the backend:
+
+```bash
+npm run server
+```
+
+In a second terminal, start the frontend:
+
+```bash
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) in your browser.
