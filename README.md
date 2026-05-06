@@ -32,18 +32,7 @@ source .venv/bin/activate        # macOS/Linux
 pip install torch Pillow realesrgan basicsr opencv-python numpy
 ```
 
-### 4. Download RealESRGAN weights
-
-Download `RealESRGAN_x4plus.pth` and place it in `server/scripts/`:
-
-```bash
-curl -L -o server/scripts/RealESRGAN_x4plus.pth \
-  https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
-```
-
-> The weights file is ~67MB and is not included in the repository.
-
-### 5. Run the app
+### 4. Run the app
 
 In one terminal, start the backend:
 
