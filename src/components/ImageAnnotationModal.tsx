@@ -14,7 +14,7 @@ interface Stroke {
 }
 
 const BASE_CHROMOSOMES = Array.from({length: 22}, (_, i) => String(i+1)).concat(['X', 'Y']);
-const ALL_LABELS = BASE_CHROMOSOMES.flatMap(chr => [`${chr}-1`, `${chr}-2`]);
+const ALL_LABELS = BASE_CHROMOSOMES.flatMap(chr => [`${chr}L`, `${chr}R`]);
 
 interface ImageAnnotationModalProps {
   imageUrl: string;
@@ -65,7 +65,19 @@ function xmlToStrokes(xmlText: string): Stroke[] | null {
   }
 }
 
-const OrientationDialog = ({ stroke, img, onComplete }: { stroke: Stroke, img: HTMLImageElement, onComplete: (updates: Partial<Stroke>) => void }) => {
+const OrientationDialog = ({ 
+  stroke, 
+  img, 
+  onComplete,
+  onEdit,
+  onRedo
+}: { 
+  stroke: Stroke, 
+  img: HTMLImageElement, 
+  onComplete: (updates: Partial<Stroke>) => void,
+  onEdit: () => void,
+  onRedo: () => void
+}) => {
   const [rotation, setRotation] = useState(stroke.rotation || 0);
   const [flipX, setFlipX] = useState(stroke.flipX || false);
   const [flipY, setFlipY] = useState(stroke.flipY || false);
@@ -151,16 +163,41 @@ const OrientationDialog = ({ stroke, img, onComplete }: { stroke: Stroke, img: H
           </button>
         </div>
 
-        <button
-          onClick={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            onComplete({ rotation, flipX, flipY });
-          }}
-          className="w-full py-4 bg-sky-500 text-white rounded-xl font-black text-lg hover:bg-sky-600 hover:-translate-y-0.5 active:translate-y-0 transition-all shadow-lg shadow-sky-500/30"
-        >
-          Save Orientation
-        </button>
+        <div className="flex flex-col gap-3 w-full">
+          <button
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onComplete({ rotation, flipX, flipY });
+            }}
+            className="w-full py-4 bg-sky-500 text-white rounded-xl font-black text-lg hover:bg-sky-600 hover:-translate-y-0.5 active:translate-y-0 transition-all shadow-lg shadow-sky-500/30"
+          >
+            Save Orientation
+          </button>
+          
+          <div className="flex gap-3 w-full">
+            <button
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onEdit();
+              }}
+              className="flex-1 py-3 bg-white border-2 border-slate-200 text-slate-700 rounded-xl font-bold hover:border-slate-300 transition-colors"
+            >
+              Edit Points
+            </button>
+            <button
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onRedo();
+              }}
+              className="flex-1 py-3 bg-white border-2 border-red-200 text-red-600 rounded-xl font-bold hover:bg-red-50 transition-colors"
+            >
+              Redo Shape
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -202,7 +239,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
 
   const [currentStroke, setCurrentStroke] = useState<Stroke | null>(null);
   const [color, setColor] = useState('#ef4444');
-  const [lineWidth, setLineWidth] = useState(2);
+  const [lineWidth, setLineWidth] = useState(1);
   const [imgSize, setImgSize] = useState({ width: 0, height: 0 });
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
@@ -211,7 +248,8 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
 
   const [showLabels, setShowLabels] = useState(true);
   const [mode, setMode] = useState<Mode>('draw');
-  const [activeLabel, setActiveLabel] = useState<string>('1-1');
+  const [drawStyle, setDrawStyle] = useState<'polygon' | 'freehand'>('polygon');
+  const [activeLabel, setActiveLabel] = useState<string>('1L');
   const [selectedStrokeId, setSelectedStrokeId] = useState<string | null>(null);
   const [orientingStrokeId, setOrientingStrokeId] = useState<string | null>(null);
   const [draggedPoint, setDraggedPoint] = useState<{ strokeId: string, index: number } | null>(null);
@@ -295,7 +333,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
         const cx = (minX + maxX) / 2;
         const cy = (minY + maxY) / 2;
 
-        const fontSize = Math.max(16, canvas.width * 0.015);
+        const fontSize = Math.max(10, canvas.width * 0.008);
         ctx.font = `bold ${fontSize}px sans-serif`;
         const text = stroke.label;
         const metrics = ctx.measureText(text);
@@ -365,7 +403,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
     gestureRef.current.drawStroke = null;
     pointersRef.current.clear();
     setShowLabels(true);
-    setActiveLabel('1-1');
+    setActiveLabel('1L');
   }, [imageId]);
 
   useEffect(() => {
@@ -521,26 +559,76 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
 
       if (mode === 'draw') {
         setSelectedStrokeId(null); // Deselect if drawing
-        if (currentStroke) {
-          const first = currentStroke.points[0];
-          const dist = Math.hypot(p.x - first.x, p.y - first.y) * scale;
-          if (dist < 20 && currentStroke.points.length >= 2) {
-            const newStroke = currentStroke;
-            const newStrokes = [...strokes, newStroke];
-            setStrokes(newStrokes);
-            setCurrentStroke(null);
-            setPreviewPoint(null);
-            const used = new Set(newStrokes.map(s => s.label));
-            const next = ALL_LABELS.find(l => !used.has(l));
-            if (next) setActiveLabel(next);
-            
-            setOrientingStrokeId(newStroke.id);
+        
+        if (!currentStroke) {
+          for (let i = strokes.length - 1; i >= 0; i--) {
+            const s = strokes[i];
+            if (isPointInPolygon(p, s.points)) {
+              setMode('edit');
+              setSelectedStrokeId(s.id);
+              return;
+            }
+            const edgeRadius = 5 / scale;
+            let onEdge = false;
+            for (let j = 0; j < s.points.length; j++) {
+              const p1 = s.points[j];
+              const p2 = s.points[(j + 1) % s.points.length];
+              if (distToSegment(p, p1, p2) <= edgeRadius) {
+                onEdge = true;
+                break;
+              }
+            }
+            if (onEdge) {
+              setMode('edit');
+              setSelectedStrokeId(s.id);
+              return;
+            }
+          }
+        }
+
+        if (drawStyle === 'freehand') {
+          if (gestureRef.current.type === 'draw' && currentStroke) {
+            if (currentStroke.points.length > 2) {
+              const newStroke = currentStroke;
+              const newStrokes = [...strokes, newStroke];
+              setStrokes(newStrokes);
+              setCurrentStroke(null);
+              setPreviewPoint(null);
+              const used = new Set(newStrokes.map(s => s.label));
+              const next = ALL_LABELS.find(l => !used.has(l));
+              if (next) setActiveLabel(next);
+              setOrientingStrokeId(newStroke.id);
+            } else {
+              setCurrentStroke(null);
+              setPreviewPoint(null);
+            }
+            gestureRef.current.type = null;
           } else {
-            setCurrentStroke({ ...currentStroke, points: [...currentStroke.points, p] });
+            const id = `stroke-${Date.now()}-${Math.random()}`;
+            setCurrentStroke({ id, points: [p], color, width: lineWidth, label: activeLabel });
+            gestureRef.current.type = 'draw';
           }
         } else {
-          const id = `stroke-${Date.now()}-${Math.random()}`;
-          setCurrentStroke({ id, points: [p], color, width: lineWidth, label: activeLabel });
+          if (currentStroke) {
+            const first = currentStroke.points[0];
+            const dist = Math.hypot(p.x - first.x, p.y - first.y) * scale;
+            if (dist < 20 && currentStroke.points.length >= 2) {
+              const newStroke = currentStroke;
+              const newStrokes = [...strokes, newStroke];
+              setStrokes(newStrokes);
+              setCurrentStroke(null);
+              setPreviewPoint(null);
+              const used = new Set(newStrokes.map(s => s.label));
+              const next = ALL_LABELS.find(l => !used.has(l));
+              if (next) setActiveLabel(next);
+              setOrientingStrokeId(newStroke.id);
+            } else {
+              setCurrentStroke({ ...currentStroke, points: [...currentStroke.points, p] });
+            }
+          } else {
+            const id = `stroke-${Date.now()}-${Math.random()}`;
+            setCurrentStroke({ id, points: [p], color, width: lineWidth, label: activeLabel });
+          }
         }
       }
     }
@@ -548,6 +636,38 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
 
   const handlePointerMove = (e: React.PointerEvent) => {
     if (mode === 'draw') {
+      if (drawStyle === 'freehand' && gestureRef.current.type === 'draw' && currentStroke) {
+        const p = toCanvasPoint(e.clientX, e.clientY);
+        if (p) {
+          const newPoints = [...currentStroke.points, p];
+          const first = newPoints[0];
+          const dist = Math.hypot(p.x - first.x, p.y - first.y) * scale;
+          
+          let hasLeftOrigin = false;
+          for (let i = 1; i < newPoints.length; i++) {
+            if (Math.hypot(newPoints[i].x - first.x, newPoints[i].y - first.y) * scale > 30) {
+              hasLeftOrigin = true;
+              break;
+            }
+          }
+
+          if (dist < 20 && newPoints.length > 10 && hasLeftOrigin) {
+            const newStroke = { ...currentStroke, points: newPoints };
+            const newStrokes = [...strokes, newStroke];
+            setStrokes(newStrokes);
+            setCurrentStroke(null);
+            setPreviewPoint(null);
+            gestureRef.current.type = null;
+            const used = new Set(newStrokes.map(s => s.label));
+            const next = ALL_LABELS.find(l => !used.has(l));
+            if (next) setActiveLabel(next);
+            setOrientingStrokeId(newStroke.id);
+          } else {
+            setCurrentStroke({ ...currentStroke, points: newPoints });
+          }
+        }
+        return;
+      }
       setPreviewPoint(toCanvasPoint(e.clientX, e.clientY));
     }
 
@@ -603,7 +723,9 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
       setDraggedPoint(null);
     }
     if (pointersRef.current.size === 0) {
-      gestureRef.current.type = null;
+      if (!(mode === 'draw' && drawStyle === 'freehand')) {
+        gestureRef.current.type = null;
+      }
     }
   };
 
@@ -614,11 +736,13 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
       setStrokes(newStrokes);
       setCurrentStroke(null);
       setPreviewPoint(null);
+      gestureRef.current.type = null;
       const used = new Set(newStrokes.map(s => s.label));
       const next = ALL_LABELS.find(l => !used.has(l));
       if (next) setActiveLabel(next);
-      
       setOrientingStrokeId(newStroke.id);
+    } else if (mode === 'edit' && selectedStrokeId) {
+      setOrientingStrokeId(selectedStrokeId);
     }
   };
 
@@ -627,6 +751,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
       if (currentStroke.points.length === 1) {
         setCurrentStroke(null);
         setPreviewPoint(null);
+        gestureRef.current.type = null;
       } else {
         setCurrentStroke({ ...currentStroke, points: currentStroke.points.slice(0, -1) });
       }
@@ -640,6 +765,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
     setCurrentStroke(null);
     setPreviewPoint(null);
     setSelectedStrokeId(null);
+    gestureRef.current.type = null;
   };
 
   const deleteSelected = () => {
@@ -773,19 +899,35 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
             <div className="h-6 w-px bg-slate-300 mx-1" />
 
             <button
-              onClick={() => { setMode('draw'); setSelectedStrokeId(null); }}
+              onClick={() => { setMode('draw'); setSelectedStrokeId(null); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
               className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold transition-colors ${mode === 'draw' ? 'bg-slate-900 text-white' : 'bg-slate-200 text-slate-600 hover:bg-slate-300'}`}
             >
               <PenLine className="w-3.5 h-3.5" /> Draw
             </button>
+            {mode === 'draw' && (
+              <div className="flex bg-slate-200 p-0.5 rounded-lg ml-1">
+                <button
+                  onClick={() => { setDrawStyle('polygon'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
+                  className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${drawStyle === 'polygon' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                >
+                  Polygon
+                </button>
+                <button
+                  onClick={() => { setDrawStyle('freehand'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
+                  className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${drawStyle === 'freehand' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                >
+                  Freehand
+                </button>
+              </div>
+            )}
             <button
-              onClick={() => setMode('edit')}
+              onClick={() => { setMode('edit'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
               className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold transition-colors ${mode === 'edit' ? 'bg-slate-900 text-white' : 'bg-slate-200 text-slate-600 hover:bg-slate-300'}`}
             >
               <MousePointer2 className="w-3.5 h-3.5" /> Edit
             </button>
             <button
-              onClick={() => setMode('pan')}
+              onClick={() => { setMode('pan'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
               className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold transition-colors ${mode === 'pan' ? 'bg-slate-900 text-white' : 'bg-slate-200 text-slate-600 hover:bg-slate-300'}`}
             >
               <Hand className="w-3.5 h-3.5" /> Pan
@@ -817,9 +959,14 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
 
           <div className="flex items-center gap-2">
             {selectedStrokeId && (
-              <button onClick={deleteSelected} className="p-2 hover:bg-red-100 rounded-full transition-colors text-red-500" title="Delete Selected">
-                <Trash2 className="w-4 h-4" />
-              </button>
+              <>
+                <button onClick={() => setOrientingStrokeId(selectedStrokeId)} className="p-2 hover:bg-sky-100 rounded-full transition-colors text-sky-500" title="Adjust Orientation">
+                  <RotateCw className="w-4 h-4" />
+                </button>
+                <button onClick={deleteSelected} className="p-2 hover:bg-red-100 rounded-full transition-colors text-red-500" title="Delete Selected">
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </>
             )}
             <button onClick={undoLast} className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500" title="Undo last stroke">
               <Undo2 className="w-4 h-4" />
@@ -914,7 +1061,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
                   <div key={chr} className="flex items-center justify-between p-2 bg-white border border-slate-200 rounded-lg">
                     <span className="font-black text-slate-700 w-12 text-center text-lg">{chr}</span>
                     <div className="flex gap-2">
-                      {[`${chr}-1`, `${chr}-2`].map(lbl => {
+                      {[`${chr}L`, `${chr}R`].map(lbl => {
                         const isUsed = strokes.some(s => s.label === lbl && s.id !== selectedStrokeId);
                         const isSelected = currentDisplayLabel === lbl;
                         return (
@@ -928,7 +1075,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
                               "bg-white text-slate-600 border-2 border-slate-200 hover:border-sky-300 hover:text-sky-600"
                             }`}
                           >
-                            {lbl.split('-')[1]}
+                            {lbl.slice(-1)}
                           </button>
                         );
                       })}
@@ -943,16 +1090,19 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
                 >
                   Unassigned
                 </button>
-                {mode === 'edit' && selectedStrokeId && (
-                  <button
-                    onClick={() => setOrientingStrokeId(selectedStrokeId)}
-                    className="mt-2 py-3 rounded-lg font-bold text-sm bg-slate-900 text-white hover:bg-slate-800 transition-colors shadow-lg shadow-slate-900/20"
-                  >
-                    Adjust Orientation
-                  </button>
-                )}
               </div>
             </div>
+            {mode === 'edit' && selectedStrokeId && (
+              <div className="p-4 border-t border-slate-200 bg-white shadow-[0_-4px_10px_rgba(0,0,0,0.02)]">
+                <button
+                  onClick={() => setOrientingStrokeId(selectedStrokeId)}
+                  className="w-full py-3 rounded-lg font-bold text-sm bg-sky-500 text-white hover:bg-sky-600 transition-colors shadow-lg shadow-sky-500/30 flex items-center justify-center gap-2"
+                >
+                  <RotateCw className="w-5 h-5" />
+                  Adjust Orientation
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -972,6 +1122,15 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
           img={imgRef.current}
           onComplete={(updates) => {
             setStrokes(prev => prev.map(s => s.id === orientingStrokeId ? { ...s, ...updates } : s));
+            setOrientingStrokeId(null);
+          }}
+          onEdit={() => {
+            setMode('edit');
+            setSelectedStrokeId(orientingStrokeId);
+            setOrientingStrokeId(null);
+          }}
+          onRedo={() => {
+            setStrokes(prev => prev.filter(s => s.id !== orientingStrokeId));
             setOrientingStrokeId(null);
           }}
         />

@@ -96,7 +96,7 @@ const createInitialChromosomes = (): ChromosomeData[] => {
 
 // --- Components ---
 
-const ChromosomeVisual = ({ chromosome, className, isDragging = false }: { chromosome: ChromosomeData, className?: string, isDragging?: boolean }) => {
+const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewing = false }: { chromosome: ChromosomeData, className?: string, isDragging?: boolean, isReviewing?: boolean }) => {
   if (chromosome.imageUrl) {
     const rot = chromosome.userRotation || 0;
     const fx = chromosome.userFlipX ? -1 : 1;
@@ -113,14 +113,17 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false }: { chrom
       >
         <img 
           src={chromosome.imageUrl} 
-          className="max-h-full max-w-[40px] object-contain drop-shadow-md filter transition-all group-hover:drop-shadow-lg"
+          className={cn(
+            "max-h-full max-w-[40px] object-contain transition-all print:!drop-shadow-none print:!filter-none",
+            !isReviewing && "drop-shadow-md filter group-hover:drop-shadow-lg"
+          )}
           draggable={false}
           alt={chromosome.type}
           style={{ transform: `rotate(${rot}deg) scaleX(${fx}) scaleY(${fy})` }}
         />
-        {!isDragging && (
-          <div className="absolute -bottom-5 text-[10px] font-mono text-slate-400 opacity-0 hover:opacity-100 transition-opacity">
-            {chromosome.id.split('-').slice(1, 3).join('-')}
+        {!isDragging && !isReviewing && (
+          <div className="absolute -bottom-5 text-[10px] font-mono text-slate-400 opacity-0 hover:opacity-100 transition-opacity print:hidden">
+            {chromosome.type + (chromosome.indexInPair === 0 ? 'L' : 'R')}
           </div>
         )}
       </div>
@@ -137,9 +140,12 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false }: { chrom
       style={{ height: `${chromosome.size * 100}px`, width: '24px' }}
     >
       {/* Centromere/Structure */}
-      <div className="absolute top-1/3 left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-slate-900 z-10" />
+      <div className={cn("absolute top-1/3 left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-slate-900 z-10 print:!border-none", isReviewing && "hidden")} />
       
-      <div className="flex flex-col w-4 h-full rounded-full border-2 border-slate-800 bg-slate-100 overflow-hidden shadow-sm">
+      <div className={cn(
+        "flex flex-col w-4 h-full rounded-full bg-slate-100 overflow-hidden print:!border-none print:!shadow-none",
+        !isReviewing ? "border-2 border-slate-800 shadow-sm" : "border-none shadow-none"
+      )}>
         {chromosome.banding.map((width, i) => (
           <div 
             key={i} 
@@ -149,8 +155,8 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false }: { chrom
         ))}
       </div>
       
-      {!isDragging && (
-        <div className="absolute -bottom-5 text-[10px] font-mono text-slate-400 opacity-0 hover:opacity-100 transition-opacity">
+      {!isDragging && !isReviewing && (
+        <div className="absolute -bottom-5 text-[10px] font-mono text-slate-400 opacity-0 hover:opacity-100 transition-opacity print:hidden">
           {chromosome.id}
         </div>
       )}
@@ -158,7 +164,7 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false }: { chrom
   );
 };
 
-const DraggableChromosome = ({ id, chromosome, onUpdate }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void }) => {
+const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void, isReviewing?: boolean }) => {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id,
     data: chromosome,
@@ -171,10 +177,10 @@ const DraggableChromosome = ({ id, chromosome, onUpdate }: { id: string, chromos
   return (
     <div className="relative group/chrom">
       <div ref={setNodeRef} style={style} {...listeners} {...attributes} className="z-10">
-        <ChromosomeVisual chromosome={chromosome} isDragging={isDragging} />
+        <ChromosomeVisual chromosome={chromosome} isDragging={isDragging} isReviewing={isReviewing} />
       </div>
-      {onUpdate && chromosome.imageUrl && !isDragging && (
-        <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-white border border-slate-200 shadow-lg rounded-lg p-1 flex gap-1 z-50 opacity-0 group-hover/chrom:opacity-100 transition-opacity cursor-default">
+      {onUpdate && chromosome.imageUrl && !isDragging && !isReviewing && (
+        <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-white border border-slate-200 shadow-lg rounded-lg p-1 flex gap-1 z-50 opacity-0 group-hover/chrom:opacity-100 transition-opacity cursor-default print:hidden">
           <button onClick={(e) => { e.stopPropagation(); onUpdate(id, { userRotation: ((chromosome.userRotation || 0) + 45) % 360 }) }} className="p-1 hover:bg-slate-100 rounded text-slate-600"><RotateCw className="w-3 h-3" /></button>
           <button onClick={(e) => { e.stopPropagation(); onUpdate(id, { userFlipX: !chromosome.userFlipX }) }} className="p-1 hover:bg-slate-100 rounded text-slate-600"><FlipHorizontal className="w-3 h-3" /></button>
           <button onClick={(e) => { e.stopPropagation(); onUpdate(id, { userFlipY: !chromosome.userFlipY }) }} className="p-1 hover:bg-slate-100 rounded text-slate-600"><FlipVertical className="w-3 h-3" /></button>
@@ -184,7 +190,7 @@ const DraggableChromosome = ({ id, chromosome, onUpdate }: { id: string, chromos
   );
 };
 
-const DroppableSlot = ({ id, acceptType, children, isOccupied, state }: { id: string, acceptType: ChromosomeType, children?: React.ReactNode, isOccupied?: boolean, state: 'empty' | 'wrong' | 'type-correct' | 'fully-correct' }) => {
+const DroppableSlot = ({ id, acceptType, children, isOccupied, state, isReviewing }: { id: string, acceptType: ChromosomeType, children?: React.ReactNode, isOccupied?: boolean, state: 'empty' | 'wrong' | 'type-correct' | 'fully-correct', isReviewing?: boolean }) => {
   const { setNodeRef, isOver } = useDroppable({
     id,
     data: { acceptType }
@@ -193,21 +199,22 @@ const DroppableSlot = ({ id, acceptType, children, isOccupied, state }: { id: st
   return (
     <motion.div 
       ref={setNodeRef}
-      animate={isOccupied && state === 'fully-correct' ? { scale: [1, 1.05, 1], borderColor: ["#10b981", "#10b981"] } : {}}
+      animate={!isReviewing && isOccupied && state === 'fully-correct' ? { scale: [1, 1.05, 1] } : { scale: 1 }}
       transition={{ duration: 0.3 }}
       className={cn(
-        "w-8 h-24 border-2 border-dashed rounded-lg flex items-center justify-center transition-all duration-200 relative group/slot",
-        isOver ? "border-sky-500 bg-sky-50 scale-105" : "border-slate-200 bg-slate-50/50",
-        isOccupied && state === 'wrong' ? "border-solid border-slate-300 bg-white" : "",
-        isOccupied && state === 'type-correct' ? "border-amber-400 bg-amber-50/30 shadow-[0_0_15px_rgba(251,191,36,0.1)] border-solid" : "",
-        isOccupied && state === 'fully-correct' ? "border-emerald-500 bg-emerald-50/30 shadow-[0_0_15px_rgba(16,185,129,0.1)] border-solid" : ""
+        "w-8 h-24 flex items-center justify-center transition-all duration-200 relative group/slot print:!border-none print:!bg-transparent print:!shadow-none",
+        isReviewing ? "bg-transparent" : "border-2 border-dashed rounded-lg",
+        !isReviewing && (isOver ? "border-sky-500 bg-sky-50 scale-105" : "border-slate-200 bg-slate-50/50"),
+        !isReviewing && isOccupied && state === 'wrong' ? "border-solid border-slate-300 bg-white" : "",
+        !isReviewing && isOccupied && state === 'type-correct' ? "border-amber-400 bg-amber-50/30 shadow-[0_0_15px_rgba(251,191,36,0.1)] border-solid" : "",
+        !isReviewing && isOccupied && state === 'fully-correct' ? "border-emerald-500 bg-emerald-50/30 shadow-[0_0_15px_rgba(16,185,129,0.1)] border-solid" : ""
       )}
     >
-      {isOccupied && state === 'fully-correct' && (
+      {!isReviewing && isOccupied && state === 'fully-correct' && (
         <motion.div 
           initial={{ opacity: 0, scale: 0 }}
           animate={{ opacity: 1, scale: 1 }}
-          className="absolute -top-1 -right-1 w-3 h-3 bg-emerald-500 rounded-full flex items-center justify-center z-20 shadow-sm border border-white"
+          className="absolute -top-1 -right-1 w-3 h-3 bg-emerald-500 rounded-full flex items-center justify-center z-20 shadow-sm border border-white print:hidden"
         >
           <CheckCircle2 className="w-2 h-2 text-white stroke-[4px]" />
         </motion.div>
@@ -226,9 +233,10 @@ interface KaryotypePairProps {
   type: ChromosomeType;
   placedChromosomes: Record<string, ChromosomeData>;
   onUpdateChromosome: (slotId: string, updates: Partial<ChromosomeData>) => void;
+  isReviewing?: boolean;
 }
 
-const KaryotypePair: React.FC<KaryotypePairProps> = ({ type, placedChromosomes, onUpdateChromosome }) => {
+const KaryotypePair: React.FC<KaryotypePairProps> = ({ type, placedChromosomes, onUpdateChromosome, isReviewing }) => {
   const slot1Id = `slot-${type}-0`;
   const slot2Id = `slot-${type}-1`;
   
@@ -258,18 +266,18 @@ const KaryotypePair: React.FC<KaryotypePairProps> = ({ type, placedChromosomes, 
   const state2 = getSlotState(chrom2, 1);
 
   return (
-    <div className="flex flex-col items-center gap-2 p-3 rounded-xl hover:bg-slate-100/50 transition-colors group">
+    <div className={cn("flex flex-col items-center gap-2 p-3 rounded-xl transition-colors group", !isReviewing && "hover:bg-slate-100/50")}>
       <div className="flex gap-1">
-        <DroppableSlot id={slot1Id} acceptType={type} isOccupied={isOccupied1} state={state1}>
-          {chrom1 && <DraggableChromosome id={chrom1.id} chromosome={chrom1} onUpdate={(id, updates) => onUpdateChromosome(slot1Id, updates)} />}
+        <DroppableSlot id={slot1Id} acceptType={type} isOccupied={isOccupied1} state={state1} isReviewing={isReviewing}>
+          {chrom1 && <DraggableChromosome id={chrom1.id} chromosome={chrom1} onUpdate={(id, updates) => onUpdateChromosome(slot1Id, updates)} isReviewing={isReviewing} />}
         </DroppableSlot>
-        <DroppableSlot id={slot2Id} acceptType={type} isOccupied={isOccupied2} state={state2}>
-          {chrom2 && <DraggableChromosome id={chrom2.id} chromosome={chrom2} onUpdate={(id, updates) => onUpdateChromosome(slot2Id, updates)} />}
+        <DroppableSlot id={slot2Id} acceptType={type} isOccupied={isOccupied2} state={state2} isReviewing={isReviewing}>
+          {chrom2 && <DraggableChromosome id={chrom2.id} chromosome={chrom2} onUpdate={(id, updates) => onUpdateChromosome(slot2Id, updates)} isReviewing={isReviewing} />}
         </DroppableSlot>
       </div>
       <span className={cn(
-        "text-xs font-bold font-mono transition-colors",
-        (isOccupied1 && state1 === 'fully-correct' && isOccupied2 && state2 === 'fully-correct') ? "text-emerald-600" : "text-slate-500 group-hover:text-sky-600"
+        "text-xs font-bold font-mono transition-colors print:!text-slate-900",
+        !isReviewing && (isOccupied1 && state1 === 'fully-correct' && isOccupied2 && state2 === 'fully-correct') ? "text-emerald-600" : (!isReviewing ? "text-slate-500 group-hover:text-sky-600" : "text-slate-900")
       )}>
         {type}
       </span>
@@ -295,13 +303,26 @@ const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin }) => (
       <motion.div
          initial={{ scale: 0.8, y: 20 }}
          animate={{ scale: 1, y: 0 }}
-         className="w-20 h-20 bg-slate-900 rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-2xl"
+         className="flex items-center justify-center mx-auto mb-8 relative"
       >
-        <Dna className="w-10 h-10 text-white" />
+        <motion.img 
+          src="/logo.png" 
+          alt="Chromosome"
+          className="w-32 h-32 object-contain drop-shadow-md"
+          animate={{ 
+            y: [-8, 8, -8],
+            rotate: [-4, 4, -4]
+          }}
+          transition={{ 
+            duration: 4,
+            repeat: Infinity,
+            ease: "easeInOut"
+          }}
+        />
       </motion.div>
       
       <h1 className="text-6xl font-black text-slate-900 tracking-tighter mb-4">
-        CHROMY
+        Chromy.
       </h1>
       <p className="text-slate-500 text-lg mb-12 font-medium tracking-tight">
         An interactive laboratory simulation designed for cytogeneticists to master the art of karyotyping and chromosomal identification.
@@ -365,11 +386,18 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
     strokeEls.forEach((el, idx) => {
       const label = el.getAttribute('label') || 'Unassigned';
       if (label === 'Unassigned') return;
-      const baseLabel = label.split('-')[0];
-      if (!CHROMOSOME_TYPES.includes(baseLabel as ChromosomeType)) return;
+      let baseLabel = '';
+      let indexInPair = 0;
       
-      const pairIndexStr = label.split('-')[1];
-      const indexInPair = pairIndexStr === '2' ? 1 : 0;
+      if (label.includes('-')) {
+        baseLabel = label.split('-')[0];
+        indexInPair = label.split('-')[1] === '2' ? 1 : 0;
+      } else {
+        baseLabel = label.slice(0, -1);
+        indexInPair = label.slice(-1) === 'R' ? 1 : 0;
+      }
+      
+      if (!CHROMOSOME_TYPES.includes(baseLabel as ChromosomeType)) return;
       
       const rotation = parseFloat(el.getAttribute('rotation') || '0');
       const flipX = el.getAttribute('flipX') === 'true';
@@ -837,6 +865,8 @@ export default function Chromy() {
   const [jumbled, setJumbled] = useState<ChromosomeData[]>([]);
   const [placed, setPlaced] = useState<Record<string, ChromosomeData>>({});
   const [history, setHistory] = useState<{ jumbled: ChromosomeData[], placed: Record<string, ChromosomeData> }[]>([]);
+  const [isReviewingCertificate, setIsReviewingCertificate] = useState(false);
+  const [certificateName, setCertificateName] = useState('');
   const [activeId, setActiveId] = useState<string | null>(null);
   const [score, setScore] = useState({ correct: 0, total: 0 });
 
@@ -1042,7 +1072,7 @@ export default function Chromy() {
           onDragEnd={handleDragEnd}
         >
           {/* Header */}
-        <header className="fixed top-0 left-0 right-0 h-16 bg-white border-b border-slate-200 z-50 px-6 flex items-center justify-between">
+        <header className={cn("fixed top-0 left-0 right-0 h-16 bg-white border-b border-slate-200 z-50 px-6 flex items-center justify-between print:hidden", isReviewingCertificate && "hidden")}>
           <div className="flex items-center gap-3 cursor-pointer" onClick={() => setGameState('welcome')}>
             <div className="w-10 h-10 bg-slate-900 rounded-xl flex items-center justify-center text-white">
               <Dna className="w-6 h-6" />
@@ -1096,99 +1126,133 @@ export default function Chromy() {
           </div>
         </header>
 
-        <main className="pt-20 px-6 pb-6 grid grid-cols-1 lg:grid-cols-[1fr_3fr] gap-6 h-[calc(100vh-80px)] overflow-hidden">
+        <main className={cn(
+          "px-6 pb-6 grid gap-6 overflow-hidden print:h-auto print:overflow-visible print:block",
+          isReviewingCertificate ? "pt-6 h-screen grid-cols-1" : "pt-20 h-[calc(100vh-80px)] grid-cols-1 lg:grid-cols-[1fr_3fr]"
+        )}>
           
           {/* Left Panel: Jumbled Source */}
-          <RawSampleDroppable id="raw-sample-panel">
-            <div className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col shadow-sm overflow-hidden bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] h-full">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
-                  <Info className="w-4 h-4" />
-                  Raw Sample
-                </h2>
-                <span className="text-xs font-mono text-slate-400">
-                  {jumbled.length} REMAINING
-                </span>
-              </div>
+          {!isReviewingCertificate && (
+            <RawSampleDroppable id="raw-sample-panel">
+              <div className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col shadow-sm overflow-hidden bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] h-full">
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
+                    <Info className="w-4 h-4" />
+                    Raw Sample
+                  </h2>
+                  <span className="text-xs font-mono text-slate-400">
+                    {jumbled.length} REMAINING
+                  </span>
+                </div>
 
-            {selectedImage && (
-              <div className="w-full h-48 mb-6 rounded-xl overflow-hidden border border-slate-200 relative shrink-0 shadow-sm bg-black group/source">
-                <img 
-                  src={selectedImage.upscaledUrl ?? selectedImage.originalUrl ?? ''} 
-                  alt="Selected Metaphase Spread"
-                  className="w-full h-full object-cover transition-transform duration-500 group-hover/source:scale-105"
-                />
-                <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-transparent opacity-0 group-hover/source:opacity-100 transition-opacity" />
+              {selectedImage && (
+                <div className="w-full h-48 mb-6 rounded-xl overflow-hidden border border-slate-200 relative shrink-0 shadow-sm bg-black group/source">
+                  <img 
+                    src={selectedImage.upscaledUrl ?? selectedImage.originalUrl ?? ''} 
+                    alt="Selected Metaphase Spread"
+                    className="w-full h-full object-cover transition-transform duration-500 group-hover/source:scale-105"
+                  />
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-transparent opacity-0 group-hover/source:opacity-100 transition-opacity" />
+                  
+                  <div className="absolute top-2 left-2 bg-slate-900/80 backdrop-blur text-white text-[10px] font-bold px-2 py-1 rounded shadow-sm">
+                    SOURCE IMAGE
+                  </div>
+
+                  <div className="absolute bottom-2 right-2 flex gap-2 opacity-0 group-hover/source:opacity-100 transition-all translate-y-2 group-hover/source:translate-y-0">
+                    <a
+                      href={selectedImage.upscaledUrl ?? selectedImage.originalUrl ?? ''}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 backdrop-blur border border-white/20 flex items-center justify-center text-white transition-colors"
+                      title="Open Full Size"
+                    >
+                      <Expand className="w-4 h-4" />
+                    </a>
+                    <a
+                      href={selectedImage.upscaledUrl ?? selectedImage.originalUrl ?? ''}
+                      download={`chromy-sample-${selectedImage.id}.png`}
+                      className="w-8 h-8 rounded-lg bg-white text-slate-900 hover:bg-sky-50 flex items-center justify-center transition-colors shadow-lg"
+                      title="Download Source Image"
+                    >
+                      <Download className="w-4 h-4" />
+                    </a>
+                  </div>
+                </div>
+              )}
                 
-                <div className="absolute top-2 left-2 bg-slate-900/80 backdrop-blur text-white text-[10px] font-bold px-2 py-1 rounded shadow-sm">
-                  SOURCE IMAGE
+                <div className="flex-1 overflow-y-auto scrollbar-hide">
+                  <div className="flex flex-wrap gap-4 items-end justify-center">
+                    <AnimatePresence>
+                      {jumbled.length > 0 ? (
+                        jumbled.map((chrom) => (
+                          <motion.div
+                            key={chrom.id}
+                            layoutId={chrom.id}
+                            initial={{ opacity: 0, scale: 0.8 }}
+                            animate={{ opacity: 1, scale: 1 }}
+                            exit={{ opacity: 0, scale: 0.8 }}
+                          >
+                            <DraggableChromosome id={chrom.id} chromosome={chrom} onUpdate={updateJumbled} />
+                          </motion.div>
+                        ))
+                      ) : (
+                        <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-300">
+                          <CheckCircle2 className="w-12 h-12 mb-4 opacity-20" />
+                          <p className="text-sm font-medium">Sample fully processed</p>
+                        </div>
+                      )}
+                    </AnimatePresence>
+                  </div>
                 </div>
 
-                <div className="absolute bottom-2 right-2 flex gap-2 opacity-0 group-hover/source:opacity-100 transition-all translate-y-2 group-hover/source:translate-y-0">
-                  <a
-                    href={selectedImage.upscaledUrl ?? selectedImage.originalUrl ?? ''}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 backdrop-blur border border-white/20 flex items-center justify-center text-white transition-colors"
-                    title="Open Full Size"
-                  >
-                    <Expand className="w-4 h-4" />
-                  </a>
-                  <a
-                    href={selectedImage.upscaledUrl ?? selectedImage.originalUrl ?? ''}
-                    download={`chromy-sample-${selectedImage.id}.png`}
-                    className="w-8 h-8 rounded-lg bg-white text-slate-900 hover:bg-sky-50 flex items-center justify-center transition-colors shadow-lg"
-                    title="Download Source Image"
-                  >
-                    <Download className="w-4 h-4" />
-                  </a>
+                <div className="mt-4 p-4 bg-slate-50 rounded-xl border border-dashed border-slate-200">
+                   <p className="text-[11px] text-slate-500 leading-relaxed italic">
+                     "Drag chromosomes to the diagnostic board. Use the banding patterns and size ratio to identify correct pairings."
+                   </p>
                 </div>
               </div>
-            )}
-              
-              <div className="flex-1 overflow-y-auto scrollbar-hide">
-                <div className="flex flex-wrap gap-4 items-end justify-center">
-                  <AnimatePresence>
-                    {jumbled.length > 0 ? (
-                      jumbled.map((chrom) => (
-                        <motion.div
-                          key={chrom.id}
-                          layoutId={chrom.id}
-                          initial={{ opacity: 0, scale: 0.8 }}
-                          animate={{ opacity: 1, scale: 1 }}
-                          exit={{ opacity: 0, scale: 0.8 }}
-                        >
-                          <DraggableChromosome id={chrom.id} chromosome={chrom} onUpdate={updateJumbled} />
-                        </motion.div>
-                      ))
-                    ) : (
-                      <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-300">
-                        <CheckCircle2 className="w-12 h-12 mb-4 opacity-20" />
-                        <p className="text-sm font-medium">Sample fully processed</p>
-                      </div>
-                    )}
-                  </AnimatePresence>
-                </div>
-              </div>
-
-              <div className="mt-4 p-4 bg-slate-50 rounded-xl border border-dashed border-slate-200">
-                 <p className="text-[11px] text-slate-500 leading-relaxed italic">
-                   "Drag chromosomes to the diagnostic board. Use the banding patterns and size ratio to identify correct pairings."
-                 </p>
-              </div>
-            </div>
-          </RawSampleDroppable>
+            </RawSampleDroppable>
+          )}
 
           {/* Right Panel: Diagnostic Board */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-8 shadow-sm overflow-y-auto">
-             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-x-2 gap-y-8">
-               {CHROMOSOME_TYPES.map((type: ChromosomeType) => (
-                 <KaryotypePair 
-                   key={type} 
-                   type={type} 
-                   placedChromosomes={placed} 
-                   onUpdateChromosome={updatePlaced}
-                 />
+          <div className={cn(
+            "bg-white rounded-2xl border border-slate-200 p-8 shadow-sm overflow-y-auto print:border-none print:shadow-none print:p-0 flex flex-col print:overflow-visible print:h-auto min-h-0", 
+            isReviewingCertificate && "col-span-full border-none shadow-none h-full pb-20"
+          )}>
+             {isReviewingCertificate && (
+               <div className="text-center mb-4 hidden print:block !block shrink-0">
+                 <h1 className="text-4xl font-black text-slate-900 tracking-tighter mb-2">KARYOTYPE DIAGNOSTIC CERTIFICATE</h1>
+                 <p className="text-lg text-slate-500 font-medium">Assembled and verified by <span className="font-black text-slate-800">{certificateName}</span></p>
+                 <div className="w-24 h-1 bg-slate-200 mx-auto mt-4 rounded-full" />
+               </div>
+             )}
+
+             <div className="flex flex-col justify-between flex-1 w-full max-w-6xl mx-auto h-full min-h-0 gap-4 md:gap-6">
+               {[
+                 [['1', '2', '3'], ['4', '5']],
+                 [['6', '7', '8', '9', '10', '11', '12']],
+                 [['13', '14', '15'], ['16', '17', '18']],
+                 [['19', '20'], ['21', '22'], ['X', 'Y']]
+               ].map((rowGroups, rowIdx) => (
+                 <div key={rowIdx} className="flex w-full justify-center items-start gap-8 md:gap-16">
+                   {rowGroups.map((group, groupIdx) => (
+                     <div 
+                       key={groupIdx} 
+                       className="flex gap-2 md:gap-4"
+                     >
+                       {group.map((type: string) => (
+                         <div key={type} className="flex-shrink-0">
+                           <KaryotypePair 
+                             type={type as ChromosomeType} 
+                             placedChromosomes={placed} 
+                             onUpdateChromosome={updatePlaced}
+                             isReviewing={isReviewingCertificate}
+                           />
+                         </div>
+                       ))}
+                     </div>
+                   ))}
+                 </div>
                ))}
              </div>
 
@@ -1196,12 +1260,36 @@ export default function Chromy() {
         </main>
 
         <AnimatePresence>
-          {isComplete && (
+          {isReviewingCertificate && (
+            <motion.div
+              initial={{ y: 100, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: 100, opacity: 0 }}
+              className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[500] bg-white rounded-2xl shadow-2xl border border-slate-200 p-4 flex gap-4 print:hidden"
+            >
+              <button
+                onClick={() => setIsReviewingCertificate(false)}
+                className="px-6 py-3 rounded-xl font-bold text-slate-500 bg-slate-100 hover:bg-slate-200 transition-colors"
+              >
+                BACK
+              </button>
+              <button
+                onClick={() => window.print()}
+                className="px-8 py-3 rounded-xl font-bold text-white bg-emerald-500 hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/20"
+              >
+                PRINT PDF
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {isComplete && !isReviewingCertificate && (
             <motion.div 
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="fixed inset-0 z-[400] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4"
+              className="fixed inset-0 z-[400] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 print:hidden"
             >
               <motion.div 
                 initial={{ scale: 0.9, y: 20 }}
@@ -1214,22 +1302,41 @@ export default function Chromy() {
                 </div>
                 
                 <h3 className="text-3xl font-black text-emerald-900 mt-10 mb-3">{successPhrase}</h3>
-                <p className="text-slate-500 text-lg mb-10 leading-relaxed font-medium">
+                <p className="text-slate-500 text-lg mb-6 leading-relaxed font-medium">
                   The karyotype has been successfully assembled. All chromosomal pairs are correctly aligned.
                 </p>
+
+                <div className="w-full mb-8 flex flex-col items-center">
+                  <label htmlFor="cert-name" className="text-sm font-bold text-slate-700 mb-2">Print Karyogram Certificate</label>
+                  <input
+                    id="cert-name"
+                    type="text"
+                    placeholder="Enter your name"
+                    value={certificateName}
+                    onChange={(e) => setCertificateName(e.target.value)}
+                    className="w-full max-w-xs px-4 py-3 rounded-xl border border-slate-200 bg-slate-50 text-center font-bold focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent transition-all"
+                  />
+                </div>
                 
                 <div className="flex gap-4 w-full">
                   <button 
                     onClick={() => setGameState('select')}
-                    className="flex-1 flex items-center justify-center gap-2 bg-slate-100 text-slate-600 px-6 py-4 rounded-xl font-bold hover:bg-slate-200 transition-colors"
+                    className="flex-1 flex items-center justify-center gap-2 bg-slate-100 text-slate-600 px-4 py-4 rounded-xl font-bold hover:bg-slate-200 transition-colors text-sm"
                   >
                     NEW SAMPLE
                   </button>
                   <button 
                     onClick={resetGame}
-                    className="flex-1 flex items-center justify-center gap-2 bg-emerald-500 text-white px-6 py-4 rounded-xl font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/30"
+                    className="flex-1 flex items-center justify-center gap-2 bg-emerald-50 text-emerald-600 px-4 py-4 rounded-xl font-bold hover:bg-emerald-100 transition-colors text-sm"
                   >
                     RESTART
+                  </button>
+                  <button 
+                    onClick={() => setIsReviewingCertificate(true)}
+                    disabled={!certificateName.trim()}
+                    className="flex-[1.5] flex items-center justify-center gap-2 bg-emerald-500 text-white px-4 py-4 rounded-xl font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/30 text-sm disabled:opacity-50 disabled:hover:bg-emerald-500 disabled:shadow-none"
+                  >
+                    REVIEW & PRINT
                   </button>
                 </div>
               </motion.div>
