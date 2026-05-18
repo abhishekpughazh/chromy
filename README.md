@@ -5,15 +5,14 @@ An interactive karyotype assembly tool for cytogeneticists to learn and practice
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) (v18+)
-- [Python](https://www.python.org/) 3.12+
 
 ## Setup
 
 ### 1. Clone the repo
 
 ```bash
-git clone https://repos.roswellpark.org/ab55604/chromy_v1.git
-cd chromy_v1
+git clone https://github.com/abhishekpughazh/chromy.git
+cd chromy
 ```
 
 ### 2. Install Node dependencies
@@ -22,25 +21,7 @@ cd chromy_v1
 npm install
 ```
 
-### 3. Set up the Python environment
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate        # macOS/Linux
-# .venv\Scripts\activate         # Windows
-
-pip install torch Pillow realesrgan basicsr opencv-python numpy
-```
-
-### 4. Run the app
-
-In one terminal, start the backend:
-
-```bash
-npm run server
-```
-
-In a second terminal, start the frontend:
+### 3. Run the app
 
 ```bash
 npm run dev
