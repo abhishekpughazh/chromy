@@ -9,7 +9,10 @@
  */
 
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { set, get } from 'idb-keyval';
+import { supabase } from './lib/supabase';
+import { Auth } from '@supabase/auth-ui-react';
+import { ThemeSupa } from '@supabase/auth-ui-shared';
+import { Session } from '@supabase/supabase-js';
 import { 
   DndContext, 
   DragOverlay, 
@@ -289,15 +292,24 @@ const KaryotypePair: React.FC<KaryotypePairProps> = ({ type, placedChromosomes, 
 interface WelcomeScreenProps {
   onStart: () => void;
   onAdmin: () => void;
+  onSignOut?: () => void;
 }
 
-const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin }) => (
+const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin, onSignOut }) => (
   <motion.div 
     initial={{ opacity: 0 }}
     animate={{ opacity: 1 }}
     exit={{ opacity: 0 }}
     className="fixed inset-0 z-[100] bg-white flex items-center justify-center p-6 overflow-hidden"
   >
+    {onSignOut && (
+      <button 
+        onClick={onSignOut}
+        className="absolute top-6 right-6 z-50 text-slate-400 hover:text-slate-900 transition-colors text-xs font-bold tracking-widest uppercase flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-lg"
+      >
+        Sign Out
+      </button>
+    )}
     <div className="absolute inset-0 opacity-[0.03] pointer-events-none bg-[radial-gradient(#000_1px,transparent_1px)] [background-size:24px_24px]" />
     
     <div className="max-w-2xl w-full text-center relative z-10">
@@ -474,7 +486,6 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
 interface AdminImage {
   id: string;
   originalUrl: string;
-  blob: Blob;
   xml?: string;
 }
 
@@ -484,9 +495,10 @@ interface AdminPanelProps {
   onClose: () => void;
   images: AdminImage[];
   setImages: React.Dispatch<React.SetStateAction<AdminImage[]>>;
+  session: Session | null;
 }
 
-const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages }) => {
+const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, session }) => {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [lastUpload, setLastUpload] = useState<AdminImage | null>(null);
@@ -502,15 +514,40 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages }) =
   };
 
   const handleUpload = async (file: File) => {
+    if (!session?.user) return;
     setUploading(true);
     setUploadError(null);
 
     try {
-      const originalUrl = URL.createObjectURL(file);
+      const fileExt = file.name.split('.').pop();
+      const fileName = `${session.user.id}/${Date.now()}-${Math.random().toString(36).substring(2)}.${fileExt}`;
+      
+      const { error: uploadError, data: uploadData } = await supabase.storage
+        .from('images')
+        .upload(fileName, file);
+
+      if (uploadError) throw uploadError;
+
+      const { data: { publicUrl } } = supabase.storage
+        .from('images')
+        .getPublicUrl(fileName);
+
+      const { data: dbData, error: dbError } = await supabase
+        .from('samples')
+        .insert({
+          user_id: session.user.id,
+          original_url: publicUrl,
+          xml: ''
+        })
+        .select()
+        .single();
+
+      if (dbError) throw dbError;
+
       const newImage: AdminImage = {
-        id: `img-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-        originalUrl,
-        blob: file
+        id: dbData.id,
+        originalUrl: publicUrl,
+        xml: ''
       };
       
       setImages(prev => [newImage, ...prev]);
@@ -527,14 +564,19 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages }) =
     e.stopPropagation();
     if (!window.confirm('Are you sure you want to delete this sample?')) return;
     
-    setImages(prev => {
-      const img = prev.find(i => i.id === id);
-      if (img && img.originalUrl) {
-        URL.revokeObjectURL(img.originalUrl);
-      }
-      return prev.filter(i => i.id !== id);
-    });
-    if (lastUpload?.id === id) setLastUpload(null);
+    const img = images.find(i => i.id === id);
+    if (!img) return;
+
+    try {
+      const fileName = img.originalUrl.split('/').slice(-2).join('/');
+      await supabase.storage.from('images').remove([fileName]);
+      await supabase.from('samples').delete().eq('id', id);
+
+      setImages(prev => prev.filter(i => i.id !== id));
+      if (lastUpload?.id === id) setLastUpload(null);
+    } catch (err) {
+      console.error('Failed to delete image:', err);
+    }
   };
 
   return (
@@ -692,8 +734,19 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages }) =
           imageUrl={annotateImageUrl}
           imageId={annotateImageId}
           initialXml={images.find(img => img.id === annotateImageId)?.xml}
-          onSave={(xml) => {
-            setImages(prev => prev.map(img => img.id === annotateImageId ? { ...img, xml } : img));
+          onSave={async (xml) => {
+            try {
+              const { error } = await supabase
+                .from('samples')
+                .update({ xml })
+                .eq('id', annotateImageId);
+              
+              if (error) throw error;
+              setImages(prev => prev.map(img => img.id === annotateImageId ? { ...img, xml } : img));
+            } catch (err) {
+              console.error('Failed to save annotations to DB:', err);
+              alert('Failed to save annotations to database.');
+            }
           }}
           onClose={() => {
             setAnnotateImageUrl(null);
@@ -803,6 +856,7 @@ const SUCCESS_PHRASES = [
 ];
 
 export default function Chromy() {
+  const [session, setSession] = useState<Session | null>(null);
   const [images, setImages] = useState<AdminImage[]>([]);
   const [imagesLoaded, setImagesLoaded] = useState(false);
   const [gameState, setGameState] = useState<'welcome' | 'select' | 'playing' | 'admin'>('welcome');
@@ -823,43 +877,69 @@ export default function Chromy() {
   );
 
   useEffect(() => {
-    const loadFromIdb = async () => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  if (!session) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border border-slate-200">
+          <div className="flex items-center justify-center gap-3 mb-8">
+            <div className="w-12 h-12 bg-slate-900 rounded-xl flex items-center justify-center text-white">
+              <Dna className="w-8 h-8" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-black tracking-tight text-slate-900">CHROMY</h1>
+              <p className="text-[10px] text-slate-400 font-mono tracking-widest uppercase">Login to continue</p>
+            </div>
+          </div>
+          <Auth 
+            supabaseClient={supabase} 
+            appearance={{ theme: ThemeSupa }} 
+            providers={['google']} 
+          />
+        </div>
+      </div>
+    );
+  }
+
+  useEffect(() => {
+    if (!session) return;
+    
+    const loadFromDb = async () => {
       try {
-        const stored = await get<any[]>('chromy-images');
-        if (stored && Array.isArray(stored)) {
-          const loaded = stored.map(s => ({
-            id: s.id,
-            originalUrl: URL.createObjectURL(s.blob),
-            blob: s.blob,
-            xml: s.xml
-          }));
-          setImages(loaded);
+        const { data, error } = await supabase
+          .from('samples')
+          .select('*')
+          .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        
+        if (data) {
+          setImages(data.map(row => ({
+            id: row.id,
+            originalUrl: row.original_url,
+            xml: row.xml
+          })));
         }
       } catch (e) {
-        console.error('Failed to load images from IDB', e);
+        console.error('Failed to load images from Supabase', e);
       } finally {
         setImagesLoaded(true);
       }
     };
-    loadFromIdb();
-  }, []);
-
-  useEffect(() => {
-    if (!imagesLoaded) return;
-    const saveToIdb = async () => {
-      try {
-        const toStore = images.map(img => ({
-          id: img.id,
-          blob: img.blob,
-          xml: img.xml
-        }));
-        await set('chromy-images', toStore);
-      } catch (e) {
-        console.error('Failed to save images to IDB', e);
-      }
-    };
-    saveToIdb();
-  }, [images, imagesLoaded]);
+    loadFromDb();
+  }, [session]);
 
   useEffect(() => {
     const initial = createInitialChromosomes();
@@ -1013,6 +1093,9 @@ export default function Chromy() {
             key="welcome" 
             onStart={() => setGameState('select')} 
             onAdmin={() => setGameState('admin')} 
+            onSignOut={async () => {
+              await supabase.auth.signOut();
+            }}
           />
         )}
         {gameState === 'select' && (
