@@ -526,7 +526,10 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
         .from('images')
         .upload(fileName, file);
 
-      if (uploadError) throw uploadError;
+      if (uploadError) {
+        console.error('Supabase Storage Upload Error:', uploadError);
+        throw new Error(`Storage Error: ${uploadError.message}`);
+      }
 
       const { data: { publicUrl } } = supabase.storage
         .from('images')
@@ -542,7 +545,10 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
         .select()
         .single();
 
-      if (dbError) throw dbError;
+      if (dbError) {
+        console.error('Supabase Database Insert Error:', dbError);
+        throw new Error(`Database Error: ${dbError.message}`);
+      }
 
       const newImage: AdminImage = {
         id: dbData.id,
@@ -909,8 +915,9 @@ export default function Chromy() {
             xml: row.xml
           })));
         }
-      } catch (e) {
+      } catch (e: any) {
         console.error('Failed to load images from Supabase', e);
+        setUploadError(`Load Error: ${e.message}`);
       } finally {
         setImagesLoaded(true);
       }
@@ -1129,6 +1136,7 @@ export default function Chromy() {
             key="admin" 
             images={images}
             setImages={setImages}
+            session={session}
             onClose={() => setGameState('welcome')} 
           />
         )}
