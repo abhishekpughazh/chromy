@@ -924,30 +924,6 @@ export default function Chromy() {
     setScore({ correct: 0, total: initial.length });
   }, []);
 
-  if (!session) {
-    return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-        <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border border-slate-200">
-          <div className="flex items-center justify-center gap-3 mb-8">
-            <div className="w-12 h-12 bg-slate-900 rounded-xl flex items-center justify-center text-white">
-              <Dna className="w-8 h-8" />
-            </div>
-            <div>
-              <h1 className="text-2xl font-black tracking-tight text-slate-900">CHROMY</h1>
-              <p className="text-[10px] text-slate-400 font-mono tracking-widest uppercase">Login to continue</p>
-            </div>
-          </div>
-          <Auth 
-            supabaseClient={supabase} 
-            appearance={{ theme: ThemeSupa }} 
-            providers={['google']}
-            magicLink={true}
-          />
-        </div>
-      </div>
-    );
-  }
-
   const handleDragStart = (event: DragStartEvent) => {
     setActiveId(event.active.id as string);
   };
@@ -1085,6 +1061,30 @@ export default function Chromy() {
     }
     return "DIAGNOSIS COMPLETE";
   }, [isComplete]);
+
+  if (!session) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border border-slate-200">
+          <div className="flex items-center justify-center gap-3 mb-8">
+            <div className="w-12 h-12 bg-slate-900 rounded-xl flex items-center justify-center text-white">
+              <Dna className="w-8 h-8" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-black tracking-tight text-slate-900">CHROMY</h1>
+              <p className="text-[10px] text-slate-400 font-mono tracking-widest uppercase">Login to continue</p>
+            </div>
+          </div>
+          <Auth 
+            supabaseClient={supabase} 
+            appearance={{ theme: ThemeSupa }} 
+            providers={['google']}
+            magicLink={true}
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-sky-100 overflow-hidden">
