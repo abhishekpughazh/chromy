@@ -19,6 +19,8 @@ const ALL_LABELS = BASE_CHROMOSOMES.flatMap(chr => [`${chr}L`, `${chr}R`]);
 interface ImageAnnotationModalProps {
   imageUrl: string;
   imageId: string;
+  initialXml?: string;
+  onSave: (xml: string) => void;
   onClose: () => void;
 }
 
@@ -224,7 +226,7 @@ function distToSegment(p: Point, v: Point, w: Point) {
 
 type Mode = 'draw' | 'pan' | 'edit';
 
-export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: ImageAnnotationModalProps) {
+export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, onSave, onClose }: ImageAnnotationModalProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
@@ -374,24 +376,17 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
     }
   }, []);
 
-  const loadAnnotations = async () => {
-    try {
-      const res = await fetch(`/api/annotations/${encodeURIComponent(imageId)}`);
-      if (res.status === 404) return;
-      if (!res.ok) throw new Error('Failed to load annotations');
-      const xml = await res.text();
-      const loaded = xmlToStrokes(xml);
-      if (loaded) {
-        _setStrokes(loaded);
-        setIsDirty(false);
-        const used = new Set(loaded.map(s => s.label));
-        const next = ALL_LABELS.find(l => !used.has(l));
-        if (next) setActiveLabel(next);
-      }
-    } catch (e) {
-      // no annotations yet
+  const loadAnnotations = useCallback(() => {
+    if (!initialXml) return;
+    const loaded = xmlToStrokes(initialXml);
+    if (loaded) {
+      _setStrokes(loaded);
+      setIsDirty(false);
+      const used = new Set(loaded.map(s => s.label));
+      const next = ALL_LABELS.find(l => !used.has(l));
+      if (next) setActiveLabel(next);
     }
-  };
+  }, [initialXml]);
 
   useEffect(() => {
     loadAnnotations();
@@ -404,7 +399,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
     pointersRef.current.clear();
     setShowLabels(true);
     setActiveLabel('1L');
-  }, [imageId]);
+  }, [imageId, loadAnnotations]);
 
   useEffect(() => {
     const preventPinch = (e: TouchEvent) => {
@@ -784,12 +779,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, onClose }: Ima
     setSaveMsg(null);
     try {
       const xml = strokesToXml(strokes, imageId, imgSize.width, imgSize.height);
-      const res = await fetch(`/api/annotations/${encodeURIComponent(imageId)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/xml' },
-        body: xml,
-      });
-      if (!res.ok) throw new Error('Save failed');
+      onSave(xml);
       setSaveMsg('Saved');
       setIsDirty(false);
       setTimeout(() => setSaveMsg(null), 2000);

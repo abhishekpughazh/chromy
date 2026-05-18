@@ -361,16 +361,15 @@ const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin }) => (
 
 export const extractChromosomes = async (imgObj: AdminImage): Promise<ChromosomeData[]> => {
   try {
-    const res = await fetch(`/api/annotations/${encodeURIComponent(imgObj.id)}`);
-    if (!res.ok) return [];
-    const xmlText = await res.text();
+    if (!imgObj.xml) return [];
+    const xmlText = imgObj.xml;
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlText, 'application/xml');
     const strokeEls = doc.querySelectorAll('stroke');
     
     if (strokeEls.length === 0) return [];
     
-    const imgUrl = imgObj.upscaledUrl ?? imgObj.originalUrl ?? '';
+    const imgUrl = imgObj.originalUrl;
     if (!imgUrl) return [];
 
     const img = new Image();
@@ -473,40 +472,25 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
 
 interface AdminImage {
   id: string;
-  originalUrl: string | null;
-  upscaledUrl: string | null;
+  originalUrl: string;
+  xml?: string;
 }
 
 import ImageAnnotationModal from './components/ImageAnnotationModal';
 
 interface AdminPanelProps {
   onClose: () => void;
+  images: AdminImage[];
+  setImages: React.Dispatch<React.SetStateAction<AdminImage[]>>;
 }
 
-const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
+const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages }) => {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [lastUpload, setLastUpload] = useState<AdminImage | null>(null);
-  const [images, setImages] = useState<AdminImage[]>([]);
-  const [doUpscale, setDoUpscale] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [annotateImageUrl, setAnnotateImageUrl] = useState<string | null>(null);
   const [annotateImageId, setAnnotateImageId] = useState<string | null>(null);
-
-  const loadImages = async () => {
-    try {
-      const res = await fetch('/api/images');
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data.ok && Array.isArray(data.images)) {
-        setImages(data.images);
-      }
-    } catch (_) { /* ignore */ }
-  };
-
-  useEffect(() => {
-    loadImages();
-  }, []);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -519,24 +503,15 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
     setUploading(true);
     setUploadError(null);
 
-    const formData = new FormData();
-    formData.append('image', file);
-    formData.append('upscale', doUpscale ? 'true' : 'false');
-
     try {
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Upload failed');
-      }
-
-      const data = await res.json();
-      setLastUpload({ id: data.id, originalUrl: data.originalUrl, upscaledUrl: data.upscaledUrl });
-      await loadImages();
+      const originalUrl = URL.createObjectURL(file);
+      const newImage: AdminImage = {
+        id: `img-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        originalUrl
+      };
+      
+      setImages(prev => [newImage, ...prev]);
+      setLastUpload(newImage);
     } catch (err: any) {
       setUploadError(err.message || 'Upload failed');
     } finally {
@@ -548,13 +523,15 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
     e.preventDefault();
     e.stopPropagation();
     if (!window.confirm('Are you sure you want to delete this sample?')) return;
-    try {
-      const res = await fetch(`/api/images/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        if (lastUpload?.id === id) setLastUpload(null);
-        await loadImages();
+    
+    setImages(prev => {
+      const img = prev.find(i => i.id === id);
+      if (img && img.originalUrl) {
+        URL.revokeObjectURL(img.originalUrl);
       }
-    } catch (_) { /* ignore */ }
+      return prev.filter(i => i.id !== id);
+    });
+    if (lastUpload?.id === id) setLastUpload(null);
   };
 
   return (
@@ -586,7 +563,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
               onChange={handleFileChange}
             />
 
-            <div
+              <div
               onClick={() => fileInputRef.current?.click()}
               onDragOver={(e) => { e.preventDefault(); }}
               onDrop={(e) => {
@@ -605,7 +582,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                 <Upload className="w-12 h-12 text-slate-300 group-hover:text-slate-900 transition-colors mb-4" />
               )}
               <p className="font-bold text-slate-400 group-hover:text-slate-900">
-                {uploading ? (doUpscale ? 'Upscaling to 4K...' : 'Saving...') : 'Upload JPG, JPEG or PNG'}
+                {uploading ? 'Processing...' : 'Upload JPG, JPEG or PNG'}
               </p>
               <p className="text-sm text-slate-300">Click or drag & drop</p>
               {uploadError && (
@@ -613,32 +590,13 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
               )}
             </div>
 
-            <label className="flex items-center gap-3 cursor-pointer select-none">
-              <div
-                onClick={() => setDoUpscale(v => !v)}
-                className={cn(
-                  "w-11 h-6 rounded-full relative transition-colors",
-                  doUpscale ? "bg-emerald-500" : "bg-slate-300"
-                )}
-              >
-                <div className={cn(
-                  "absolute top-1 w-4 h-4 rounded-full bg-white transition-transform",
-                  doUpscale ? "left-6" : "left-1"
-                )} />
-              </div>
-              <span className="text-sm font-bold text-slate-700 flex items-center gap-2">
-                <Zap className="w-4 h-4 text-amber-500" />
-                {doUpscale ? 'Upscale to 4K enabled' : 'Upscale to 4K disabled'}
-              </span>
-            </label>
-
             {lastUpload && (
               <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-3">
                 <p className="text-xs font-mono text-slate-400">
-                  {lastUpload.upscaledUrl ? '4K UPSCALE PREVIEW' : 'ORIGINAL PREVIEW'}
+                  IMAGE PREVIEW
                 </p>
                 <img
-                  src={lastUpload.upscaledUrl ?? lastUpload.originalUrl ?? ''}
+                  src={lastUpload.originalUrl}
                   alt="Uploaded"
                   className="w-full rounded-xl border border-slate-100"
                 />
@@ -653,7 +611,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                <ul className="space-y-4 text-sm text-slate-300">
                  <li className="flex items-start gap-3">
                    <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">1</div>
-                   Upload a metaphase spread image. You can optionally enable 4K upscaling for better clarity.
+                   Upload a metaphase spread image.
                  </li>
                  <li className="flex items-start gap-3">
                    <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">2</div>
@@ -681,7 +639,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                        key={img.id}
                        className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden cursor-pointer group relative aspect-square flex flex-col"
                        onClick={() => {
-                         const url = img.upscaledUrl ?? img.originalUrl ?? '';
+                         const url = img.originalUrl;
                          if (!url) return;
                          setAnnotateImageUrl(url);
                          setAnnotateImageId(img.id);
@@ -700,15 +658,15 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
                        <div className="absolute top-2 left-2 z-10">
                          <span className={cn(
                            "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm uppercase backdrop-blur-md",
-                           img.upscaledUrl ? "bg-emerald-500/90 text-white" : "bg-slate-900/80 text-white"
+                           "bg-slate-900/80 text-white"
                          )}>
-                           {img.upscaledUrl ? '4K' : 'RAW'}
+                           RAW
                          </span>
                        </div>
 
                        <div className="relative flex-1 bg-slate-100 overflow-hidden">
                          <img
-                           src={img.upscaledUrl ?? img.originalUrl ?? ''}
+                           src={img.originalUrl}
                            alt="Sample"
                            className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
                          />
@@ -726,45 +684,32 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose }) => {
              </div>
           </div>
         </div>
-    {annotateImageUrl && annotateImageId && (
-      <ImageAnnotationModal
-        imageUrl={annotateImageUrl}
-        imageId={annotateImageId}
-        onClose={() => {
-          setAnnotateImageUrl(null);
-          setAnnotateImageId(null);
-        }}
-      />
-    )}
+      {annotateImageUrl && annotateImageId && (
+        <ImageAnnotationModal
+          imageUrl={annotateImageUrl}
+          imageId={annotateImageId}
+          initialXml={images.find(img => img.id === annotateImageId)?.xml}
+          onSave={(xml) => {
+            setImages(prev => prev.map(img => img.id === annotateImageId ? { ...img, xml } : img));
+          }}
+          onClose={() => {
+            setAnnotateImageUrl(null);
+            setAnnotateImageId(null);
+          }}
+        />
+      )}
     </motion.div>
   );
 };
 
 interface SpreadSelectionScreenProps {
+  images: AdminImage[];
   onSelect: (img: AdminImage, extracted: ChromosomeData[]) => void;
   onBack: () => void;
 }
 
-const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ onSelect, onBack }) => {
-  const [images, setImages] = useState<AdminImage[]>([]);
-  const [loading, setLoading] = useState(true);
+const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, onSelect, onBack }) => {
   const [extractingId, setExtractingId] = useState<string | null>(null);
-
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const res = await fetch('/api/images');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.ok && Array.isArray(data.images)) {
-            setImages(data.images);
-          }
-        }
-      } catch (_) { }
-      setLoading(false);
-    };
-    load();
-  }, []);
 
   const handleSelect = async (img: AdminImage) => {
     if (extractingId) return;
@@ -792,11 +737,7 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ onSelect,
           </button>
         </header>
 
-        {loading ? (
-          <div className="flex flex-col items-center justify-center h-64">
-            <Loader className="w-8 h-8 text-sky-500 animate-spin" />
-          </div>
-        ) : images.length === 0 ? (
+        {images.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-64 text-slate-400 bg-white rounded-3xl border border-slate-200 shadow-sm p-8 text-center">
             <ImageIcon className="w-12 h-12 mb-4 opacity-50 mx-auto" />
             <p className="text-lg font-bold text-slate-700">No metaphase spreads available</p>
@@ -821,7 +762,7 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ onSelect,
                 )}
                 <div className="relative flex-1 bg-slate-100 overflow-hidden">
                   <img
-                    src={img.upscaledUrl ?? img.originalUrl ?? ''}
+                    src={img.originalUrl}
                     alt="Spread"
                     className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110"
                   />
@@ -859,6 +800,7 @@ const SUCCESS_PHRASES = [
 ];
 
 export default function Chromy() {
+  const [images, setImages] = useState<AdminImage[]>([]);
   const [gameState, setGameState] = useState<'welcome' | 'select' | 'playing' | 'admin'>('welcome');
   const [selectedImage, setSelectedImage] = useState<AdminImage | null>(null);
   const [originalExtracted, setOriginalExtracted] = useState<ChromosomeData[]>([]);
@@ -1033,6 +975,7 @@ export default function Chromy() {
         {gameState === 'select' && (
           <SpreadSelectionScreen
             key="select"
+            images={images}
             onBack={() => setGameState('welcome')}
             onSelect={(img, extracted) => {
               setSelectedImage(img);
@@ -1057,6 +1000,8 @@ export default function Chromy() {
         {gameState === 'admin' && (
           <AdminPanel 
             key="admin" 
+            images={images}
+            setImages={setImages}
             onClose={() => setGameState('welcome')} 
           />
         )}
@@ -1148,7 +1093,7 @@ export default function Chromy() {
               {selectedImage && (
                 <div className="w-full h-48 mb-6 rounded-xl overflow-hidden border border-slate-200 relative shrink-0 shadow-sm bg-black group/source">
                   <img 
-                    src={selectedImage.upscaledUrl ?? selectedImage.originalUrl ?? ''} 
+                    src={selectedImage.originalUrl} 
                     alt="Selected Metaphase Spread"
                     className="w-full h-full object-cover transition-transform duration-500 group-hover/source:scale-105"
                   />
@@ -1160,7 +1105,7 @@ export default function Chromy() {
 
                   <div className="absolute bottom-2 right-2 flex gap-2 opacity-0 group-hover/source:opacity-100 transition-all translate-y-2 group-hover/source:translate-y-0">
                     <a
-                      href={selectedImage.upscaledUrl ?? selectedImage.originalUrl ?? ''}
+                      href={selectedImage.originalUrl}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 backdrop-blur border border-white/20 flex items-center justify-center text-white transition-colors"
@@ -1169,7 +1114,7 @@ export default function Chromy() {
                       <Expand className="w-4 h-4" />
                     </a>
                     <a
-                      href={selectedImage.upscaledUrl ?? selectedImage.originalUrl ?? ''}
+                      href={selectedImage.originalUrl}
                       download={`chromy-sample-${selectedImage.id}.png`}
                       className="w-8 h-8 rounded-lg bg-white text-slate-900 hover:bg-sky-50 flex items-center justify-center transition-colors shadow-lg"
                       title="Download Source Image"
