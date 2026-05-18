@@ -9,6 +9,7 @@
  */
 
 import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { set, get } from 'idb-keyval';
 import { 
   DndContext, 
   DragOverlay, 
@@ -473,6 +474,7 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
 interface AdminImage {
   id: string;
   originalUrl: string;
+  blob: Blob;
   xml?: string;
 }
 
@@ -507,7 +509,8 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages }) =
       const originalUrl = URL.createObjectURL(file);
       const newImage: AdminImage = {
         id: `img-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-        originalUrl
+        originalUrl,
+        blob: file
       };
       
       setImages(prev => [newImage, ...prev]);
@@ -801,6 +804,7 @@ const SUCCESS_PHRASES = [
 
 export default function Chromy() {
   const [images, setImages] = useState<AdminImage[]>([]);
+  const [imagesLoaded, setImagesLoaded] = useState(false);
   const [gameState, setGameState] = useState<'welcome' | 'select' | 'playing' | 'admin'>('welcome');
   const [selectedImage, setSelectedImage] = useState<AdminImage | null>(null);
   const [originalExtracted, setOriginalExtracted] = useState<ChromosomeData[]>([]);
@@ -817,6 +821,45 @@ export default function Chromy() {
     useSensor(MouseSensor),
     useSensor(TouchSensor)
   );
+
+  useEffect(() => {
+    const loadFromIdb = async () => {
+      try {
+        const stored = await get<any[]>('chromy-images');
+        if (stored && Array.isArray(stored)) {
+          const loaded = stored.map(s => ({
+            id: s.id,
+            originalUrl: URL.createObjectURL(s.blob),
+            blob: s.blob,
+            xml: s.xml
+          }));
+          setImages(loaded);
+        }
+      } catch (e) {
+        console.error('Failed to load images from IDB', e);
+      } finally {
+        setImagesLoaded(true);
+      }
+    };
+    loadFromIdb();
+  }, []);
+
+  useEffect(() => {
+    if (!imagesLoaded) return;
+    const saveToIdb = async () => {
+      try {
+        const toStore = images.map(img => ({
+          id: img.id,
+          blob: img.blob,
+          xml: img.xml
+        }));
+        await set('chromy-images', toStore);
+      } catch (e) {
+        console.error('Failed to save images to IDB', e);
+      }
+    };
+    saveToIdb();
+  }, [images, imagesLoaded]);
 
   useEffect(() => {
     const initial = createInitialChromosomes();
