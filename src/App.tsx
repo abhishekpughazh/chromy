@@ -940,7 +940,8 @@ export default function Chromy() {
           <Auth 
             supabaseClient={supabase} 
             appearance={{ theme: ThemeSupa }} 
-            providers={['google']} 
+            providers={['google']}
+            magicLink={true}
           />
         </div>
       </div>
