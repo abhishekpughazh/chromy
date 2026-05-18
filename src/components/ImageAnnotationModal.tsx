@@ -20,7 +20,7 @@ interface ImageAnnotationModalProps {
   imageUrl: string;
   imageId: string;
   initialXml?: string;
-  onSave: (xml: string) => void;
+  onSave: (xml: string) => Promise<void>;
   onClose: () => void;
 }
 
@@ -111,16 +111,28 @@ const OrientationDialog = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    ctx.beginPath();
-    ctx.moveTo(stroke.points[0].x - minX, stroke.points[0].y - minY);
-    for (let i = 1; i < stroke.points.length; i++) {
-      ctx.lineTo(stroke.points[i].x - minX, stroke.points[i].y - minY);
-    }
-    ctx.closePath();
-    ctx.clip();
+    // Create an anonymous image to draw onto the canvas to prevent tainting
+    const safeImg = new Image();
+    safeImg.crossOrigin = 'anonymous';
+    safeImg.onload = () => {
+      ctx.beginPath();
+      ctx.moveTo(stroke.points[0].x - minX, stroke.points[0].y - minY);
+      for (let i = 1; i < stroke.points.length; i++) {
+        ctx.lineTo(stroke.points[i].x - minX, stroke.points[i].y - minY);
+      }
+      ctx.closePath();
+      ctx.clip();
 
-    ctx.drawImage(img, minX, minY, w, h, 0, 0, w, h);
-    setDataUrl(canvas.toDataURL('image/png'));
+      ctx.drawImage(safeImg, minX, minY, w, h, 0, 0, w, h);
+      setDataUrl(canvas.toDataURL('image/png'));
+    };
+    safeImg.onerror = () => {
+      console.error('Failed to load image for OrientationDialog');
+      // If it fails, fallback to drawing the tainted image so the user can at least see something,
+      // but we won't be able to use toDataURL.
+      setDataUrl('');
+    };
+    safeImg.src = img.src;
   }, [stroke, img]);
 
   return (
@@ -376,9 +388,9 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     }
   }, []);
 
-  const loadAnnotations = useCallback(() => {
-    if (!initialXml) return;
-    const loaded = xmlToStrokes(initialXml);
+  const loadAnnotations = useCallback((xml: string | undefined) => {
+    if (!xml) return;
+    const loaded = xmlToStrokes(xml);
     if (loaded) {
       _setStrokes(loaded);
       setIsDirty(false);
@@ -386,10 +398,10 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
       const next = ALL_LABELS.find(l => !used.has(l));
       if (next) setActiveLabel(next);
     }
-  }, [initialXml]);
+  }, []); // Only runs when called
 
   useEffect(() => {
-    loadAnnotations();
+    loadAnnotations(initialXml);
     setScale(1);
     setPan({ x: 0, y: 0 });
     setMode('draw');
@@ -399,7 +411,8 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     pointersRef.current.clear();
     setShowLabels(true);
     setActiveLabel('1L');
-  }, [imageId, loadAnnotations]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageId]);
 
   useEffect(() => {
     const preventPinch = (e: TouchEvent) => {
@@ -779,7 +792,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     setSaveMsg(null);
     try {
       const xml = strokesToXml(strokes, imageId, imgSize.width, imgSize.height);
-      onSave(xml);
+      await onSave(xml);
       setSaveMsg('Saved');
       setIsDirty(false);
       setTimeout(() => setSaveMsg(null), 2000);
@@ -996,6 +1009,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
               <img
                 ref={imgRef}
                 src={imageUrl}
+                crossOrigin="anonymous"
                 alt="Annotate"
                 className="block max-w-none select-none"
                 draggable={false}
