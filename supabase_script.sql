@@ -2,9 +2,15 @@
 create table if not exists public.user_roles (
   id uuid default gen_random_uuid() primary key,
   user_id uuid references auth.users(id) on delete cascade not null unique,
+  email text,
+  username text,
   role text not null check (role in ('SUPER ADMIN', 'ADMIN', 'USER')),
   created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
+
+-- Add email and username columns if the table already existed
+alter table public.user_roles add column if not exists email text;
+alter table public.user_roles add column if not exists username text;
 
 -- Enable RLS on user_roles
 alter table public.user_roles enable row level security;
@@ -22,8 +28,13 @@ drop policy if exists "Super Admins can view all roles" on public.user_roles;
 create or replace function public.handle_new_user()
 returns trigger as $$
 begin
-  insert into public.user_roles (user_id, role)
-  values (new.id, 'USER');
+  insert into public.user_roles (user_id, role, email, username)
+  values (
+    new.id, 
+    'USER', 
+    new.email, 
+    new.raw_user_meta_data->>'username'
+  );
   return new;
 end;
 $$ language plpgsql security definer;
