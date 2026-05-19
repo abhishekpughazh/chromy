@@ -293,9 +293,10 @@ interface WelcomeScreenProps {
   onStart: () => void;
   onAdmin: () => void;
   onSignOut?: () => void;
+  userRole: 'SUPER ADMIN' | 'ADMIN' | 'USER' | null;
 }
 
-const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin, onSignOut }) => (
+const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin, onSignOut, userRole }) => (
   <motion.div 
     initial={{ opacity: 0 }}
     animate={{ opacity: 1 }}
@@ -362,12 +363,14 @@ const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin, onSignO
         Start Karyotyping <Play className="w-4 h-4 fill-current" />
       </button>
 
-      <button 
-        onClick={onAdmin}
-        className="mt-8 text-slate-300 hover:text-slate-900 transition-colors text-xs font-mono tracking-widest uppercase flex items-center gap-2 mx-auto"
-      >
-        <ShieldCheck className="w-3.5 h-3.5" /> ADMIN ACCESS
-      </button>
+      {(userRole === 'ADMIN' || userRole === 'SUPER ADMIN') && (
+        <button 
+          onClick={onAdmin}
+          className="mt-8 text-slate-300 hover:text-slate-900 transition-colors text-xs font-mono tracking-widest uppercase flex items-center gap-2 mx-auto"
+        >
+          <ShieldCheck className="w-3.5 h-3.5" /> ADMIN ACCESS
+        </button>
+      )}
     </div>
   </motion.div>
 );
@@ -487,6 +490,7 @@ interface AdminImage {
   id: string;
   originalUrl: string;
   xml?: string;
+  uploaderEmail?: string;
 }
 
 import ImageAnnotationModal from './components/ImageAnnotationModal';
@@ -496,9 +500,10 @@ interface AdminPanelProps {
   images: AdminImage[];
   setImages: React.Dispatch<React.SetStateAction<AdminImage[]>>;
   session: Session | null;
+  userRole: 'SUPER ADMIN' | 'ADMIN' | 'USER' | null;
 }
 
-const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, session }) => {
+const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, session, userRole }) => {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [lastUpload, setLastUpload] = useState<AdminImage | null>(null);
@@ -539,6 +544,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
         .from('samples')
         .insert({
           user_id: session.user.id,
+          uploader_email: session.user.email,
           original_url: publicUrl,
           xml: ''
         })
@@ -553,7 +559,8 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
       const newImage: AdminImage = {
         id: dbData.id,
         originalUrl: publicUrl,
-        xml: ''
+        xml: '',
+        uploaderEmail: session.user.email
       };
       
       setImages(prev => [newImage, ...prev]);
@@ -705,15 +712,22 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
                          <Trash2 className="w-3.5 h-3.5" />
                        </button>
 
-                       {/* Status Tag */}
-                       <div className="absolute top-2 left-2 z-10">
-                         <span className={cn(
-                           "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm uppercase backdrop-blur-md",
-                           "bg-slate-900/80 text-white"
-                         )}>
-                           RAW
-                         </span>
-                       </div>
+                      <div className="absolute top-2 left-2 z-10 flex flex-col gap-1">
+                        <span className={cn(
+                          "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm uppercase backdrop-blur-md",
+                          "bg-slate-900/80 text-white w-fit"
+                        )}>
+                          RAW
+                        </span>
+                        {userRole === 'SUPER ADMIN' && img.uploaderEmail && (
+                          <span className={cn(
+                            "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm backdrop-blur-md",
+                            "bg-sky-500/90 text-white w-fit truncate max-w-[120px]"
+                          )} title={img.uploaderEmail}>
+                            {img.uploaderEmail}
+                          </span>
+                        )}
+                      </div>
 
                        <div className="relative flex-1 bg-slate-100 overflow-hidden">
                          <img
@@ -864,6 +878,7 @@ const SUCCESS_PHRASES = [
 
 export default function Chromy() {
   const [session, setSession] = useState<Session | null>(null);
+  const [userRole, setUserRole] = useState<'SUPER ADMIN' | 'ADMIN' | 'USER' | null>(null);
   const [images, setImages] = useState<AdminImage[]>([]);
   const [imagesLoaded, setImagesLoaded] = useState(false);
   const [gameState, setGameState] = useState<'welcome' | 'select' | 'playing' | 'admin'>('welcome');
@@ -886,12 +901,22 @@ export default function Chromy() {
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
+      if (session?.user) {
+        supabase.from('user_roles').select('role').eq('user_id', session.user.id).single()
+          .then(({ data }) => setUserRole(data?.role || 'USER'));
+      }
     });
 
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
+      if (session?.user) {
+        supabase.from('user_roles').select('role').eq('user_id', session.user.id).single()
+          .then(({ data }) => setUserRole(data?.role || 'USER'));
+      } else {
+        setUserRole(null);
+      }
     });
 
     return () => subscription.unsubscribe();
@@ -913,7 +938,8 @@ export default function Chromy() {
           setImages(data.map(row => ({
             id: row.id,
             originalUrl: row.original_url,
-            xml: row.xml
+            xml: row.xml,
+            uploaderEmail: row.uploader_email
           })));
         }
       } catch (e: any) {
@@ -1102,6 +1128,7 @@ export default function Chromy() {
             onSignOut={async () => {
               await supabase.auth.signOut();
             }}
+            userRole={userRole}
           />
         )}
         {gameState === 'select' && (
@@ -1135,6 +1162,7 @@ export default function Chromy() {
             images={images}
             setImages={setImages}
             session={session}
+            userRole={userRole}
             onClose={() => setGameState('welcome')} 
           />
         )}
