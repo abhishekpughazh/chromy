@@ -25,7 +25,7 @@ create policy "Super Admins can view all roles"
   );
 
 -- Function to automatically assign 'USER' role to new signups
-create or function public.handle_new_user()
+create or replace function public.handle_new_user()
 returns trigger as $$
 begin
   insert into public.user_roles (user_id, role)
