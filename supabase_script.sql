@@ -15,15 +15,8 @@ create policy "Users can view their own role"
   on public.user_roles for select
   using ( auth.uid() = user_id );
 
+-- REMOVED: "Super Admins can view all roles" to prevent infinite recursion
 drop policy if exists "Super Admins can view all roles" on public.user_roles;
-create policy "Super Admins can view all roles"
-  on public.user_roles for select
-  using ( 
-    exists (
-      select 1 from public.user_roles ur 
-      where ur.user_id = auth.uid() and ur.role = 'SUPER ADMIN'
-    )
-  );
 
 -- Function to automatically assign 'USER' role to new signups
 create or replace function public.handle_new_user()

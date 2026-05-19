@@ -944,7 +944,7 @@ export default function Chromy() {
         }
       } catch (e: any) {
         console.error('Failed to load images from Supabase', e);
-        setUploadError(`Load Error: ${e.message}`);
+        // setUploadError is not defined here, so we just log or alert if needed
       } finally {
         setImagesLoaded(true);
       }
