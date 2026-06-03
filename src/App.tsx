@@ -523,17 +523,14 @@ const DraggableDatasetImage = ({
       }
     : undefined;
 
-    return (
-      <div
-        ref={setNodeRef}
-        style={style}
-        {...listeners}
-        {...attributes}
-        onDragStart={(e) => e.preventDefault()}
-      >
-        {children}
-      </div>
-    );
+            return (
+          <div
+            ref={setNodeRef}
+            style={style}
+          >
+            {children}
+          </div>
+        );
 };
 
 const LevelFolder = ({
@@ -861,7 +858,7 @@ const handleFolderDrop = async (event: DragEndEvent) => {
                               }}
                             >
                               <button
-                                onClick={(e) => deleteImage(img.id, e)}
+                                 onClick={(e) => deleteImage(img.id, e)}
                                 className="absolute top-2 right-2 z-10 w-7 h-7 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
                                 title="Delete Sample"
                               >
@@ -877,18 +874,6 @@ const handleFolderDrop = async (event: DragEndEvent) => {
                                 >
                                   RAW
                                 </span>
-
-                                {userRole === 'SUPER ADMIN' && img.uploaderEmail && (
-                                  <span
-                                    className={cn(
-                                      "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm backdrop-blur-md",
-                                      "bg-sky-500/90 text-white w-fit truncate max-w-[120px]"
-                                    )}
-                                    title={img.uploaderEmail}
-                                  >
-                                    {img.uploaderEmail}
-                                  </span>
-                                )}
                               </div>
 
                               <div className="relative flex-1 bg-slate-100 overflow-hidden">
@@ -899,7 +884,7 @@ const handleFolderDrop = async (event: DragEndEvent) => {
                                   className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
                                 />
 
-                                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
+                                <div className="absolute inset-0 pointer-events-none bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
                                   <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 flex items-center gap-2 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-lg shadow-xl">
                                     <Pencil className="w-3.5 h-3.5 text-slate-900" />
                                     <span className="text-[10px] font-bold text-slate-900">
