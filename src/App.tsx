@@ -489,6 +489,7 @@ interface AdminImage {
   originalUrl: string;
   xml?: string;
   uploaderEmail?: string;
+  level?: number
 }
 
 import ImageAnnotationModal from './components/ImageAnnotationModal';
@@ -501,13 +502,130 @@ interface AdminPanelProps {
   userRole: 'SUPER ADMIN' | 'ADMIN' | 'USER' | null;
 }
 
+const DraggableDatasetImage = ({
+  img,
+  children
+}: {
+  img: AdminImage;
+  children: React.ReactNode;
+}) => {
+  const { attributes, listeners, setNodeRef, transform } = useDraggable({
+    id: `dataset-${img.id}`,
+    data: {
+      imageId: img.id,
+      currentLevel: img.level || 1
+    }
+  });
+
+  const style = transform
+    ? {
+        transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`
+      }
+    : undefined;
+
+    return (
+      <div
+        ref={setNodeRef}
+        style={style}
+        {...listeners}
+        {...attributes}
+        onDragStart={(e) => e.preventDefault()}
+      >
+        {children}
+      </div>
+    );
+};
+
+const LevelFolder = ({
+  level,
+  children
+}: {
+  level: number;
+  children: React.ReactNode;
+}) => {
+  const { setNodeRef, isOver } = useDroppable({
+    id: `level-${level}`
+  });
+
+     return (
+      <div
+        ref={setNodeRef}
+        className={cn(
+          "rounded-xl border p-4 transition-all duration-200",
+          isOver
+            ? "border-sky-500 bg-sky-50 shadow-lg"
+            : "border-slate-200 bg-white"
+        )}
+      >
+        <div
+          className={cn(
+            "mb-4 rounded-lg border-2 border-dashed px-3 py-2 text-center transition-all",
+            isOver
+              ? "border-sky-500 bg-sky-100"
+              : "border-slate-200 bg-slate-50"
+          )}
+        >
+          {isOver
+            ? `Drop sample into Level ${level}`
+            : `Level ${level} Folder`}
+        </div>
+
+        {children}
+      </div>
+    );
+};
+
 const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, session, userRole }) => {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [lastUpload, setLastUpload] = useState<AdminImage | null>(null);
+  const [selectedLevel, setSelectedLevel] = useState(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [annotateImageUrl, setAnnotateImageUrl] = useState<string | null>(null);
   const [annotateImageId, setAnnotateImageId] = useState<string | null>(null);
+  const levels = Array.from({ length: 10 }, (_, i) => i + 1);
+
+const imagesByLevel = levels.reduce((acc, level) => {
+  acc[level] = images.filter(img => (img.level || 1) === level);
+  return acc;
+}, {} as Record<number, AdminImage[]>);
+
+const handleFolderDrop = async (event: DragEndEvent) => {
+  const { active, over } = event;
+
+  if (!over) return;
+
+  const imageId = String(active.id).replace(
+    'dataset-',
+    ''
+  );
+
+  const targetLevel = Number(
+    String(over.id).replace('level-', '')
+  );
+
+  if (Number.isNaN(targetLevel)) return;
+
+  try {
+    await supabase
+      .from('samples')
+      .update({ level: targetLevel })
+      .eq('id', imageId);
+
+    setImages(prev =>
+      prev.map(img =>
+        img.id === imageId
+          ? {
+              ...img,
+              level: targetLevel
+            }
+          : img
+      )
+    );
+  } catch (err) {
+    console.error('Failed to move sample:', err);
+  }
+};
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -544,7 +662,8 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
           user_id: session.user.id,
           uploader_email: session.user.email,
           original_url: publicUrl,
-          xml: ''
+          xml: '',
+          level: selectedLevel
         })
         .select()
         .single();
@@ -558,7 +677,8 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
         id: dbData.id,
         originalUrl: publicUrl,
         xml: '',
-        uploaderEmail: session.user.email
+        uploaderEmail: session.user.email,
+        level: selectedLevel
       };
       
       setImages(prev => [newImage, ...prev]);
@@ -610,6 +730,26 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
         <div className="flex-1 max-w-4xl mx-auto w-full grid grid-cols-1 md:grid-cols-2 gap-12">
           <div className="space-y-6">
             <h3 className="text-xl font-black">Upload Metaphase Spread</h3>
+            <div className="space-y-2">
+                      <label className="text-xs font-bold text-slate-500 uppercase">
+                        Target Level
+                      </label>
+
+                      <select
+                        value={selectedLevel}
+                        onChange={(e) => setSelectedLevel(Number(e.target.value))}
+                        className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white"
+                      >
+                        {levels.map(level => (
+                          <option
+                            key={level}
+                            value={level}
+                          >
+                            Level {level}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
 
             <input
               type="file"
@@ -689,60 +829,93 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
                    <p className="text-sm font-medium">No samples uploaded yet</p>
                  </div>
                ) : (
-                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
-                   {images.map((img) => (
-                     <div
-                       key={img.id}
-                       className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden cursor-pointer group relative aspect-square flex flex-col"
-                       onClick={() => {
-                         const url = img.originalUrl;
-                         if (!url) return;
-                         setAnnotateImageUrl(url);
-                         setAnnotateImageId(img.id);
-                       }}
-                     >
-                       {/* Delete Button */}
-                       <button
-                         onClick={(e) => deleteImage(img.id, e)}
-                         className="absolute top-2 right-2 z-10 w-7 h-7 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
-                         title="Delete Sample"
-                       >
-                         <Trash2 className="w-3.5 h-3.5" />
-                       </button>
+                <DndContext onDragEnd={handleFolderDrop}>
+                 <div className="space-y-6">
+                  {levels.map(level => (
+                      <LevelFolder
+                        key={level}
+                        level={level}
+                      >
+                      <div className="flex items-center justify-between mb-4">
+                        <h4 className="font-bold text-slate-700">
+                          📁 Level {level}
+                        </h4>
 
-                      <div className="absolute top-2 left-2 z-10 flex flex-col gap-1">
-                        <span className={cn(
-                          "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm uppercase backdrop-blur-md",
-                          "bg-slate-900/80 text-white w-fit"
-                        )}>
-                          RAW
+                        <span className="text-xs text-slate-400">
+                          {imagesByLevel[level].length} Samples
                         </span>
-                        {userRole === 'SUPER ADMIN' && img.uploaderEmail && (
-                          <span className={cn(
-                            "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm backdrop-blur-md",
-                            "bg-sky-500/90 text-white w-fit truncate max-w-[120px]"
-                          )} title={img.uploaderEmail}>
-                            {img.uploaderEmail}
-                          </span>
-                        )}
                       </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                         {imagesByLevel[level].map((img) => (
+                            <DraggableDatasetImage
+                              key={img.id}
+                              img={img}
+                            >
+                              <div
+                                className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden cursor-pointer group relative aspect-square flex flex-col"
+                              onClick={() => {
+                                const url = img.originalUrl;
+                                if (!url) return;
+                                setAnnotateImageUrl(url);
+                                setAnnotateImageId(img.id);
+                              }}
+                            >
+                              <button
+                                onClick={(e) => deleteImage(img.id, e)}
+                                className="absolute top-2 right-2 z-10 w-7 h-7 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
+                                title="Delete Sample"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
 
-                       <div className="relative flex-1 bg-slate-100 overflow-hidden">
-                         <img
-                           src={img.originalUrl}
-                           alt="Sample"
-                           className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
-                         />
-                         <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
-                           <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 flex items-center gap-2 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-lg shadow-xl">
-                             <Pencil className="w-3.5 h-3.5 text-slate-900" />
-                             <span className="text-[10px] font-bold text-slate-900">Annotate</span>
-                           </div>
-                         </div>
-                       </div>
-                     </div>
-                   ))}
-                 </div>
+                              <div className="absolute top-2 left-2 z-10 flex flex-col gap-1">
+                                <span
+                                  className={cn(
+                                    "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm uppercase backdrop-blur-md",
+                                    "bg-slate-900/80 text-white w-fit"
+                                  )}
+                                >
+                                  RAW
+                                </span>
+
+                                {userRole === 'SUPER ADMIN' && img.uploaderEmail && (
+                                  <span
+                                    className={cn(
+                                      "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm backdrop-blur-md",
+                                      "bg-sky-500/90 text-white w-fit truncate max-w-[120px]"
+                                    )}
+                                    title={img.uploaderEmail}
+                                  >
+                                    {img.uploaderEmail}
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="relative flex-1 bg-slate-100 overflow-hidden">
+                                <img
+                                  src={img.originalUrl}
+                                  alt="Sample"
+                                  draggable={false}
+                                  className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
+                                />
+
+                                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
+                                  <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 flex items-center gap-2 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-lg shadow-xl">
+                                    <Pencil className="w-3.5 h-3.5 text-slate-900" />
+                                    <span className="text-[10px] font-bold text-slate-900">
+                                      Annotate
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                           </DraggableDatasetImage>
+                          ))}
+                        </div>
+                    </LevelFolder>
+                  ))}
+                </div>
+               </DndContext>
                )}
              </div>
           </div>
@@ -1045,7 +1218,8 @@ export default function Chromy() {
             id: row.id,
             originalUrl: row.original_url,
             xml: row.xml,
-            uploaderEmail: row.uploader_email
+            uploaderEmail: row.uploader_email,
+            level: row.level || 1
           })));
         }
       } catch (e: any) {
