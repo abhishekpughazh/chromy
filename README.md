@@ -21,7 +21,17 @@ cd chromy
 npm install
 ```
 
-### 3. Run the app
+### 3. Configure environment variables
+
+Copy `.env.example` to `.env` and fill in your Supabase project URL and anon key.
+
+### 4. Configure auth email (Resend)
+
+Supabase's default auth email sender is heavily rate-limited. To allow more signups, connect [Resend](https://resend.com) as your email provider.
+
+See **[docs/RESEND_SETUP.md](docs/RESEND_SETUP.md)** for step-by-step instructions (SMTP integration or Edge Function).
+
+### 5. Run the app
 
 ```bash
 npm run dev

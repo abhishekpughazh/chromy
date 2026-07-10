@@ -28,7 +28,7 @@ import { cn } from './lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Info, RotateCcw, CheckCircle2, ChevronRight, Dna, Undo2, 
-  ShieldCheck, Upload, Play, Beaker, X, Loader, ImageIcon, Zap, Pencil, Trash2, RotateCw, FlipHorizontal, FlipVertical, Expand, Download
+  ShieldCheck, Upload, Play, Beaker, X, Loader, ImageIcon, Zap, Pencil, Trash2, RotateCw, FlipHorizontal, FlipVertical, Expand, Download, FolderPlus, Folder
 } from 'lucide-react';
 
 // --- Types ---
@@ -484,13 +484,183 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
   }
 };
 
+interface Bucket {
+  id: string;
+  bucketNumber: number;
+  name: string;
+  description: string;
+}
+
 interface AdminImage {
   id: string;
   originalUrl: string;
   xml?: string;
   uploaderEmail?: string;
-  level?: number
+  bucketId?: string | null;
 }
+
+const formatBucketLabel = (bucket: Bucket) =>
+  `[${bucket.bucketNumber}] ${bucket.name}`;
+
+const BucketHeader: React.FC<{
+  bucketNumber?: number;
+  name: string;
+  description?: string;
+  sampleCount: number;
+  editable?: boolean;
+  onSave?: (name: string, description: string) => Promise<void>;
+}> = ({ bucketNumber, name, description, sampleCount, editable, onSave }) => {
+  const [expanded, setExpanded] = useState(false);
+  const [isClamped, setIsClamped] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editName, setEditName] = useState(name);
+  const [editDescription, setEditDescription] = useState(description ?? '');
+  const [saving, setSaving] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const descRef = useRef<HTMLParagraphElement>(null);
+
+  useEffect(() => {
+    if (!isEditing) {
+      setEditName(name);
+      setEditDescription(description ?? '');
+    }
+  }, [name, description, isEditing]);
+
+  useEffect(() => {
+    const el = descRef.current;
+    if (el && !isEditing) {
+      setIsClamped(el.scrollHeight > el.clientHeight + 1);
+    }
+  }, [description, isEditing]);
+
+  const inputClassName =
+    'w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900/10 focus:border-slate-400 transition-colors';
+
+  const handleSave = async () => {
+    const trimmedName = editName.trim();
+    const trimmedDescription = editDescription.trim();
+    if (!trimmedName || !trimmedDescription) {
+      setEditError('Bucket name and description are required.');
+      return;
+    }
+    if (!onSave) return;
+
+    setSaving(true);
+    setEditError(null);
+    try {
+      await onSave(trimmedName, trimmedDescription);
+      setIsEditing(false);
+    } catch (err: any) {
+      setEditError(err.message || 'Failed to update bucket');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCancel = () => {
+    setEditName(name);
+    setEditDescription(description ?? '');
+    setEditError(null);
+    setIsEditing(false);
+  };
+
+  return (
+    <div className="mb-5">
+      <div className="flex items-center justify-between gap-2 mb-1.5">
+        <span className="text-[10px] font-mono font-bold text-slate-400 tracking-widest uppercase">
+          {bucketNumber !== undefined ? `Bucket ${bucketNumber}` : 'Unassigned'}
+        </span>
+        <div className="flex items-center gap-2">
+          {editable && !isEditing && onSave && (
+            <button
+              type="button"
+              onClick={() => setIsEditing(true)}
+              className="flex items-center gap-1 text-[10px] font-bold text-slate-400 hover:text-slate-700 transition-colors"
+            >
+              <Pencil className="w-3 h-3" />
+              Edit
+            </button>
+          )}
+          <span className="text-[10px] font-mono font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-md">
+            {sampleCount} {sampleCount === 1 ? 'Sample' : 'Samples'}
+          </span>
+        </div>
+      </div>
+
+      {isEditing ? (
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <label className="text-xs font-bold text-slate-500 uppercase">Bucket Name</label>
+            <input
+              type="text"
+              value={editName}
+              onChange={(e) => setEditName(e.target.value)}
+              className={inputClassName}
+            />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs font-bold text-slate-500 uppercase">Description</label>
+            <textarea
+              value={editDescription}
+              onChange={(e) => setEditDescription(e.target.value)}
+              rows={3}
+              className={cn(inputClassName, 'resize-none')}
+            />
+          </div>
+          {editError && (
+            <p className="text-xs text-red-600 font-medium">{editError}</p>
+          )}
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saving}
+              className="flex-1 rounded-xl bg-slate-900 text-white py-2 text-xs font-bold hover:bg-slate-800 disabled:opacity-50"
+            >
+              {saving ? 'Saving...' : 'Save'}
+            </button>
+            <button
+              type="button"
+              onClick={handleCancel}
+              disabled={saving}
+              className="flex-1 rounded-xl border border-slate-300 text-slate-600 py-2 text-xs font-bold hover:bg-slate-50 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <h4 className="font-black text-slate-800 text-base leading-snug tracking-tight">
+            {name}
+          </h4>
+          {description && (
+            <div className="mt-1">
+              <p
+                ref={descRef}
+                className={cn(
+                  "text-xs text-slate-500 leading-relaxed",
+                  !expanded && "line-clamp-1"
+                )}
+              >
+                {description}
+              </p>
+              {(isClamped || expanded) && (
+                <button
+                  type="button"
+                  onClick={() => setExpanded(v => !v)}
+                  className="mt-0.5 text-[10px] font-bold text-slate-400 hover:text-slate-700 transition-colors"
+                >
+                  {expanded ? 'Show less ↑' : 'Show more ↓'}
+                </button>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
 
 import ImageAnnotationModal from './components/ImageAnnotationModal';
 
@@ -509,120 +679,363 @@ const DraggableDatasetImage = ({
   img: AdminImage;
   children: React.ReactNode;
 }) => {
-  const { attributes, listeners, setNodeRef, transform } = useDraggable({
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `dataset-${img.id}`,
     data: {
       imageId: img.id,
-      currentLevel: img.level || 1
+      currentBucketId: img.bucketId ?? null
     }
   });
 
   const style = transform
     ? {
-        transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`
+        transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`,
+        zIndex: isDragging ? 50 : undefined
       }
     : undefined;
 
-            return (
-          <div
-            ref={setNodeRef}
-            style={style}
-          >
-            {children}
-          </div>
-        );
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...listeners}
+      {...attributes}
+      className={cn(
+        "touch-none",
+        isDragging ? "opacity-40 cursor-grabbing" : "cursor-grab"
+      )}
+    >
+      {children}
+    </div>
+  );
 };
 
-const LevelFolder = ({
-  level,
+const BucketFolder = ({
+  bucket,
+  sampleCount,
+  editable,
+  onUpdate,
   children
 }: {
-  level: number;
+  bucket: Bucket;
+  sampleCount: number;
+  editable?: boolean;
+  onUpdate?: (name: string, description: string) => Promise<void>;
+  children: React.ReactNode;
+}) => (
+  <div className="rounded-xl border border-slate-200 bg-white p-4">
+    <BucketHeader
+      bucketNumber={bucket.bucketNumber}
+      name={bucket.name}
+      description={bucket.description}
+      sampleCount={sampleCount}
+      editable={editable}
+      onSave={onUpdate}
+    />
+    {children}
+  </div>
+);
+
+const UnassignedFolder = ({
+  sampleCount,
+  children
+}: {
+  sampleCount: number;
+  children: React.ReactNode;
+}) => (
+  <div className="rounded-xl border border-slate-200 bg-white p-4">
+    <BucketHeader
+      name="Unassigned"
+      description="Samples not yet placed in a bucket. Drag them into a bucket on the left."
+      sampleCount={sampleCount}
+    />
+    {children}
+  </div>
+);
+
+const DroppableBucketListItem = ({
+  droppableId,
+  active,
+  onClick,
+  children
+}: {
+  droppableId: string;
+  active: boolean;
+  onClick: () => void;
   children: React.ReactNode;
 }) => {
-  const { setNodeRef, isOver } = useDroppable({
-    id: `level-${level}`
-  });
-
-     return (
-      <div
-        ref={setNodeRef}
+  // prefix with "list-" so these IDs never duplicate BucketFolder/UnassignedFolder IDs
+  const { setNodeRef, isOver } = useDroppable({ id: `list-${droppableId}` });
+  return (
+    <li ref={setNodeRef}>
+      <button
+        type="button"
+        onClick={onClick}
         className={cn(
-          "rounded-xl border p-4 transition-all duration-200",
+          "w-full text-left px-3 py-2.5 rounded-xl transition-colors flex items-center justify-between gap-2 group",
           isOver
-            ? "border-sky-500 bg-sky-50 shadow-lg"
-            : "border-slate-200 bg-white"
+            ? "bg-sky-500 text-white scale-[1.02] shadow-md"
+            : active
+              ? "bg-slate-900 text-white"
+              : "hover:bg-slate-200 text-slate-700"
         )}
       >
-        <div
-          className={cn(
-            "mb-4 rounded-lg border-2 border-dashed px-3 py-2 text-center transition-all",
-            isOver
-              ? "border-sky-500 bg-sky-100"
-              : "border-slate-200 bg-slate-50"
-          )}
-        >
-          {isOver
-            ? `Drop sample into Level ${level}`
-            : `Level ${level} Folder`}
-        </div>
-
         {children}
-      </div>
-    );
+      </button>
+    </li>
+  );
 };
 
 const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, session, userRole }) => {
+  const canCreateBuckets = userRole === 'SUPER ADMIN';
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [moveError, setMoveError] = useState<string | null>(null);
   const [lastUpload, setLastUpload] = useState<AdminImage | null>(null);
-  const [selectedLevel, setSelectedLevel] = useState(1);
+  const [buckets, setBuckets] = useState<Bucket[]>([]);
+  const [selectedBucketId, setSelectedBucketId] = useState<string>('');
+  const [activeBucketId, setActiveBucketId] = useState<string | null>(null);
+  const [showCreateBucket, setShowCreateBucket] = useState(false);
+  const [newBucketName, setNewBucketName] = useState('');
+  const [newBucketDescription, setNewBucketDescription] = useState('');
+  const [creatingBucket, setCreatingBucket] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [annotateImageUrl, setAnnotateImageUrl] = useState<string | null>(null);
   const [annotateImageId, setAnnotateImageId] = useState<string | null>(null);
-  const levels = Array.from({ length: 10 }, (_, i) => i + 1);
 
-const imagesByLevel = levels.reduce((acc, level) => {
-  acc[level] = images.filter(img => (img.level || 1) === level);
-  return acc;
-}, {} as Record<number, AdminImage[]>);
+  const loadBuckets = async () => {
+    if (!session?.user) return;
+    try {
+      const { data, error } = await supabase
+        .from('buckets')
+        .select('*')
+        .order('bucket_number', { ascending: true });
 
-const handleFolderDrop = async (event: DragEndEvent) => {
-  const { active, over } = event;
+      if (error) throw error;
 
-  if (!over) return;
+      const loaded = (data ?? []).map(row => ({
+        id: row.id,
+        bucketNumber: row.bucket_number,
+        name: row.name,
+        description: row.description
+      }));
 
-  const imageId = String(active.id).replace(
-    'dataset-',
-    ''
-  );
+      setBuckets(loaded);
+      if (loaded.length > 0 && !selectedBucketId) {
+        setSelectedBucketId(loaded[0].id);
+      }
+      if (loaded.length > 0 && activeBucketId === null) {
+        setActiveBucketId(loaded[0].id);
+      }
+    } catch (err) {
+      console.error('Failed to load buckets:', err);
+    }
+  };
 
-  const targetLevel = Number(
-    String(over.id).replace('level-', '')
-  );
+  useEffect(() => {
+    loadBuckets();
+  }, [session?.user?.id]);
 
-  if (Number.isNaN(targetLevel)) return;
+  const imagesByBucket = buckets.reduce((acc, bucket) => {
+    acc[bucket.id] = images.filter(img => img.bucketId === bucket.id);
+    return acc;
+  }, {} as Record<string, AdminImage[]>);
 
-  try {
-    await supabase
-      .from('samples')
-      .update({ level: targetLevel })
-      .eq('id', imageId);
+  const unassignedImages = images.filter(img => !img.bucketId);
 
-    setImages(prev =>
-      prev.map(img =>
-        img.id === imageId
-          ? {
-              ...img,
-              level: targetLevel
-            }
-          : img
+  const handleCreateBucket = async () => {
+    if (!session?.user) return;
+    if (!canCreateBuckets) {
+      setUploadError('Only super admins can create buckets.');
+      return;
+    }
+    const name = newBucketName.trim();
+    const description = newBucketDescription.trim();
+    if (!name || !description) {
+      setUploadError('Bucket name and description are required.');
+      return;
+    }
+
+    setCreatingBucket(true);
+    setUploadError(null);
+
+    try {
+      const { data: existing } = await supabase
+        .from('buckets')
+        .select('bucket_number')
+        .eq('user_id', session.user.id)
+        .order('bucket_number', { ascending: false })
+        .limit(1);
+
+      const nextNumber = (existing?.[0]?.bucket_number ?? 0) + 1;
+
+      const { data, error } = await supabase
+        .from('buckets')
+        .insert({
+          user_id: session.user.id,
+          bucket_number: nextNumber,
+          name,
+          description
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      const newBucket: Bucket = {
+        id: data.id,
+        bucketNumber: data.bucket_number,
+        name: data.name,
+        description: data.description
+      };
+
+      setBuckets(prev => [...prev, newBucket].sort((a, b) => a.bucketNumber - b.bucketNumber));
+      setSelectedBucketId(newBucket.id);
+      setActiveBucketId(newBucket.id);
+      setNewBucketName('');
+      setNewBucketDescription('');
+      setShowCreateBucket(false);
+    } catch (err: any) {
+      setUploadError(err.message || 'Failed to create bucket');
+    } finally {
+      setCreatingBucket(false);
+    }
+  };
+
+  const handleUpdateBucket = async (bucketId: string, name: string, description: string) => {
+    const { data, error } = await supabase
+      .from('buckets')
+      .update({ name, description })
+      .eq('id', bucketId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) throw new Error('Could not update bucket. You may not have permission.');
+
+    setBuckets(prev =>
+      prev.map(bucket =>
+        bucket.id === bucketId
+          ? { ...bucket, name: data.name, description: data.description }
+          : bucket
       )
     );
-  } catch (err) {
-    console.error('Failed to move sample:', err);
-  }
-};
+  };
+
+  const folderDragSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } })
+  );
+
+  const resolveTargetBucketId = (overId: string): string | null | undefined => {
+    // left-side list item drop targets
+    if (overId === 'list-bucket-unassigned') return null;
+    if (overId.startsWith('list-bucket-')) {
+      return overId.replace('list-bucket-', '');
+    }
+
+    // dropping directly onto another sample card — inherit its bucket
+    if (overId.startsWith('dataset-')) {
+      const targetImageId = overId.replace('dataset-', '');
+      const targetImage = images.find(image => image.id === targetImageId);
+      if (!targetImage) return undefined;
+      return targetImage.bucketId ?? null;
+    }
+
+    return undefined;
+  };
+
+  const handleFolderDrop = async (event: DragEndEvent) => {
+    const { active, over } = event;
+
+    if (!over) return;
+
+    const imageId = String(active.id).replace('dataset-', '');
+    const currentBucketId =
+      (active.data.current as { currentBucketId?: string | null } | undefined)?.currentBucketId ?? null;
+
+    const targetBucketId = resolveTargetBucketId(String(over.id));
+    if (targetBucketId === undefined) return;
+    if (currentBucketId === targetBucketId) return;
+
+    try {
+      setMoveError(null);
+
+      const { data, error } = await supabase
+        .from('samples')
+        .update({ bucket_id: targetBucketId })
+        .eq('id', imageId)
+        .select('id, bucket_id');
+
+      if (error) throw error;
+      if (!data?.length) {
+        throw new Error('Could not save bucket change. Check that the bucket_id column exists and you have permission to move this sample.');
+      }
+
+      setImages(prev =>
+        prev.map(img =>
+          img.id === imageId
+            ? { ...img, bucketId: data[0].bucket_id ?? null }
+            : img
+        )
+      );
+    } catch (err: any) {
+      console.error('Failed to move sample:', err);
+      setMoveError(err.message || 'Failed to move sample between buckets.');
+    }
+  };
+
+  const renderSampleCard = (img: AdminImage) => (
+    <DraggableDatasetImage key={img.id} img={img}>
+      <div
+        className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden group relative aspect-square flex flex-col"
+        onClick={() => {
+          const url = img.originalUrl;
+          if (!url) return;
+          setAnnotateImageUrl(url);
+          setAnnotateImageId(img.id);
+        }}
+      >
+        <button
+          onClick={(e) => deleteImage(img.id, e)}
+          className="absolute top-2 right-2 z-10 w-7 h-7 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
+          title="Delete Sample"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+
+        <div className="absolute top-2 left-2 z-10 flex flex-col gap-1">
+          <span
+            className={cn(
+              "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm uppercase backdrop-blur-md",
+              "bg-slate-900/80 text-white w-fit"
+            )}
+          >
+            RAW
+          </span>
+        </div>
+
+        <div className="relative flex-1 bg-slate-100 overflow-hidden">
+          <img
+            src={img.originalUrl}
+            alt="Sample"
+            draggable={false}
+            className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
+          />
+
+          <div className="absolute inset-0 pointer-events-none bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
+            <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 flex items-center gap-2 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-lg shadow-xl">
+              <Pencil className="w-3.5 h-3.5 text-slate-900" />
+              <span className="text-[10px] font-bold text-slate-900">
+                Annotate
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </DraggableDatasetImage>
+  );
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -633,6 +1046,10 @@ const handleFolderDrop = async (event: DragEndEvent) => {
 
   const handleUpload = async (file: File) => {
     if (!session?.user) return;
+    if (!selectedBucketId) {
+      setUploadError('Please select or create a bucket before uploading.');
+      return;
+    }
     setUploading(true);
     setUploadError(null);
 
@@ -660,7 +1077,7 @@ const handleFolderDrop = async (event: DragEndEvent) => {
           uploader_email: session.user.email,
           original_url: publicUrl,
           xml: '',
-          level: selectedLevel
+          bucket_id: selectedBucketId
         })
         .select()
         .single();
@@ -675,7 +1092,7 @@ const handleFolderDrop = async (event: DragEndEvent) => {
         originalUrl: publicUrl,
         xml: '',
         uploaderEmail: session.user.email,
-        level: selectedLevel
+        bucketId: selectedBucketId
       };
       
       setImages(prev => [newImage, ...prev]);
@@ -724,29 +1141,141 @@ const handleFolderDrop = async (event: DragEndEvent) => {
         </button>
       </header>
 
+        <DndContext sensors={folderDragSensors} onDragEnd={handleFolderDrop}>
         <div className="flex-1 max-w-4xl mx-auto w-full grid grid-cols-1 md:grid-cols-2 gap-12">
           <div className="space-y-6">
             <h3 className="text-xl font-black">Upload Metaphase Spread</h3>
-            <div className="space-y-2">
-                      <label className="text-xs font-bold text-slate-500 uppercase">
-                        Target Level
-                      </label>
 
-                      <select
-                        value={selectedLevel}
-                        onChange={(e) => setSelectedLevel(Number(e.target.value))}
-                        className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white"
-                      >
-                        {levels.map(level => (
-                          <option
-                            key={level}
-                            value={level}
-                          >
-                            Level {level}
-                          </option>
-                        ))}
-                      </select>
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-500 uppercase">
+                  Target Bucket
+                </label>
+                {buckets.length === 0 ? (
+                  <p className="text-sm text-amber-600 font-medium">
+                    {canCreateBuckets
+                      ? 'Create a bucket below before uploading samples.'
+                      : 'No buckets available. Ask a super admin to create one before uploading.'}
+                  </p>
+                ) : (
+                  <select
+                    value={selectedBucketId}
+                    onChange={(e) => setSelectedBucketId(e.target.value)}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white"
+                  >
+                    {buckets.map(bucket => (
+                      <option key={bucket.id} value={bucket.id}>
+                        {formatBucketLabel(bucket)}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {selectedBucketId && (
+                  <p className="text-xs text-slate-500">
+                    {buckets.find(b => b.id === selectedBucketId)?.description}
+                  </p>
+                )}
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-sm font-bold text-slate-700">Buckets</h4>
+                  {canCreateBuckets && (
+                    <button
+                      type="button"
+                      onClick={() => setShowCreateBucket(prev => !prev)}
+                      className="flex items-center gap-1.5 text-xs font-bold text-sky-600 hover:text-sky-700"
+                    >
+                      <FolderPlus className="w-4 h-4" />
+                      {showCreateBucket ? 'Cancel' : 'New Bucket'}
+                    </button>
+                  )}
+                </div>
+
+                {canCreateBuckets && showCreateBucket && (
+                  <div className="space-y-3 pt-1">
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold text-slate-500 uppercase">
+                        Bucket Name
+                      </label>
+                      <input
+                        type="text"
+                        value={newBucketName}
+                        onChange={(e) => setNewBucketName(e.target.value)}
+                        placeholder="e.g. Normal Karyotypes"
+                        className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white text-sm"
+                      />
                     </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold text-slate-500 uppercase">
+                        Description
+                      </label>
+                      <textarea
+                        value={newBucketDescription}
+                        onChange={(e) => setNewBucketDescription(e.target.value)}
+                        placeholder="What do the spreads in this bucket have in common?"
+                        rows={3}
+                        className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white text-sm resize-none"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleCreateBucket}
+                      disabled={creatingBucket}
+                      className="w-full rounded-xl bg-slate-900 text-white py-2.5 text-sm font-bold hover:bg-slate-800 disabled:opacity-50"
+                    >
+                      {creatingBucket ? 'Creating...' : 'Create Bucket'}
+                    </button>
+                  </div>
+                )}
+
+                {!showCreateBucket && (
+                  buckets.length === 0 ? (
+                    <p className="text-xs text-slate-400">No buckets yet.</p>
+                  ) : (
+                    <ul className="space-y-1">
+                      {buckets.map(bucket => {
+                        const count = (imagesByBucket[bucket.id] ?? []).length;
+                        const active = activeBucketId === bucket.id;
+                        return (
+                          <DroppableBucketListItem
+                            key={bucket.id}
+                            droppableId={`bucket-${bucket.id}`}
+                            active={active}
+                            onClick={() => setActiveBucketId(bucket.id)}
+                          >
+                            <span className="text-sm font-bold truncate">
+                              [{bucket.bucketNumber}] {bucket.name}
+                            </span>
+                            <span className={cn(
+                              "text-[10px] font-mono font-bold shrink-0 px-1.5 py-0.5 rounded",
+                              active ? "bg-white/20 text-white" : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
+                            )}>
+                              {count}
+                            </span>
+                          </DroppableBucketListItem>
+                        );
+                      })}
+                      {unassignedImages.length > 0 && (
+                        <DroppableBucketListItem
+                          droppableId="bucket-unassigned"
+                          active={activeBucketId === 'unassigned'}
+                          onClick={() => setActiveBucketId('unassigned')}
+                        >
+                          <span className="text-sm font-bold">Unassigned</span>
+                          <span className={cn(
+                            "text-[10px] font-mono font-bold shrink-0 px-1.5 py-0.5 rounded",
+                            activeBucketId === 'unassigned' ? "bg-white/20 text-white" : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
+                          )}>
+                            {unassignedImages.length}
+                          </span>
+                        </DroppableBucketListItem>
+                      )}
+                    </ul>
+                  )
+                )}
+              </div>
+            </div>
 
             <input
               type="file"
@@ -754,19 +1283,28 @@ const handleFolderDrop = async (event: DragEndEvent) => {
               className="hidden"
               ref={fileInputRef}
               onChange={handleFileChange}
+              disabled={!selectedBucketId}
             />
 
               <div
-              onClick={() => fileInputRef.current?.click()}
+              onClick={() => selectedBucketId && fileInputRef.current?.click()}
               onDragOver={(e) => { e.preventDefault(); }}
               onDrop={(e) => {
                 e.preventDefault();
+                if (!selectedBucketId) {
+                  setUploadError('Please select or create a bucket before uploading.');
+                  return;
+                }
                 const file = e.dataTransfer.files[0];
                 if (file) handleUpload(file);
               }}
               className={cn(
-                "p-12 border-4 border-dashed rounded-3xl flex flex-col items-center justify-center text-center group transition-colors cursor-pointer bg-slate-50/50",
-                uploading ? "border-sky-300 bg-sky-50/50" : "border-slate-100 hover:border-slate-300"
+                "p-12 border-4 border-dashed rounded-3xl flex flex-col items-center justify-center text-center group transition-colors bg-slate-50/50",
+                !selectedBucketId
+                  ? "border-slate-100 opacity-60 cursor-not-allowed"
+                  : uploading
+                    ? "border-sky-300 bg-sky-50/50 cursor-pointer"
+                    : "border-slate-100 hover:border-slate-300 cursor-pointer"
               )}
             >
               {uploading ? (
@@ -775,7 +1313,13 @@ const handleFolderDrop = async (event: DragEndEvent) => {
                 <Upload className="w-12 h-12 text-slate-300 group-hover:text-slate-900 transition-colors mb-4" />
               )}
               <p className="font-bold text-slate-400 group-hover:text-slate-900">
-                {uploading ? 'Processing...' : 'Upload JPG, JPEG or PNG'}
+                {!selectedBucketId
+                  ? (canCreateBuckets
+                      ? 'Create a bucket to enable uploads'
+                      : 'Select an existing bucket to enable uploads')
+                  : uploading
+                    ? 'Processing...'
+                    : 'Upload JPG, JPEG or PNG'}
               </p>
               <p className="text-sm text-slate-300">Click or drag & drop</p>
               {uploadError && (
@@ -802,109 +1346,83 @@ const handleFolderDrop = async (event: DragEndEvent) => {
                  Instructions
                </h4>
                <ul className="space-y-4 text-sm text-slate-300">
-                 <li className="flex items-start gap-3">
-                   <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">1</div>
-                   Upload a metaphase spread image.
-                 </li>
+                 {canCreateBuckets ? (
+                   <li className="flex items-start gap-3">
+                     <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">1</div>
+                     Create a bucket with a name and description, then upload a metaphase spread into it.
+                   </li>
+                 ) : (
+                   <li className="flex items-start gap-3">
+                     <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">1</div>
+                     Select an existing bucket, then upload a metaphase spread into it.
+                   </li>
+                 )}
                  <li className="flex items-start gap-3">
                    <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">2</div>
-                   Click on the uploaded sample in the gallery to open the annotation tool and outline individual chromosomes.
+                   Drag samples between buckets to reorganize them.
+                 </li>
+                 <li className="flex items-start gap-3">
+                   <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">3</div>
+                   Click on an uploaded sample to open the annotation tool and outline individual chromosomes.
                  </li>
                </ul>
             </div>
           </div>
 
           <div className="bg-slate-50 rounded-3xl p-8 border border-slate-100 flex flex-col h-full max-h-[800px]">
-             <div className="flex items-center justify-between mb-6 shrink-0">
-               <h3 className="text-xl font-black">Available Dataset</h3>
-               <span className="text-xs font-mono font-bold text-slate-400 bg-slate-200 px-2 py-1 rounded-md">{images.length} SAMPLES</span>
-             </div>
-             
-             <div className="flex-1 overflow-y-auto pr-2 pb-4 scrollbar-hide">
-               {images.length === 0 ? (
-                 <div className="h-full flex flex-col items-center justify-center text-center text-slate-300">
-                   <p className="text-sm font-medium">No samples uploaded yet</p>
-                 </div>
-               ) : (
-                <DndContext onDragEnd={handleFolderDrop}>
-                 <div className="space-y-6">
-                  {levels.map(level => (
-                      <LevelFolder
-                        key={level}
-                        level={level}
-                      >
-                      <div className="flex items-center justify-between mb-4">
-                        <h4 className="font-bold text-slate-700">
-                          📁 Level {level}
-                        </h4>
+            <div className="flex items-center justify-between mb-6 shrink-0">
+              <h3 className="text-xl font-black">Available Dataset</h3>
+              <span className="text-xs font-mono font-bold text-slate-400 bg-slate-200 px-2 py-1 rounded-md">{images.length} SAMPLES</span>
+            </div>
 
-                        <span className="text-xs text-slate-400">
-                          {imagesByLevel[level].length} Samples
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
-                         {imagesByLevel[level].map((img) => (
-                            <DraggableDatasetImage
-                              key={img.id}
-                              img={img}
-                            >
-                              <div
-                                className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden cursor-pointer group relative aspect-square flex flex-col"
-                              onClick={() => {
-                                const url = img.originalUrl;
-                                if (!url) return;
-                                setAnnotateImageUrl(url);
-                                setAnnotateImageId(img.id);
-                              }}
-                            >
-                              <button
-                                 onClick={(e) => deleteImage(img.id, e)}
-                                className="absolute top-2 right-2 z-10 w-7 h-7 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
-                                title="Delete Sample"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+            {moveError && (
+              <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600 font-medium shrink-0">
+                {moveError}
+              </div>
+            )}
 
-                              <div className="absolute top-2 left-2 z-10 flex flex-col gap-1">
-                                <span
-                                  className={cn(
-                                    "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm uppercase backdrop-blur-md",
-                                    "bg-slate-900/80 text-white w-fit"
-                                  )}
-                                >
-                                  RAW
-                                </span>
-                              </div>
-
-                              <div className="relative flex-1 bg-slate-100 overflow-hidden">
-                                <img
-                                  src={img.originalUrl}
-                                  alt="Sample"
-                                  draggable={false}
-                                  className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
-                                />
-
-                                <div className="absolute inset-0 pointer-events-none bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
-                                  <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 flex items-center gap-2 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-lg shadow-xl">
-                                    <Pencil className="w-3.5 h-3.5 text-slate-900" />
-                                    <span className="text-[10px] font-bold text-slate-900">
-                                      Annotate
-                                    </span>
-                                  </div>
-                                </div>
-                              </div>
-                            </div>
-                           </DraggableDatasetImage>
-                          ))}
-                        </div>
-                    </LevelFolder>
-                  ))}
+            <div className="flex-1 overflow-y-auto pr-2 pb-4 scrollbar-hide">
+              {activeBucketId === null ? (
+                <div className="h-full flex flex-col items-center justify-center text-center text-slate-300">
+                  <Folder className="w-8 h-8 mb-3 opacity-40" />
+                  <p className="text-sm font-medium">Select a bucket on the left to view its samples</p>
                 </div>
-               </DndContext>
-               )}
-             </div>
+              ) : (
+                  activeBucketId === 'unassigned' ? (
+                    <UnassignedFolder sampleCount={unassignedImages.length}>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 min-h-[4rem]">
+                        {unassignedImages.map(img => renderSampleCard(img))}
+                      </div>
+                    </UnassignedFolder>
+                  ) : (() => {
+                    const bucket = buckets.find(b => b.id === activeBucketId);
+                    if (!bucket) return null;
+                    const bucketImages = imagesByBucket[bucket.id] ?? [];
+                    return (
+                      <BucketFolder
+                        bucket={bucket}
+                        sampleCount={bucketImages.length}
+                        editable={canCreateBuckets}
+                        onUpdate={(name, description) => handleUpdateBucket(bucket.id, name, description)}
+                      >
+                        {bucketImages.length === 0 ? (
+                          <div className="flex flex-col items-center justify-center py-12 text-slate-300 text-center">
+                            <p className="text-xs font-medium">No samples in this bucket yet</p>
+                            <p className="text-xs mt-1">Upload a spread or drag one here from another bucket</p>
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 min-h-[4rem]">
+                            {bucketImages.map(img => renderSampleCard(img))}
+                          </div>
+                        )}
+                      </BucketFolder>
+                    );
+                  })()
+              )}
+            </div>
           </div>
         </div>
+        </DndContext>
       {annotateImageUrl && annotateImageId && (
         <ImageAnnotationModal
           imageUrl={annotateImageUrl}
@@ -1040,6 +1558,9 @@ const AuthForm = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const inputClassName =
+    'w-full rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900/10 focus:border-slate-400 transition-colors';
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -1057,6 +1578,7 @@ const AuthForm = () => {
           email,
           password,
           options: {
+            emailRedirectTo: window.location.origin,
             data: {
               username,
             }
@@ -1073,70 +1595,128 @@ const AuthForm = () => {
   };
 
   return (
-    <div className="w-full">
-      <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-        {!isLogin && (
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Username</label>
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              className="w-full px-4 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-500"
-              placeholder="Cytogeneticist"
-              required={!isLogin}
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      className="fixed inset-0 z-[100] bg-white flex items-center justify-center p-6 overflow-hidden"
+    >
+      <div className="absolute inset-0 opacity-[0.03] pointer-events-none bg-[radial-gradient(#000_1px,transparent_1px)] [background-size:24px_24px]" />
+
+      <div className="w-full max-w-md relative z-10">
+        <motion.div
+          initial={{ scale: 0.95, y: 16 }}
+          animate={{ scale: 1, y: 0 }}
+          className="bg-white border border-slate-100 rounded-3xl shadow-xl shadow-slate-900/5 p-8 md:p-10"
+        >
+          <div className="text-center mb-8">
+            <motion.img
+              src="/logo.png"
+              alt="Chromy"
+              className="w-20 h-20 object-contain mx-auto mb-5 drop-shadow-md"
+              animate={{
+                y: [-4, 4, -4],
+                rotate: [-2, 2, -2]
+              }}
+              transition={{
+                duration: 4,
+                repeat: Infinity,
+                ease: 'easeInOut'
+              }}
             />
+            <h1 className="text-4xl font-black text-slate-900 tracking-tighter mb-2">
+              Chromy.
+            </h1>
+            <p className="text-slate-500 text-sm font-medium">
+              {isLogin
+                ? 'Sign in to access the karyotyping laboratory.'
+                : 'Create an account to start practicing karyotyping.'}
+            </p>
           </div>
-        )}
-        
-        <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">Email</label>
-          <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            className="w-full px-4 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-500"
-            placeholder="you@lab.com"
-            required
-          />
-        </div>
 
-        <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            className="w-full px-4 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-500"
-            placeholder="••••••••"
-            required
-          />
-        </div>
+          <form onSubmit={handleSubmit} className="space-y-5">
+            {!isLogin && (
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-500 uppercase tracking-wide">
+                  Username
+                </label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  className={inputClassName}
+                  placeholder="Cytogeneticist"
+                  required={!isLogin}
+                />
+              </div>
+            )}
 
-        {error && <p className="text-red-500 text-sm">{error}</p>}
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-wide">
+                Email
+              </label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className={inputClassName}
+                placeholder="you@lab.com"
+                required
+              />
+            </div>
 
-        <button
-          type="submit"
-          disabled={loading}
-          className="w-full py-3 bg-sky-500 text-white rounded-lg font-bold hover:bg-sky-600 transition-colors disabled:opacity-50"
-        >
-          {loading ? 'Processing...' : isLogin ? 'Sign In' : 'Sign Up'}
-        </button>
-      </form>
-      
-      <div className="mt-6 text-center">
-        <button
-          type="button"
-          onClick={() => {
-            setIsLogin(!isLogin);
-            setError(null);
-          }}
-          className="text-sm text-sky-500 hover:text-sky-600 hover:underline"
-        >
-          {isLogin ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}
-        </button>
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-wide">
+                Password
+              </label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className={inputClassName}
+                placeholder="••••••••"
+                required
+              />
+            </div>
+
+            {error && (
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600 font-medium">
+                {error}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full flex items-center justify-center gap-2 bg-slate-900 text-white px-6 py-3.5 rounded-xl font-black text-sm hover:scale-[1.02] transition-all shadow-xl shadow-slate-900/20 active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
+            >
+              {loading ? (
+                <>
+                  <Loader className="w-4 h-4 animate-spin" />
+                  Processing...
+                </>
+              ) : isLogin ? (
+                'Sign In'
+              ) : (
+                'Sign Up'
+              )}
+            </button>
+          </form>
+
+          <div className="mt-8 pt-6 border-t border-slate-100 text-center">
+            <button
+              type="button"
+              onClick={() => {
+                setIsLogin(!isLogin);
+                setError(null);
+              }}
+              className="text-xs font-mono tracking-widest uppercase text-slate-400 hover:text-slate-900 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 focus-visible:ring-offset-2 rounded-md px-2 py-1"
+            >
+              {isLogin ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}
+            </button>
+          </div>
+        </motion.div>
       </div>
-    </div>
+    </motion.div>
   );
 };
 
@@ -1204,7 +1784,7 @@ export default function Chromy() {
             originalUrl: row.original_url,
             xml: row.xml,
             uploaderEmail: row.uploader_email,
-            level: row.level || 1
+            bucketId: row.bucket_id ?? null
           })));
         }
       } catch (e: any) {
@@ -1364,20 +1944,7 @@ export default function Chromy() {
   return (
     <>
       {!session ? (
-        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border border-slate-200">
-            <div className="flex items-center justify-center gap-3 mb-8">
-              <div className="w-12 h-12 bg-slate-900 rounded-xl flex items-center justify-center text-white">
-                <Dna className="w-8 h-8" />
-              </div>
-              <div>
-                <h1 className="text-2xl font-black tracking-tight text-slate-900">CHROMY</h1>
-                <p className="text-[10px] text-slate-400 font-mono tracking-widest uppercase">Login to continue</p>
-              </div>
-            </div>
-            <AuthForm />
-          </div>
-        </div>
+        <AuthForm />
       ) : (
         <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-sky-100 overflow-hidden">
           <AnimatePresence mode="wait">

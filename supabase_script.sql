@@ -57,38 +57,134 @@ create table if not exists public.samples (
 -- Add uploader_email column if the table already existed
 alter table public.samples add column if not exists uploader_email text;
 
+-- 2b. Create buckets table for grouping metaphase spreads
+create table if not exists public.buckets (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users(id) on delete cascade not null,
+  bucket_number integer not null,
+  name text not null,
+  description text not null,
+  created_at timestamp with time zone default timezone('utc'::text, now()) not null,
+  unique (user_id, bucket_number)
+);
+
+alter table public.buckets enable row level security;
+
+drop policy if exists "Users can view their own buckets and Super Admins can view all" on public.buckets;
+drop policy if exists "Users can insert their own buckets" on public.buckets;
+drop policy if exists "Users can update their own buckets" on public.buckets;
+drop policy if exists "Users can delete their own buckets" on public.buckets;
+drop policy if exists "Admins can view all buckets" on public.buckets;
+drop policy if exists "Only Super Admins can create buckets" on public.buckets;
+drop policy if exists "Only Super Admins can update buckets" on public.buckets;
+drop policy if exists "Only Super Admins can delete buckets" on public.buckets;
+
+create policy "Admins can view all buckets"
+  on public.buckets for select
+  using (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
+    )
+  );
+
+create policy "Only Super Admins can create buckets"
+  on public.buckets for insert
+  with check (
+    auth.uid() = user_id
+    and exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role = 'SUPER ADMIN'
+    )
+  );
+
+create policy "Only Super Admins can update buckets"
+  on public.buckets for update
+  using (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role = 'SUPER ADMIN'
+    )
+  )
+  with check (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role = 'SUPER ADMIN'
+    )
+  );
+
+create policy "Only Super Admins can delete buckets"
+  on public.buckets for delete
+  using (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role = 'SUPER ADMIN'
+    )
+  );
+
+-- Link samples to buckets (replaces legacy level column)
+alter table public.samples add column if not exists bucket_id uuid references public.buckets(id) on delete set null;
+alter table public.samples drop column if exists level;
+
 -- 3. Enable Row Level Security (RLS) on the samples table
 alter table public.samples enable row level security;
 
 -- 4. Create RLS policies for the samples table
 drop policy if exists "Users can view their own samples" on public.samples;
 drop policy if exists "Users can view their own samples and Super Admins can view all" on public.samples;
+drop policy if exists "Users can view their own samples and Admins can view all" on public.samples;
 drop policy if exists "Users can insert their own samples" on public.samples;
 drop policy if exists "Users can update their own samples" on public.samples;
 drop policy if exists "Users can delete their own samples" on public.samples;
 
--- Select: Owner can view, SUPER ADMIN can view all
-create policy "Users can view their own samples and Super Admins can view all"
+-- Select: Owner can view, ADMIN and SUPER ADMIN can view all
+create policy "Users can view their own samples and Admins can view all"
   on public.samples for select
   using ( 
     auth.uid() = user_id 
     or 
     exists (
       select 1 from public.user_roles 
-      where user_roles.user_id = auth.uid() and user_roles.role = 'SUPER ADMIN'
+      where user_roles.user_id = auth.uid() 
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
     )
   );
 
--- Insert/Update/Delete: Only the owner can modify
+-- Insert: Only the owner can create samples
 create policy "Users can insert their own samples"
   on public.samples for insert
   with check ( auth.uid() = user_id );
 
+-- Update: Owner can update their own, ADMIN and SUPER ADMIN can update any
+drop policy if exists "Admins can update all samples" on public.samples;
 create policy "Users can update their own samples"
   on public.samples for update
   using ( auth.uid() = user_id )
   with check ( auth.uid() = user_id );
 
+create policy "Admins can update all samples"
+  on public.samples for update
+  using (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
+    )
+  )
+  with check (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
+    )
+  );
+
+-- Delete: Only the owner can delete
 create policy "Users can delete their own samples"
   on public.samples for delete
   using ( auth.uid() = user_id );
