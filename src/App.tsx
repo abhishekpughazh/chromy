@@ -22,7 +22,10 @@ import {
   useSensor,
   useSensors,
   TouchSensor,
-  MouseSensor
+  MouseSensor,
+  pointerWithin,
+  closestCenter,
+  type CollisionDetection
 } from '@dnd-kit/core';
 import { cn } from './lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
@@ -672,14 +675,41 @@ interface AdminPanelProps {
   userRole: 'SUPER ADMIN' | 'ADMIN' | 'USER' | null;
 }
 
-const DraggableDatasetImage = ({
-  img,
-  children
-}: {
+/** Prefer the bucket under the pointer; fall back to nearest list row only when needed. */
+const bucketListCollisionDetection: CollisionDetection = (args) => {
+  const listContainers = args.droppableContainers.filter(({ id }) =>
+    String(id).startsWith('list-')
+  );
+  const scoped = { ...args, droppableContainers: listContainers };
+
+  const pointerHits = pointerWithin(scoped);
+  if (pointerHits.length > 0) return pointerHits;
+
+  // Only use closest-center when the pointer is within a few px of a row (gaps),
+  // so we never jump to a distant neighbor.
+  const nearby = closestCenter(scoped).filter(({ id }) => {
+    const rect = args.droppableRects.get(id);
+    const pointer = args.pointerCoordinates;
+    if (!rect || !pointer) return false;
+    const pad = 6;
+    return (
+      pointer.x >= rect.left - pad &&
+      pointer.x <= rect.right + pad &&
+      pointer.y >= rect.top - pad &&
+      pointer.y <= rect.bottom + pad
+    );
+  });
+  return nearby;
+};
+
+const DraggableDatasetImage: React.FC<{
   img: AdminImage;
   children: React.ReactNode;
+}> = ({
+  img,
+  children
 }) => {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `dataset-${img.id}`,
     data: {
       imageId: img.id,
@@ -687,22 +717,16 @@ const DraggableDatasetImage = ({
     }
   });
 
-  const style = transform
-    ? {
-        transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`,
-        zIndex: isDragging ? 50 : undefined
-      }
-    : undefined;
-
+  // Keep the source in place; DragOverlay follows the pointer so collision
+  // detection isn't polluted by the sample card's large bounding box.
   return (
     <div
       ref={setNodeRef}
-      style={style}
       {...listeners}
       {...attributes}
       className={cn(
         "touch-none",
-        isDragging ? "opacity-40 cursor-grabbing" : "cursor-grab"
+        isDragging ? "opacity-30 cursor-grabbing" : "cursor-grab"
       )}
     >
       {children}
@@ -753,31 +777,36 @@ const UnassignedFolder = ({
   </div>
 );
 
-const DroppableBucketListItem = ({
-  droppableId,
-  active,
-  onClick,
-  children
-}: {
+const DroppableBucketListItem: React.FC<{
   droppableId: string;
   active: boolean;
+  dragging?: boolean;
   onClick: () => void;
   children: React.ReactNode;
+}> = ({
+  droppableId,
+  active,
+  dragging,
+  onClick,
+  children
 }) => {
   // prefix with "list-" so these IDs never duplicate BucketFolder/UnassignedFolder IDs
   const { setNodeRef, isOver } = useDroppable({ id: `list-${droppableId}` });
   return (
-    <li ref={setNodeRef}>
+    <li>
       <button
+        ref={setNodeRef}
         type="button"
         onClick={onClick}
         className={cn(
-          "w-full text-left px-3 py-2.5 rounded-xl transition-colors flex items-center justify-between gap-2 group",
+          "w-full text-left px-3 py-3 rounded-xl transition-all flex items-center justify-between gap-2 group",
           isOver
-            ? "bg-sky-500 text-white scale-[1.02] shadow-md"
+            ? "bg-sky-500 text-white shadow-md ring-2 ring-sky-300 ring-offset-2 scale-[1.02]"
             : active
               ? "bg-slate-900 text-white"
-              : "hover:bg-slate-200 text-slate-700"
+              : dragging
+                ? "bg-white border-2 border-dashed border-sky-300 text-slate-700"
+                : "hover:bg-slate-200 text-slate-700"
         )}
       >
         {children}
@@ -795,6 +824,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
   const [buckets, setBuckets] = useState<Bucket[]>([]);
   const [selectedBucketId, setSelectedBucketId] = useState<string>('');
   const [activeBucketId, setActiveBucketId] = useState<string | null>(null);
+  const [draggingSample, setDraggingSample] = useState<AdminImage | null>(null);
   const [showCreateBucket, setShowCreateBucket] = useState(false);
   const [newBucketName, setNewBucketName] = useState('');
   const [newBucketDescription, setNewBucketDescription] = useState('');
@@ -924,30 +954,31 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
 
   const folderDragSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
-    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } })
   );
 
   const resolveTargetBucketId = (overId: string): string | null | undefined => {
-    // left-side list item drop targets
+    // Only left-side bucket list items are valid drop targets.
     if (overId === 'list-bucket-unassigned') return null;
     if (overId.startsWith('list-bucket-')) {
       return overId.replace('list-bucket-', '');
     }
-
-    // dropping directly onto another sample card — inherit its bucket
-    if (overId.startsWith('dataset-')) {
-      const targetImageId = overId.replace('dataset-', '');
-      const targetImage = images.find(image => image.id === targetImageId);
-      if (!targetImage) return undefined;
-      return targetImage.bucketId ?? null;
-    }
-
     return undefined;
+  };
+
+  const handleFolderDragStart = (event: DragStartEvent) => {
+    const imageId = String(event.active.id).replace('dataset-', '');
+    setDraggingSample(images.find(img => img.id === imageId) ?? null);
+    setMoveError(null);
+  };
+
+  const handleFolderDragCancel = () => {
+    setDraggingSample(null);
   };
 
   const handleFolderDrop = async (event: DragEndEvent) => {
     const { active, over } = event;
+    setDraggingSample(null);
 
     if (!over) return;
 
@@ -980,6 +1011,9 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
             : img
         )
       );
+
+      // Open the destination so the move is obvious
+      setActiveBucketId(targetBucketId ?? 'unassigned');
     } catch (err: any) {
       console.error('Failed to move sample:', err);
       setMoveError(err.message || 'Failed to move sample between buckets.');
@@ -1129,9 +1163,9 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
       initial={{ opacity: 0, x: 20 }}
       animate={{ opacity: 1, x: 0 }}
       exit={{ opacity: 0, x: 20 }}
-      className="fixed inset-0 z-[100] bg-white flex flex-col p-8"
+      className="fixed inset-0 z-[100] bg-white flex flex-col p-8 overflow-y-auto"
     >
-      <header className="flex items-center justify-between mb-12">
+      <header className="flex items-center justify-between mb-6 shrink-0">
         <div className="flex items-center gap-3">
           <ShieldCheck className="w-8 h-8 text-slate-900" />
           <h2 className="text-2xl font-black">Admin Console</h2>
@@ -1141,8 +1175,70 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
         </button>
       </header>
 
-        <DndContext sensors={folderDragSensors} onDragEnd={handleFolderDrop}>
-        <div className="flex-1 max-w-4xl mx-auto w-full grid grid-cols-1 md:grid-cols-2 gap-12">
+      <div className="mb-8 shrink-0 max-w-4xl mx-auto w-full rounded-2xl border border-slate-200 bg-gradient-to-r from-slate-50 to-sky-50/60 px-5 py-4">
+        <div className="flex items-stretch gap-0">
+          <div className="flex-1 min-w-0 flex items-start gap-3 pr-4">
+            <div className="w-9 h-9 rounded-xl bg-white border border-slate-200 shadow-sm flex items-center justify-center shrink-0">
+              {canCreateBuckets ? (
+                <FolderPlus className="w-4 h-4 text-sky-600" />
+              ) : (
+                <Folder className="w-4 h-4 text-sky-600" />
+              )}
+            </div>
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-sky-700/80 mb-0.5">
+                {canCreateBuckets ? 'Set up' : 'Choose'}
+              </p>
+              <p className="text-sm text-slate-600 leading-snug">
+                {canCreateBuckets
+                  ? 'Create a bucket, then upload a metaphase spread into it.'
+                  : 'Select a bucket, then upload a metaphase spread into it.'}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center shrink-0 px-1">
+            <ChevronRight className="w-4 h-4 text-slate-300" />
+          </div>
+
+          <div className="flex-1 min-w-0 flex items-start gap-3 px-4">
+            <div className="w-9 h-9 rounded-xl bg-white border border-slate-200 shadow-sm flex items-center justify-center shrink-0">
+              <Upload className="w-4 h-4 text-sky-600" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-sky-700/80 mb-0.5">Organize</p>
+              <p className="text-sm text-slate-600 leading-snug">
+                Drag samples onto buckets to reorganize them.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center shrink-0 px-1">
+            <ChevronRight className="w-4 h-4 text-slate-300" />
+          </div>
+
+          <div className="flex-1 min-w-0 flex items-start gap-3 pl-4">
+            <div className="w-9 h-9 rounded-xl bg-white border border-slate-200 shadow-sm flex items-center justify-center shrink-0">
+              <Pencil className="w-4 h-4 text-sky-600" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-sky-700/80 mb-0.5">Annotate</p>
+              <p className="text-sm text-slate-600 leading-snug">
+                Click a sample to outline individual chromosomes.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+        <DndContext
+          sensors={folderDragSensors}
+          collisionDetection={bucketListCollisionDetection}
+          onDragStart={handleFolderDragStart}
+          onDragEnd={handleFolderDrop}
+          onDragCancel={handleFolderDragCancel}
+        >
+        <div className="flex-1 max-w-4xl mx-auto w-full grid grid-cols-1 md:grid-cols-2 gap-12 pb-8">
           <div className="space-y-6">
             <h3 className="text-xl font-black">Upload Metaphase Spread</h3>
 
@@ -1233,7 +1329,12 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
                   buckets.length === 0 ? (
                     <p className="text-xs text-slate-400">No buckets yet.</p>
                   ) : (
-                    <ul className="space-y-1">
+                    <ul className={cn("space-y-2", draggingSample && "rounded-xl bg-sky-50/80 p-2 -mx-1")}>
+                      {draggingSample && (
+                        <li className="px-1 pb-1 text-[10px] font-bold uppercase tracking-wide text-sky-600">
+                          Drop onto a bucket
+                        </li>
+                      )}
                       {buckets.map(bucket => {
                         const count = (imagesByBucket[bucket.id] ?? []).length;
                         const active = activeBucketId === bucket.id;
@@ -1242,6 +1343,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
                             key={bucket.id}
                             droppableId={`bucket-${bucket.id}`}
                             active={active}
+                            dragging={!!draggingSample}
                             onClick={() => setActiveBucketId(bucket.id)}
                           >
                             <span className="text-sm font-bold truncate">
@@ -1249,23 +1351,32 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
                             </span>
                             <span className={cn(
                               "text-[10px] font-mono font-bold shrink-0 px-1.5 py-0.5 rounded",
-                              active ? "bg-white/20 text-white" : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
+                              active
+                                ? "bg-white/20 text-white"
+                                : draggingSample
+                                  ? "bg-sky-100 text-sky-700"
+                                  : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
                             )}>
                               {count}
                             </span>
                           </DroppableBucketListItem>
                         );
                       })}
-                      {unassignedImages.length > 0 && (
+                      {(unassignedImages.length > 0 || draggingSample) && (
                         <DroppableBucketListItem
                           droppableId="bucket-unassigned"
                           active={activeBucketId === 'unassigned'}
+                          dragging={!!draggingSample}
                           onClick={() => setActiveBucketId('unassigned')}
                         >
                           <span className="text-sm font-bold">Unassigned</span>
                           <span className={cn(
                             "text-[10px] font-mono font-bold shrink-0 px-1.5 py-0.5 rounded",
-                            activeBucketId === 'unassigned' ? "bg-white/20 text-white" : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
+                            activeBucketId === 'unassigned'
+                              ? "bg-white/20 text-white"
+                              : draggingSample
+                                ? "bg-sky-100 text-sky-700"
+                                : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
                           )}>
                             {unassignedImages.length}
                           </span>
@@ -1339,34 +1450,6 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
                 />
               </div>
             )}
-
-            <div className="bg-slate-900 text-white p-6 rounded-2xl shadow-xl">
-               <h4 className="flex items-center gap-2 font-bold mb-4">
-                 <Info className="w-5 h-5 text-sky-400" />
-                 Instructions
-               </h4>
-               <ul className="space-y-4 text-sm text-slate-300">
-                 {canCreateBuckets ? (
-                   <li className="flex items-start gap-3">
-                     <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">1</div>
-                     Create a bucket with a name and description, then upload a metaphase spread into it.
-                   </li>
-                 ) : (
-                   <li className="flex items-start gap-3">
-                     <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">1</div>
-                     Select an existing bucket, then upload a metaphase spread into it.
-                   </li>
-                 )}
-                 <li className="flex items-start gap-3">
-                   <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">2</div>
-                   Drag samples between buckets to reorganize them.
-                 </li>
-                 <li className="flex items-start gap-3">
-                   <div className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-bold shrink-0">3</div>
-                   Click on an uploaded sample to open the annotation tool and outline individual chromosomes.
-                 </li>
-               </ul>
-            </div>
           </div>
 
           <div className="bg-slate-50 rounded-3xl p-8 border border-slate-100 flex flex-col h-full max-h-[800px]">
@@ -1422,6 +1505,18 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
             </div>
           </div>
         </div>
+        <DragOverlay dropAnimation={null}>
+          {draggingSample ? (
+            <div className="w-28 aspect-square rounded-xl overflow-hidden border-2 border-sky-400 shadow-2xl bg-white rotate-2 cursor-grabbing">
+              <img
+                src={draggingSample.originalUrl}
+                alt="Moving sample"
+                className="w-full h-full object-cover"
+                draggable={false}
+              />
+            </div>
+          ) : null}
+        </DragOverlay>
         </DndContext>
       {annotateImageUrl && annotateImageId && (
         <ImageAnnotationModal
