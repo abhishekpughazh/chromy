@@ -28,6 +28,7 @@ import {
   type CollisionDetection
 } from '@dnd-kit/core';
 import { cn } from './lib/utils';
+import { normalizePairId, comparePairIds, MAX_CHROMOSOMES_PER_PAIR } from './lib/chromosomePairs';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Info, RotateCcw, CheckCircle2, ChevronRight, Dna, Undo2, 
@@ -36,12 +37,16 @@ import {
 
 // --- Types ---
 
-type ChromosomeType = '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' | '10' | '11' | '12' | '13' | '14' | '15' | '16' | '17' | '18' | '19' | '20' | '21' | '22' | 'X' | 'Y';
+// A pair ID is either one of the 24 standard chromosome types (1-22, X, Y) or
+// a custom name typed by a cytogeneticist for a particular sample. Order no
+// longer has any meaning - any chromosome belonging to a pair is
+// interchangeable with any other, as long as its own orientation matches.
+type ChromosomeType = string;
 
 interface ChromosomeData {
   id: string;
   type: ChromosomeType;
-  indexInPair: number; // 0 or 1
+  ordinal: number; // display-only position within the pair; never used for matching
   size: number; // visual scale factor
   banding: number[]; // relative positions/widths of bands
   imageUrl?: string;
@@ -61,12 +66,14 @@ const CHROMOSOME_TYPES: ChromosomeType[] = [
 ];
 
 // Mock sizes (Chromosomes are generally ordered from largest to smallest, 1 is biggest, 22 smallest)
-const SIZE_MAP: Record<ChromosomeType, number> = {
+const SIZE_MAP: Record<string, number> = {
   '1': 1.0, '2': 0.95, '3': 0.85, '4': 0.82, '5': 0.8, '6': 0.75, '7': 0.72, '8': 0.68,
   '9': 0.65, '10': 0.63, '11': 0.62, '12': 0.6, '13': 0.55, '14': 0.52, '15': 0.5,
   '16': 0.48, '17': 0.45, '18': 0.42, '19': 0.35, '20': 0.33, '21': 0.28, '22': 0.25,
   'X': 0.7, 'Y': 0.3
 };
+const DEFAULT_PAIR_SIZE = 0.6;
+const getPairSize = (pairId: string) => SIZE_MAP[pairId] ?? DEFAULT_PAIR_SIZE;
 
 // --- Helpers ---
 
@@ -90,8 +97,8 @@ const createInitialChromosomes = (): ChromosomeData[] => {
         chromosomes.push({
           id: `${type}-${i}`,
           type,
-          indexInPair: i,
-          size: SIZE_MAP[type],
+          ordinal: i,
+          size: getPairSize(type),
           banding: generateBanding(type + i)
         });
     }
@@ -128,7 +135,7 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewi
         />
         {!isDragging && !isReviewing && (
           <div className="absolute -bottom-5 text-[10px] font-mono text-slate-400 opacity-0 hover:opacity-100 transition-opacity print:hidden">
-            {chromosome.type + (chromosome.indexInPair === 0 ? 'L' : 'R')}
+            {chromosome.type}#{chromosome.ordinal + 1}
           </div>
         )}
       </div>
@@ -235,23 +242,24 @@ const RawSampleDroppable = ({ id, children }: { id: string, children: React.Reac
 };
 
 interface KaryotypePairProps {
-  type: ChromosomeType;
+  pairId: string;
+  slotIds: string[];
   placedChromosomes: Record<string, ChromosomeData>;
   onUpdateChromosome: (slotId: string, updates: Partial<ChromosomeData>) => void;
   isReviewing?: boolean;
 }
 
-const KaryotypePair: React.FC<KaryotypePairProps> = ({ type, placedChromosomes, onUpdateChromosome, isReviewing }) => {
-  const slot1Id = `slot-${type}-0`;
-  const slot2Id = `slot-${type}-1`;
-  
-  const chrom1 = placedChromosomes[slot1Id];
-  const chrom2 = placedChromosomes[slot2Id];
-
-  const getSlotState = (chrom: ChromosomeData | undefined, expectedIndex: number) => {
+/**
+ * Renders one pair's group of slots (1-4, dynamically sized to however many
+ * chromosomes were annotated for this pair). Order within the group carries
+ * no meaning - any chromosome belonging to this pair is valid in any of its
+ * slots, as long as its own recorded orientation matches.
+ */
+const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedChromosomes, onUpdateChromosome, isReviewing }) => {
+  const getSlotState = (chrom: ChromosomeData | undefined): 'empty' | 'wrong' | 'type-correct' | 'fully-correct' => {
     if (!chrom) return 'empty';
-    if (chrom.type !== type || chrom.indexInPair !== expectedIndex) return 'wrong';
-    
+    if (chrom.type !== pairId) return 'wrong';
+
     if (chrom.imageUrl) {
       if (chrom.userRotation === chrom.expectedRotation && 
           chrom.userFlipX === chrom.expectedFlipX && 
@@ -264,27 +272,29 @@ const KaryotypePair: React.FC<KaryotypePairProps> = ({ type, placedChromosomes, 
     return 'fully-correct';
   };
 
-  const isOccupied1 = !!chrom1;
-  const isOccupied2 = !!chrom2;
+  const slots: { slotId: string; chrom: ChromosomeData | undefined; state: 'empty' | 'wrong' | 'type-correct' | 'fully-correct' }[] = slotIds.map(slotId => {
+    const chrom = placedChromosomes[slotId];
+    return { slotId, chrom, state: getSlotState(chrom) };
+  });
 
-  const state1 = getSlotState(chrom1, 0);
-  const state2 = getSlotState(chrom2, 1);
+  const allCorrect = slots.length > 0 && slots.every(s => !!s.chrom && s.state === 'fully-correct');
 
   return (
     <div className={cn("flex flex-col items-center gap-2 p-3 rounded-xl transition-colors group", !isReviewing && "hover:bg-slate-100/50")}>
       <div className="flex gap-1">
-        <DroppableSlot id={slot1Id} acceptType={type} isOccupied={isOccupied1} state={state1} isReviewing={isReviewing}>
-          {chrom1 && <DraggableChromosome id={chrom1.id} chromosome={chrom1} onUpdate={(id, updates) => onUpdateChromosome(slot1Id, updates)} isReviewing={isReviewing} />}
-        </DroppableSlot>
-        <DroppableSlot id={slot2Id} acceptType={type} isOccupied={isOccupied2} state={state2} isReviewing={isReviewing}>
-          {chrom2 && <DraggableChromosome id={chrom2.id} chromosome={chrom2} onUpdate={(id, updates) => onUpdateChromosome(slot2Id, updates)} isReviewing={isReviewing} />}
-        </DroppableSlot>
+        {slots.map(({ slotId, chrom, state }) => (
+          <div key={slotId}>
+            <DroppableSlot id={slotId} acceptType={pairId} isOccupied={!!chrom} state={state} isReviewing={isReviewing}>
+              {chrom && <DraggableChromosome id={chrom.id} chromosome={chrom} onUpdate={(id, updates) => onUpdateChromosome(slotId, updates)} isReviewing={isReviewing} />}
+            </DroppableSlot>
+          </div>
+        ))}
       </div>
       <span className={cn(
         "text-xs font-bold font-mono transition-colors print:!text-slate-900",
-        !isReviewing && (isOccupied1 && state1 === 'fully-correct' && isOccupied2 && state2 === 'fully-correct') ? "text-emerald-600" : (!isReviewing ? "text-slate-500 group-hover:text-sky-600" : "text-slate-900")
+        !isReviewing && allCorrect ? "text-emerald-600" : (!isReviewing ? "text-slate-500 group-hover:text-sky-600" : "text-slate-900")
       )}>
-        {type}
+        {pairId}
       </span>
     </div>
   );
@@ -376,6 +386,23 @@ const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin, onSignO
   </motion.div>
 );
 
+/** Cheap, synchronous check for whether a sample has at least one annotated (non-"Unassigned") stroke, without loading its image. */
+export const hasAnnotations = (xml?: string): boolean => {
+  if (!xml) return false;
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xml, 'application/xml');
+    const strokeEls = doc.querySelectorAll('stroke');
+    for (const el of Array.from(strokeEls)) {
+      const label = el.getAttribute('label');
+      if (label && label !== 'Unassigned') return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+};
+
 export const extractChromosomes = async (imgObj: AdminImage): Promise<ChromosomeData[]> => {
   try {
     if (!imgObj.xml) return [];
@@ -398,23 +425,18 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
     });
 
     const extracted: ChromosomeData[] = [];
+    const ordinalByPair = new Map<string, number>();
     
     strokeEls.forEach((el, idx) => {
       const label = el.getAttribute('label') || 'Unassigned';
       if (label === 'Unassigned') return;
-      let baseLabel = '';
-      let indexInPair = 0;
-      
-      if (label.includes('-')) {
-        baseLabel = label.split('-')[0];
-        indexInPair = label.split('-')[1] === '2' ? 1 : 0;
-      } else {
-        baseLabel = label.slice(0, -1);
-        indexInPair = label.slice(-1) === 'R' ? 1 : 0;
-      }
-      
-      if (!CHROMOSOME_TYPES.includes(baseLabel as ChromosomeType)) return;
-      
+      // Normalizes both new-style labels (the pair ID itself, e.g. "1", "X",
+      // "Marker A") and legacy labels saved before this change (e.g. "1L",
+      // "1R") to a single pair ID used for interchangeable matching.
+      const pairId = normalizePairId(label);
+      const ordinal = ordinalByPair.get(pairId) || 0;
+      ordinalByPair.set(pairId, ordinal + 1);
+
       const rotation = parseFloat(el.getAttribute('rotation') || '0');
       const flipX = el.getAttribute('flipX') === 'true';
       const flipY = el.getAttribute('flipY') === 'true';
@@ -463,9 +485,9 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
       ctx.drawImage(img, minX, minY, w, h, 0, 0, w, h);
       
       extracted.push({
-        id: `chrom-${label}-${idx}-${Date.now()}`,
-        type: baseLabel as ChromosomeType,
-        indexInPair: indexInPair,
+        id: `chrom-${pairId}-${idx}-${Date.now()}`,
+        type: pairId,
+        ordinal,
         size: 1,
         banding: [],
         imageUrl: canvas.toDataURL('image/png'),
@@ -479,8 +501,19 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
         userFlipY: false
       });
     });
-    
-    return extracted;
+
+    // Defensively cap each pair at MAX_CHROMOSOMES_PER_PAIR in case older or
+    // malformed annotations exceeded it.
+    const seenCounts = new Map<string, number>();
+    const capped: ChromosomeData[] = [];
+    for (const chrom of extracted) {
+      const count = seenCounts.get(chrom.type) || 0;
+      if (count >= MAX_CHROMOSOMES_PER_PAIR) continue;
+      seenCounts.set(chrom.type, count + 1);
+      capped.push(chrom);
+    }
+
+    return capped;
   } catch (e) {
     console.error("Failed to extract chromosomes", e);
     return [];
@@ -500,6 +533,7 @@ interface AdminImage {
   xml?: string;
   uploaderEmail?: string;
   bucketId?: string | null;
+  karyotype?: string;
 }
 
 const formatBucketLabel = (bucket: Bucket) =>
@@ -821,6 +855,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [moveError, setMoveError] = useState<string | null>(null);
   const [lastUpload, setLastUpload] = useState<AdminImage | null>(null);
+  const [karyotypeInput, setKaryotypeInput] = useState('');
   const [buckets, setBuckets] = useState<Bucket[]>([]);
   const [selectedBucketId, setSelectedBucketId] = useState<string>('');
   const [activeBucketId, setActiveBucketId] = useState<string | null>(null);
@@ -1039,17 +1074,6 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
           <Trash2 className="w-3.5 h-3.5" />
         </button>
 
-        <div className="absolute top-2 left-2 z-10 flex flex-col gap-1">
-          <span
-            className={cn(
-              "text-[9px] font-black px-1.5 py-0.5 rounded shadow-sm uppercase backdrop-blur-md",
-              "bg-slate-900/80 text-white w-fit"
-            )}
-          >
-            RAW
-          </span>
-        </div>
-
         <div className="relative flex-1 bg-slate-100 overflow-hidden">
           <img
             src={img.originalUrl}
@@ -1067,6 +1091,17 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
             </div>
           </div>
         </div>
+
+        <button
+          onClick={(e) => handleEditKaryotype(img, e)}
+          title="Edit ISCN karyotype designation"
+          className="shrink-0 flex items-center gap-1 px-2 py-1.5 bg-slate-50 border-t border-slate-200 text-left hover:bg-slate-100 transition-colors"
+        >
+          <span className="text-[10px] font-mono font-bold text-slate-600 truncate flex-1">
+            {img.karyotype || 'No karyotype set'}
+          </span>
+          <Pencil className="w-3 h-3 text-slate-400 shrink-0" />
+        </button>
       </div>
     </DraggableDatasetImage>
   );
@@ -1082,6 +1117,11 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
     if (!session?.user) return;
     if (!selectedBucketId) {
       setUploadError('Please select or create a bucket before uploading.');
+      return;
+    }
+    const karyotype = karyotypeInput.trim();
+    if (!karyotype) {
+      setUploadError('Please enter the ISCN karyotype designation before uploading.');
       return;
     }
     setUploading(true);
@@ -1111,7 +1151,8 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
           uploader_email: session.user.email,
           original_url: publicUrl,
           xml: '',
-          bucket_id: selectedBucketId
+          bucket_id: selectedBucketId,
+          karyotype
         })
         .select()
         .single();
@@ -1126,11 +1167,13 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
         originalUrl: publicUrl,
         xml: '',
         uploaderEmail: session.user.email,
-        bucketId: selectedBucketId
+        bucketId: selectedBucketId,
+        karyotype
       };
       
       setImages(prev => [newImage, ...prev]);
       setLastUpload(newImage);
+      setKaryotypeInput('');
     } catch (err: any) {
       setUploadError(err.message || 'Upload failed');
     } finally {
@@ -1155,6 +1198,29 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
       if (lastUpload?.id === id) setLastUpload(null);
     } catch (err) {
       console.error('Failed to delete image:', err);
+    }
+  };
+
+  const handleEditKaryotype = async (img: AdminImage, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const next = window.prompt('ISCN karyotype designation', img.karyotype || '');
+    if (next === null) return;
+    const trimmed = next.trim();
+    if (!trimmed) {
+      window.alert('Karyotype designation cannot be empty.');
+      return;
+    }
+    try {
+      const { error } = await supabase
+        .from('samples')
+        .update({ karyotype: trimmed })
+        .eq('id', img.id);
+      if (error) throw error;
+      setImages(prev => prev.map(i => i.id === img.id ? { ...i, karyotype: trimmed } : i));
+    } catch (err) {
+      console.error('Failed to update karyotype:', err);
+      window.alert('Failed to update karyotype designation.');
     }
   };
 
@@ -1242,201 +1308,114 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
           <div className="space-y-6">
             <h3 className="text-xl font-black">Upload Metaphase Spread</h3>
 
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <label className="text-xs font-bold text-slate-500 uppercase">
-                  Target Bucket
-                </label>
-                {buckets.length === 0 ? (
-                  <p className="text-sm text-amber-600 font-medium">
-                    {canCreateBuckets
-                      ? 'Create a bucket below before uploading samples.'
-                      : 'No buckets available. Ask a super admin to create one before uploading.'}
-                  </p>
-                ) : (
-                  <select
-                    value={selectedBucketId}
-                    onChange={(e) => setSelectedBucketId(e.target.value)}
-                    className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white"
-                  >
-                    {buckets.map(bucket => (
-                      <option key={bucket.id} value={bucket.id}>
-                        {formatBucketLabel(bucket)}
-                      </option>
-                    ))}
-                  </select>
-                )}
-                {selectedBucketId && (
-                  <p className="text-xs text-slate-500">
-                    {buckets.find(b => b.id === selectedBucketId)?.description}
-                  </p>
-                )}
-              </div>
-
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <h4 className="text-sm font-bold text-slate-700">Buckets</h4>
-                  {canCreateBuckets && (
-                    <button
-                      type="button"
-                      onClick={() => setShowCreateBucket(prev => !prev)}
-                      className="flex items-center gap-1.5 text-xs font-bold text-sky-600 hover:text-sky-700"
-                    >
-                      <FolderPlus className="w-4 h-4" />
-                      {showCreateBucket ? 'Cancel' : 'New Bucket'}
-                    </button>
-                  )}
-                </div>
-
-                {canCreateBuckets && showCreateBucket && (
-                  <div className="space-y-3 pt-1">
-                    <div className="space-y-1">
-                      <label className="text-xs font-bold text-slate-500 uppercase">
-                        Bucket Name
-                      </label>
-                      <input
-                        type="text"
-                        value={newBucketName}
-                        onChange={(e) => setNewBucketName(e.target.value)}
-                        placeholder="e.g. Normal Karyotypes"
-                        className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white text-sm"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-xs font-bold text-slate-500 uppercase">
-                        Description
-                      </label>
-                      <textarea
-                        value={newBucketDescription}
-                        onChange={(e) => setNewBucketDescription(e.target.value)}
-                        placeholder="What do the spreads in this bucket have in common?"
-                        rows={3}
-                        className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white text-sm resize-none"
-                      />
-                    </div>
-                    <button
-                      type="button"
-                      onClick={handleCreateBucket}
-                      disabled={creatingBucket}
-                      className="w-full rounded-xl bg-slate-900 text-white py-2.5 text-sm font-bold hover:bg-slate-800 disabled:opacity-50"
-                    >
-                      {creatingBucket ? 'Creating...' : 'Create Bucket'}
-                    </button>
-                  </div>
-                )}
-
-                {!showCreateBucket && (
-                  buckets.length === 0 ? (
-                    <p className="text-xs text-slate-400">No buckets yet.</p>
-                  ) : (
-                    <ul className={cn("space-y-2", draggingSample && "rounded-xl bg-sky-50/80 p-2 -mx-1")}>
-                      {draggingSample && (
-                        <li className="px-1 pb-1 text-[10px] font-bold uppercase tracking-wide text-sky-600">
-                          Drop onto a bucket
-                        </li>
-                      )}
-                      {buckets.map(bucket => {
-                        const count = (imagesByBucket[bucket.id] ?? []).length;
-                        const active = activeBucketId === bucket.id;
-                        return (
-                          <DroppableBucketListItem
-                            key={bucket.id}
-                            droppableId={`bucket-${bucket.id}`}
-                            active={active}
-                            dragging={!!draggingSample}
-                            onClick={() => setActiveBucketId(bucket.id)}
-                          >
-                            <span className="text-sm font-bold truncate">
-                              [{bucket.bucketNumber}] {bucket.name}
-                            </span>
-                            <span className={cn(
-                              "text-[10px] font-mono font-bold shrink-0 px-1.5 py-0.5 rounded",
-                              active
-                                ? "bg-white/20 text-white"
-                                : draggingSample
-                                  ? "bg-sky-100 text-sky-700"
-                                  : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
-                            )}>
-                              {count}
-                            </span>
-                          </DroppableBucketListItem>
-                        );
-                      })}
-                      {(unassignedImages.length > 0 || draggingSample) && (
-                        <DroppableBucketListItem
-                          droppableId="bucket-unassigned"
-                          active={activeBucketId === 'unassigned'}
-                          dragging={!!draggingSample}
-                          onClick={() => setActiveBucketId('unassigned')}
-                        >
-                          <span className="text-sm font-bold">Unassigned</span>
-                          <span className={cn(
-                            "text-[10px] font-mono font-bold shrink-0 px-1.5 py-0.5 rounded",
-                            activeBucketId === 'unassigned'
-                              ? "bg-white/20 text-white"
-                              : draggingSample
-                                ? "bg-sky-100 text-sky-700"
-                                : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
-                          )}>
-                            {unassignedImages.length}
-                          </span>
-                        </DroppableBucketListItem>
-                      )}
-                    </ul>
-                  )
-                )}
-              </div>
-            </div>
-
-            <input
-              type="file"
-              accept=".jpg,.jpeg,.png"
-              className="hidden"
-              ref={fileInputRef}
-              onChange={handleFileChange}
-              disabled={!selectedBucketId}
-            />
-
-              <div
-              onClick={() => selectedBucketId && fileInputRef.current?.click()}
-              onDragOver={(e) => { e.preventDefault(); }}
-              onDrop={(e) => {
-                e.preventDefault();
-                if (!selectedBucketId) {
-                  setUploadError('Please select or create a bucket before uploading.');
-                  return;
-                }
-                const file = e.dataTransfer.files[0];
-                if (file) handleUpload(file);
-              }}
-              className={cn(
-                "p-12 border-4 border-dashed rounded-3xl flex flex-col items-center justify-center text-center group transition-colors bg-slate-50/50",
-                !selectedBucketId
-                  ? "border-slate-100 opacity-60 cursor-not-allowed"
-                  : uploading
-                    ? "border-sky-300 bg-sky-50/50 cursor-pointer"
-                    : "border-slate-100 hover:border-slate-300 cursor-pointer"
-              )}
-            >
-              {uploading ? (
-                <Loader className="w-12 h-12 text-sky-500 animate-spin mb-4" />
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-500 uppercase">
+                Target Bucket
+              </label>
+              {buckets.length === 0 ? (
+                <p className="text-sm text-amber-600 font-medium">
+                  {canCreateBuckets
+                    ? 'Create a bucket below before uploading samples.'
+                    : 'No buckets available. Ask a super admin to create one before uploading.'}
+                </p>
               ) : (
-                <Upload className="w-12 h-12 text-slate-300 group-hover:text-slate-900 transition-colors mb-4" />
+                <select
+                  value={selectedBucketId}
+                  onChange={(e) => setSelectedBucketId(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white"
+                >
+                  {buckets.map(bucket => (
+                    <option key={bucket.id} value={bucket.id}>
+                      {formatBucketLabel(bucket)}
+                    </option>
+                  ))}
+                </select>
               )}
-              <p className="font-bold text-slate-400 group-hover:text-slate-900">
-                {!selectedBucketId
-                  ? (canCreateBuckets
-                      ? 'Create a bucket to enable uploads'
-                      : 'Select an existing bucket to enable uploads')
-                  : uploading
-                    ? 'Processing...'
-                    : 'Upload JPG, JPEG or PNG'}
-              </p>
-              <p className="text-sm text-slate-300">Click or drag & drop</p>
-              {uploadError && (
-                <p className="mt-2 text-sm text-red-500 font-medium">{uploadError}</p>
+              {selectedBucketId && (
+                <p className="text-xs text-slate-500">
+                  {buckets.find(b => b.id === selectedBucketId)?.description}
+                </p>
               )}
             </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-500 uppercase">
+                ISCN Karyotype Designation
+              </label>
+              <input
+                type="text"
+                value={karyotypeInput}
+                onChange={(e) => setKaryotypeInput(e.target.value)}
+                placeholder="e.g. 46,XY or 47,XX,+21"
+                className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white text-sm font-mono"
+              />
+              <p className="text-xs text-slate-400">
+                Required. Entered by the annotator; shown to the player during gameplay.
+              </p>
+            </div>
+
+            {(() => {
+              const canUpload = !!selectedBucketId && !!karyotypeInput.trim();
+              return (
+                <>
+                  <input
+                    type="file"
+                    accept=".jpg,.jpeg,.png"
+                    className="hidden"
+                    ref={fileInputRef}
+                    onChange={handleFileChange}
+                    disabled={!canUpload}
+                  />
+
+                  <div
+                    onClick={() => canUpload && fileInputRef.current?.click()}
+                    onDragOver={(e) => { e.preventDefault(); }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      if (!selectedBucketId) {
+                        setUploadError('Please select or create a bucket before uploading.');
+                        return;
+                      }
+                      if (!karyotypeInput.trim()) {
+                        setUploadError('Please enter the ISCN karyotype designation before uploading.');
+                        return;
+                      }
+                      const file = e.dataTransfer.files[0];
+                      if (file) handleUpload(file);
+                    }}
+                    className={cn(
+                      "p-12 border-4 border-dashed rounded-3xl flex flex-col items-center justify-center text-center group transition-colors bg-slate-50/50",
+                      !canUpload
+                        ? "border-slate-100 opacity-60 cursor-not-allowed"
+                        : uploading
+                          ? "border-sky-300 bg-sky-50/50 cursor-pointer"
+                          : "border-slate-100 hover:border-slate-300 cursor-pointer"
+                    )}
+                  >
+                    {uploading ? (
+                      <Loader className="w-12 h-12 text-sky-500 animate-spin mb-4" />
+                    ) : (
+                      <Upload className="w-12 h-12 text-slate-300 group-hover:text-slate-900 transition-colors mb-4" />
+                    )}
+                    <p className="font-bold text-slate-400 group-hover:text-slate-900">
+                      {!selectedBucketId
+                        ? (canCreateBuckets
+                            ? 'Create a bucket to enable uploads'
+                            : 'Select an existing bucket to enable uploads')
+                        : !karyotypeInput.trim()
+                          ? 'Enter the ISCN karyotype designation to enable uploads'
+                          : uploading
+                            ? 'Processing...'
+                            : 'Upload JPG, JPEG or PNG'}
+                    </p>
+                    <p className="text-sm text-slate-300">Click or drag & drop</p>
+                    {uploadError && (
+                      <p className="mt-2 text-sm text-red-500 font-medium">{uploadError}</p>
+                    )}
+                  </div>
+                </>
+              );
+            })()}
 
             {lastUpload && (
               <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-3">
@@ -1448,8 +1427,127 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
                   alt="Uploaded"
                   className="w-full rounded-xl border border-slate-100"
                 />
+                {lastUpload.karyotype && (
+                  <p className="text-xs font-mono font-bold text-slate-600">
+                    {lastUpload.karyotype}
+                  </p>
+                )}
               </div>
             )}
+
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-bold text-slate-700">Buckets</h4>
+                {canCreateBuckets && (
+                  <button
+                    type="button"
+                    onClick={() => setShowCreateBucket(prev => !prev)}
+                    className="flex items-center gap-1.5 text-xs font-bold text-sky-600 hover:text-sky-700"
+                  >
+                    <FolderPlus className="w-4 h-4" />
+                    {showCreateBucket ? 'Cancel' : 'New Bucket'}
+                  </button>
+                )}
+              </div>
+
+              {canCreateBuckets && showCreateBucket && (
+                <div className="space-y-3 pt-1">
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 uppercase">
+                      Bucket Name
+                    </label>
+                    <input
+                      type="text"
+                      value={newBucketName}
+                      onChange={(e) => setNewBucketName(e.target.value)}
+                      placeholder="e.g. Normal Karyotypes"
+                      className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white text-sm"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 uppercase">
+                      Description
+                    </label>
+                    <textarea
+                      value={newBucketDescription}
+                      onChange={(e) => setNewBucketDescription(e.target.value)}
+                      placeholder="What do the spreads in this bucket have in common?"
+                      rows={3}
+                      className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-white text-sm resize-none"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleCreateBucket}
+                    disabled={creatingBucket}
+                    className="w-full rounded-xl bg-slate-900 text-white py-2.5 text-sm font-bold hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    {creatingBucket ? 'Creating...' : 'Create Bucket'}
+                  </button>
+                </div>
+              )}
+
+              {!showCreateBucket && (
+                buckets.length === 0 ? (
+                  <p className="text-xs text-slate-400">No buckets yet.</p>
+                ) : (
+                  <ul className={cn("space-y-2", draggingSample && "rounded-xl bg-sky-50/80 p-2 -mx-1")}>
+                    {draggingSample && (
+                      <li className="px-1 pb-1 text-[10px] font-bold uppercase tracking-wide text-sky-600">
+                        Drop onto a bucket
+                      </li>
+                    )}
+                    {buckets.map(bucket => {
+                      const count = (imagesByBucket[bucket.id] ?? []).length;
+                      const active = activeBucketId === bucket.id;
+                      return (
+                        <DroppableBucketListItem
+                          key={bucket.id}
+                          droppableId={`bucket-${bucket.id}`}
+                          active={active}
+                          dragging={!!draggingSample}
+                          onClick={() => setActiveBucketId(bucket.id)}
+                        >
+                          <span className="text-sm font-bold truncate">
+                            [{bucket.bucketNumber}] {bucket.name}
+                          </span>
+                          <span className={cn(
+                            "text-[10px] font-mono font-bold shrink-0 px-1.5 py-0.5 rounded",
+                            active
+                              ? "bg-white/20 text-white"
+                              : draggingSample
+                                ? "bg-sky-100 text-sky-700"
+                                : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
+                          )}>
+                            {count}
+                          </span>
+                        </DroppableBucketListItem>
+                      );
+                    })}
+                    {(unassignedImages.length > 0 || draggingSample) && (
+                      <DroppableBucketListItem
+                        droppableId="bucket-unassigned"
+                        active={activeBucketId === 'unassigned'}
+                        dragging={!!draggingSample}
+                        onClick={() => setActiveBucketId('unassigned')}
+                      >
+                        <span className="text-sm font-bold">Unassigned</span>
+                        <span className={cn(
+                          "text-[10px] font-mono font-bold shrink-0 px-1.5 py-0.5 rounded",
+                          activeBucketId === 'unassigned'
+                            ? "bg-white/20 text-white"
+                            : draggingSample
+                              ? "bg-sky-100 text-sky-700"
+                              : "bg-slate-200 text-slate-500 group-hover:bg-slate-300"
+                        )}>
+                          {unassignedImages.length}
+                        </span>
+                      </DroppableBucketListItem>
+                    )}
+                  </ul>
+                )
+              )}
+            </div>
           </div>
 
           <div className="bg-slate-50 rounded-3xl p-8 border border-slate-100 flex flex-col h-full max-h-[800px]">
@@ -1879,7 +1977,8 @@ export default function Chromy() {
             originalUrl: row.original_url,
             xml: row.xml,
             uploaderEmail: row.uploader_email,
-            bucketId: row.bucket_id ?? null
+            bucketId: row.bucket_id ?? null,
+            karyotype: row.karyotype ?? undefined
           })));
         }
       } catch (e: any) {
@@ -1894,7 +1993,8 @@ export default function Chromy() {
 
   useEffect(() => {
     const initial = createInitialChromosomes();
-    setJumbled(initial.sort(() => Math.random() - 0.5));
+    setOriginalExtracted(initial);
+    setJumbled([...initial].sort(() => Math.random() - 0.5));
     setScore({ correct: 0, total: initial.length });
   }, []);
 
@@ -1990,7 +2090,8 @@ export default function Chromy() {
       setJumbled([...originalExtracted].sort(() => Math.random() - 0.5));
     } else {
       const initial = createInitialChromosomes();
-      setJumbled(initial.sort(() => Math.random() - 0.5));
+      setOriginalExtracted(initial);
+      setJumbled([...initial].sort(() => Math.random() - 0.5));
     }
     setPlaced({});
     setHistory([]);
@@ -2003,28 +2104,63 @@ export default function Chromy() {
     return (jumbled.find(c => c.id === activeId) || Object.values(placed).find((c: ChromosomeData) => c.id === activeId)) as ChromosomeData | undefined;
   }, [activeId, jumbled, placed]);
 
-  // Calculate score: chromosomes placed in slots that match their type and pair index
+  // Derive the board's pair groups (and their slot IDs) from the full set of
+  // chromosomes for this sample. Slot IDs are opaque (`slot-${pairIndex}-${slotIndex}`)
+  // so a pair ID containing arbitrary characters (custom names) can never
+  // corrupt lookup logic - the pair ID is looked up via slotPairMap instead
+  // of being parsed back out of the slot ID string.
+  const pairGroups = useMemo(() => {
+    const membersByPair = new Map<string, ChromosomeData[]>();
+    const firstAppearanceOrder: string[] = [];
+    originalExtracted.forEach(chrom => {
+      if (!membersByPair.has(chrom.type)) {
+        membersByPair.set(chrom.type, []);
+        firstAppearanceOrder.push(chrom.type);
+      }
+      membersByPair.get(chrom.type)!.push(chrom);
+    });
+
+    const orderedPairIds = [...firstAppearanceOrder].sort((a, b) => comparePairIds(a, b, firstAppearanceOrder));
+
+    return orderedPairIds.map((pairId, pairIndex) => {
+      const members = membersByPair.get(pairId)!;
+      return {
+        pairId,
+        slotIds: members.map((_, slotIndex) => `slot-${pairIndex}-${slotIndex}`),
+      };
+    });
+  }, [originalExtracted]);
+
+  const slotPairMap = useMemo(() => {
+    const map = new Map<string, string>();
+    pairGroups.forEach(group => {
+      group.slotIds.forEach(slotId => map.set(slotId, group.pairId));
+    });
+    return map;
+  }, [pairGroups]);
+
+  // Calculate score: a chromosome is correct if it's placed in a slot
+  // belonging to its own pair (position within the pair no longer matters)
+  // and, for real annotated images, its orientation matches the orientation
+  // recorded for that specific chromosome during annotation.
   useEffect(() => {
     let correctCount = 0;
     Object.entries(placed).forEach(([slotId, chrom]: [string, ChromosomeData]) => {
-      const parts = slotId.split('-');
-      const expectedType = parts[1];
-      const expectedIndex = parseInt(parts[2], 10);
-      
-      if (chrom.type === expectedType && chrom.indexInPair === expectedIndex) {
-        if (chrom.imageUrl) {
-          if (chrom.userRotation === chrom.expectedRotation && 
-              chrom.userFlipX === chrom.expectedFlipX && 
-              chrom.userFlipY === chrom.expectedFlipY) {
-            correctCount++;
-          }
-        } else {
+      const expectedPairId = slotPairMap.get(slotId);
+      if (expectedPairId === undefined || chrom.type !== expectedPairId) return;
+
+      if (chrom.imageUrl) {
+        if (chrom.userRotation === chrom.expectedRotation && 
+            chrom.userFlipX === chrom.expectedFlipX && 
+            chrom.userFlipY === chrom.expectedFlipY) {
           correctCount++;
         }
+      } else {
+        correctCount++;
       }
     });
     setScore(prev => ({ ...prev, correct: correctCount }));
-  }, [placed]);
+  }, [placed, slotPairMap]);
 
   const progress = (score.correct / score.total) * 100;
   const isComplete = progress === 100 && score.total > 0;
@@ -2057,7 +2193,7 @@ export default function Chromy() {
         {gameState === 'select' && (
           <SpreadSelectionScreen
             key="select"
-            images={images}
+            images={images.filter(img => hasAnnotations(img.xml))}
             onBack={() => setGameState('welcome')}
             onSelect={(img, extracted) => {
               setSelectedImage(img);
@@ -2069,7 +2205,8 @@ export default function Chromy() {
               } else {
                 // Fallback to mock data if no annotations were found
                 const initial = createInitialChromosomes();
-                setJumbled(initial.sort(() => Math.random() - 0.5));
+                setOriginalExtracted(initial);
+                setJumbled([...initial].sort(() => Math.random() - 0.5));
                 setScore({ correct: 0, total: initial.length });
               }
               
@@ -2155,9 +2292,25 @@ export default function Chromy() {
           </div>
         </header>
 
+        {!isReviewingCertificate && selectedImage?.karyotype && (
+          <footer className="fixed bottom-0 left-0 right-0 h-10 bg-white border-t border-slate-200 z-50 px-6 flex items-center justify-center gap-2 print:hidden">
+            <span className="text-[10px] font-mono tracking-widest uppercase text-slate-400">
+              ISCN Karyotype Designation
+            </span>
+            <span className="text-sm font-mono font-bold text-slate-900">
+              {selectedImage.karyotype}
+            </span>
+          </footer>
+        )}
+
         <main className={cn(
           "px-6 pb-6 grid gap-6 overflow-hidden print:h-auto print:overflow-visible print:block",
-          isReviewingCertificate ? "pt-6 h-screen grid-cols-1" : "pt-20 h-[calc(100vh-80px)] grid-cols-1 lg:grid-cols-[1fr_3fr]"
+          isReviewingCertificate
+            ? "pt-6 h-screen grid-cols-1"
+            : cn(
+                "pt-20 grid-cols-1 lg:grid-cols-[1fr_3fr]",
+                selectedImage?.karyotype ? "h-[calc(100vh-120px)]" : "h-[calc(100vh-80px)]"
+              )
         )}>
           
           {/* Left Panel: Jumbled Source */}
@@ -2250,39 +2403,31 @@ export default function Chromy() {
           )}>
              {isReviewingCertificate && (
                <div className="text-center mb-4 hidden print:block !block shrink-0">
-                 <h1 className="text-4xl font-black text-slate-900 tracking-tighter mb-2">KARYOTYPE DIAGNOSTIC CERTIFICATE</h1>
-                 <p className="text-lg text-slate-500 font-medium">Assembled and verified by <span className="font-black text-slate-800">{certificateName}</span></p>
-                 <div className="w-24 h-1 bg-slate-200 mx-auto mt-4 rounded-full" />
+                <h1 className="text-4xl font-black text-slate-900 tracking-tighter mb-2">KARYOTYPE DIAGNOSTIC CERTIFICATE</h1>
+                <p className="text-lg text-slate-500 font-medium">Assembled and verified by <span className="font-black text-slate-800">{certificateName}</span></p>
+                {selectedImage?.karyotype && (
+                  <p className="text-sm font-mono font-bold text-slate-700 mt-2">
+                    ISCN: {selectedImage.karyotype}
+                  </p>
+                )}
+                <div className="w-24 h-1 bg-slate-200 mx-auto mt-4 rounded-full" />
                </div>
              )}
 
-             <div className="flex flex-col justify-between flex-1 w-full max-w-6xl mx-auto h-full min-h-0 gap-4 md:gap-6">
-               {[
-                 [['1', '2', '3'], ['4', '5']],
-                 [['6', '7', '8', '9', '10', '11', '12']],
-                 [['13', '14', '15'], ['16', '17', '18']],
-                 [['19', '20'], ['21', '22'], ['X', 'Y']]
-               ].map((rowGroups, rowIdx) => (
-                 <div key={rowIdx} className="flex w-full justify-center items-start gap-8 md:gap-16">
-                   {rowGroups.map((group, groupIdx) => (
-                     <div 
-                       key={groupIdx} 
-                       className="flex gap-2 md:gap-4"
-                     >
-                       {group.map((type: string) => (
-                         <div key={type} className="flex-shrink-0">
-                           <KaryotypePair 
-                             type={type as ChromosomeType} 
-                             placedChromosomes={placed} 
-                             onUpdateChromosome={updatePlaced}
-                             isReviewing={isReviewingCertificate}
-                           />
-                         </div>
-                       ))}
-                     </div>
-                   ))}
-                 </div>
-               ))}
+             <div className="flex flex-1 w-full max-w-6xl mx-auto h-full min-h-0">
+               <div className="flex flex-wrap w-full justify-center items-start content-start gap-4 md:gap-6">
+                 {pairGroups.map(group => (
+                   <div key={group.pairId} className="flex-shrink-0">
+                     <KaryotypePair
+                       pairId={group.pairId}
+                       slotIds={group.slotIds}
+                       placedChromosomes={placed}
+                       onUpdateChromosome={updatePlaced}
+                       isReviewing={isReviewingCertificate}
+                     />
+                   </div>
+                 ))}
+               </div>
              </div>
 
           </div>

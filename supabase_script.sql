@@ -57,6 +57,9 @@ create table if not exists public.samples (
 -- Add uploader_email column if the table already existed
 alter table public.samples add column if not exists uploader_email text;
 
+-- Add karyotype column (ISCN karyotype designation entered at upload time) if the table already existed
+alter table public.samples add column if not exists karyotype text;
+
 -- 2b. Create buckets table for grouping metaphase spreads
 create table if not exists public.buckets (
   id uuid default gen_random_uuid() primary key,

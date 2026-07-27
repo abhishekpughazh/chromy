@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { X, Save, PenLine, Trash2, Undo2, Hand, ZoomIn, ZoomOut, Maximize, MousePointer2, Eye, EyeOff, RotateCw, FlipHorizontal, FlipVertical } from 'lucide-react';
+import { X, Save, PenLine, Trash2, Undo2, Hand, ZoomIn, ZoomOut, Maximize, MousePointer2, Eye, EyeOff, RotateCw, FlipHorizontal, FlipVertical, Plus, Pencil } from 'lucide-react';
+import { STANDARD_PAIR_IDS, MAX_CHROMOSOMES_PER_PAIR, normalizePairId, isStandardPairId } from '../lib/chromosomePairs';
 
 interface Point { x: number; y: number }
 interface Stroke {
@@ -13,8 +14,23 @@ interface Stroke {
   flipY?: boolean;
 }
 
-const BASE_CHROMOSOMES = Array.from({length: 22}, (_, i) => String(i+1)).concat(['X', 'Y']);
-const ALL_LABELS = BASE_CHROMOSOMES.flatMap(chr => [`${chr}L`, `${chr}R`]);
+/**
+ * Returns the next pair ID (in the order given - standard pairs first, then
+ * custom pairs in the order they were added) that still has room for
+ * another chromosome (fewer than MAX_CHROMOSOMES_PER_PAIR strokes assigned).
+ */
+function nextAvailablePair(strokes: Stroke[], allPairIds: string[]): string | null {
+  const counts = new Map<string, number>();
+  strokes.forEach(s => {
+    if (!s.label || s.label === 'Unassigned') return;
+    const pid = normalizePairId(s.label);
+    counts.set(pid, (counts.get(pid) || 0) + 1);
+  });
+  for (const id of allPairIds) {
+    if ((counts.get(id) || 0) < MAX_CHROMOSOMES_PER_PAIR) return id;
+  }
+  return null;
+}
 
 interface ImageAnnotationModalProps {
   imageUrl: string;
@@ -262,8 +278,12 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
 
   const [showLabels, setShowLabels] = useState(true);
   const [mode, setMode] = useState<Mode>('draw');
-  const [drawStyle, setDrawStyle] = useState<'polygon' | 'freehand'>('polygon');
-  const [activeLabel, setActiveLabel] = useState<string>('1L');
+  const [drawStyle, setDrawStyle] = useState<'polygon' | 'freehand'>('freehand');
+  const [activeLabel, setActiveLabel] = useState<string>(STANDARD_PAIR_IDS[0]);
+  // The 24 standard pair slots, renameable in place (renaming replaces the
+  // entry at that position rather than spawning a separate custom pair).
+  const [pairOrder, setPairOrder] = useState<string[]>([...STANDARD_PAIR_IDS]);
+  const [customPairs, setCustomPairs] = useState<string[]>([]);
   const [selectedStrokeId, setSelectedStrokeId] = useState<string | null>(null);
   const [orientingStrokeId, setOrientingStrokeId] = useState<string | null>(null);
   const [draggedPoint, setDraggedPoint] = useState<{ strokeId: string, index: number } | null>(null);
@@ -394,14 +414,29 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     if (loaded) {
       _setStrokes(loaded);
       setIsDirty(false);
-      const used = new Set(loaded.map(s => s.label));
-      const next = ALL_LABELS.find(l => !used.has(l));
+      // Recover any custom (non-standard) pairs from previously saved strokes,
+      // so they reappear in the sidebar exactly as they were left.
+      const discoveredCustom = Array.from(new Set(
+        loaded
+          .map(s => normalizePairId(s.label || 'Unassigned'))
+          .filter(id => id !== 'Unassigned' && !isStandardPairId(id))
+      ));
+      setCustomPairs(discoveredCustom);
+      const next = nextAvailablePair(loaded, [...STANDARD_PAIR_IDS, ...discoveredCustom]);
       if (next) setActiveLabel(next);
     }
   }, []); // Only runs when called
 
   useEffect(() => {
-    loadAnnotations(initialXml);
+    setPairOrder([...STANDARD_PAIR_IDS]);
+    setCustomPairs([]);
+    if (initialXml) {
+      loadAnnotations(initialXml);
+    } else {
+      _setStrokes([]);
+      setIsDirty(false);
+      setActiveLabel(STANDARD_PAIR_IDS[0]);
+    }
     setScale(1);
     setPan({ x: 0, y: 0 });
     setMode('draw');
@@ -410,7 +445,6 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     gestureRef.current.drawStroke = null;
     pointersRef.current.clear();
     setShowLabels(true);
-    setActiveLabel('1L');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageId]);
 
@@ -463,8 +497,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
         const newStroke = currentStroke;
         setStrokes(prev => {
           const newStrokes = [...prev, newStroke];
-          const used = new Set(newStrokes.map(s => s.label));
-          const next = ALL_LABELS.find(l => !used.has(l));
+          const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
           if (next) setActiveLabel(next);
           return newStrokes;
         });
@@ -478,7 +511,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [currentStroke, selectedStrokeId, orientingStrokeId]);
+  }, [currentStroke, selectedStrokeId, orientingStrokeId, pairOrder, customPairs]);
 
   useEffect(() => {
     redrawAll(strokes, currentStroke, previewPoint, selectedStrokeId, showLabels);
@@ -602,8 +635,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
               setStrokes(newStrokes);
               setCurrentStroke(null);
               setPreviewPoint(null);
-              const used = new Set(newStrokes.map(s => s.label));
-              const next = ALL_LABELS.find(l => !used.has(l));
+              const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
               if (next) setActiveLabel(next);
               setOrientingStrokeId(newStroke.id);
             } else {
@@ -626,8 +658,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
               setStrokes(newStrokes);
               setCurrentStroke(null);
               setPreviewPoint(null);
-              const used = new Set(newStrokes.map(s => s.label));
-              const next = ALL_LABELS.find(l => !used.has(l));
+              const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
               if (next) setActiveLabel(next);
               setOrientingStrokeId(newStroke.id);
             } else {
@@ -666,8 +697,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
             setCurrentStroke(null);
             setPreviewPoint(null);
             gestureRef.current.type = null;
-            const used = new Set(newStrokes.map(s => s.label));
-            const next = ALL_LABELS.find(l => !used.has(l));
+            const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
             if (next) setActiveLabel(next);
             setOrientingStrokeId(newStroke.id);
           } else {
@@ -745,8 +775,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
       setCurrentStroke(null);
       setPreviewPoint(null);
       gestureRef.current.type = null;
-      const used = new Set(newStrokes.map(s => s.label));
-      const next = ALL_LABELS.find(l => !used.has(l));
+      const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
       if (next) setActiveLabel(next);
       setOrientingStrokeId(newStroke.id);
     } else if (mode === 'edit' && selectedStrokeId) {
@@ -849,18 +878,86 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
   };
 
   const selectedStroke = strokes.find(s => s.id === selectedStrokeId);
-  const currentDisplayLabel = (mode === 'edit' && selectedStroke) ? (selectedStroke.label || 'Unassigned') : activeLabel;
+  const rawDisplayLabel = (mode === 'edit' && selectedStroke) ? (selectedStroke.label || 'Unassigned') : activeLabel;
+  const currentDisplayLabel = rawDisplayLabel === 'Unassigned' ? 'Unassigned' : normalizePairId(rawDisplayLabel);
 
-  const handleLabelClick = (lbl: string) => {
+  const handleLabelClick = (pairId: string) => {
     if (mode === 'edit' && selectedStrokeId) {
-      setStrokes(prev => prev.map(s => s.id === selectedStrokeId ? { ...s, label: lbl } : s));
+      setStrokes(prev => prev.map(s => s.id === selectedStrokeId ? { ...s, label: pairId } : s));
     } else {
-      setActiveLabel(lbl);
+      setActiveLabel(pairId);
       if (currentStroke) {
-        setCurrentStroke({ ...currentStroke, label: lbl });
+        setCurrentStroke({ ...currentStroke, label: pairId });
       }
     }
   };
+
+  const handleAddPair = () => {
+    const name = window.prompt('Enter a name for the new pair:');
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const alreadyExists = [...pairOrder, ...customPairs].some(p => p.toLowerCase() === trimmed.toLowerCase());
+    if (alreadyExists) {
+      window.alert(`A pair named "${trimmed}" already exists.`);
+      return;
+    }
+    setCustomPairs(prev => [...prev, trimmed]);
+    handleLabelClick(trimmed);
+  };
+
+  const handleDeletePair = (pairId: string) => {
+    const affected = strokes.filter(s => s.label && normalizePairId(s.label) === pairId);
+    if (affected.length > 0) {
+      const ok = window.confirm(
+        `This will permanently delete ${affected.length} chromosome annotation${affected.length > 1 ? 's' : ''} labeled "${pairId}". Continue?`
+      );
+      if (!ok) return;
+    }
+    const affectedIds = new Set(affected.map(s => s.id));
+    setStrokes(prev => prev.filter(s => !affectedIds.has(s.id)));
+    setCustomPairs(prev => prev.filter(p => p !== pairId));
+    if (selectedStrokeId && affectedIds.has(selectedStrokeId)) {
+      setSelectedStrokeId(null);
+    }
+    if (orientingStrokeId && affectedIds.has(orientingStrokeId)) {
+      setOrientingStrokeId(null);
+    }
+    if (activeLabel === pairId) {
+      setActiveLabel(pairOrder[0] || STANDARD_PAIR_IDS[0]);
+    }
+  };
+
+  const handleRenamePair = (pairId: string) => {
+    const newName = window.prompt(`Rename pair "${pairId}" to:`, pairId);
+    if (newName === null) return;
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === pairId) return;
+    const alreadyExists = [...pairOrder, ...customPairs]
+      .filter(id => id !== pairId)
+      .some(id => id.toLowerCase() === trimmed.toLowerCase());
+    if (alreadyExists) {
+      window.alert(`A pair named "${trimmed}" already exists.`);
+      return;
+    }
+    setStrokes(prev => prev.map(s => (s.label && normalizePairId(s.label) === pairId) ? { ...s, label: trimmed } : s));
+    // Rename in place - whichever list (standard slot order or custom pairs)
+    // currently holds this ID keeps its position/section, it just gets a
+    // new name. This avoids leaving a stray empty entry behind.
+    if (pairOrder.includes(pairId)) {
+      setPairOrder(prev => prev.map(id => id === pairId ? trimmed : id));
+    } else {
+      setCustomPairs(prev => prev.map(id => id === pairId ? trimmed : id));
+    }
+    if (activeLabel === pairId) setActiveLabel(trimmed);
+  };
+
+  const pairCounts = new Map<string, number>();
+  strokes.forEach(s => {
+    if (!s.label || s.label === 'Unassigned' || s.id === selectedStrokeId) return;
+    const pid = normalizePairId(s.label);
+    pairCounts.set(pid, (pairCounts.get(pid) || 0) + 1);
+  });
 
   return (
     <div className="fixed inset-0 z-[200] bg-black/80 flex flex-col items-center justify-center p-4" onPointerDown={(e) => {
@@ -1060,40 +1157,118 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
               </p>
             </div>
             <div className="flex-1 overflow-y-auto p-4 scrollbar-hide">
-              <div className="flex flex-col gap-2">
-                {BASE_CHROMOSOMES.map(chr => (
-                  <div key={chr} className="flex items-center justify-between p-2 bg-white border border-slate-200 rounded-lg">
-                    <span className="font-black text-slate-700 w-12 text-center text-lg">{chr}</span>
-                    <div className="flex gap-2">
-                      {[`${chr}L`, `${chr}R`].map(lbl => {
-                        const isUsed = strokes.some(s => s.label === lbl && s.id !== selectedStrokeId);
-                        const isSelected = currentDisplayLabel === lbl;
+              <div className="flex flex-col gap-5">
+                <div>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Standard Pairs</p>
+                  <div className="grid grid-cols-4 gap-2">
+                    {pairOrder.map(pairId => {
+                      const count = pairCounts.get(pairId) || 0;
+                      const isFull = count >= MAX_CHROMOSOMES_PER_PAIR;
+                      const isSelected = currentDisplayLabel === pairId;
+                      return (
+                        <button
+                          key={pairId}
+                          onClick={() => !isFull && handleLabelClick(pairId)}
+                          disabled={isFull && !isSelected}
+                          className={`group/cell relative aspect-square rounded-lg border-2 transition-all flex flex-col items-center justify-center px-1 ${
+                            isSelected ? "bg-sky-50 border-sky-500 shadow-inner" :
+                            isFull ? "bg-slate-100 border-slate-200 cursor-not-allowed" :
+                            "bg-white border-slate-200 hover:border-sky-300"
+                          }`}
+                        >
+                          <span className={`font-black text-center leading-tight w-full truncate ${pairId.length > 2 ? 'text-[10px]' : 'text-base'} ${isSelected ? 'text-sky-700' : 'text-slate-700'}`} title={pairId}>
+                            {pairId}
+                          </span>
+                          <span className={`absolute -top-1.5 -right-1.5 text-[9px] font-mono font-bold w-6 h-4 flex items-center justify-center rounded-full border ${
+                            isSelected ? "bg-sky-500 text-white border-sky-500" :
+                            count === 0 ? "bg-slate-50 text-slate-300 border-slate-200" :
+                            isFull ? "bg-slate-300 text-white border-slate-300" :
+                            "bg-white text-slate-500 border-slate-200"
+                          }`}>
+                            {count}/{MAX_CHROMOSOMES_PER_PAIR}
+                          </span>
+                          <span
+                            role="button"
+                            onClick={(e) => { e.stopPropagation(); handleRenamePair(pairId); }}
+                            className="absolute -bottom-1.5 -left-1.5 w-5 h-5 rounded-full bg-white border border-slate-200 text-slate-400 hover:text-sky-600 hover:border-sky-300 flex items-center justify-center opacity-0 group-hover/cell:opacity-100 transition-opacity shadow-sm"
+                            title="Rename pair"
+                          >
+                            <Pencil className="w-2.5 h-2.5" />
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {customPairs.length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Custom Pairs</p>
+                    <div className="flex flex-col gap-2">
+                      {customPairs.map(pairId => {
+                        const count = pairCounts.get(pairId) || 0;
+                        const isFull = count >= MAX_CHROMOSOMES_PER_PAIR;
+                        const isSelected = currentDisplayLabel === pairId;
                         return (
-                          <button
-                            key={lbl}
-                            onClick={() => !isUsed && handleLabelClick(lbl)}
-                            disabled={isUsed}
-                            className={`w-10 h-10 rounded-md font-black text-sm flex items-center justify-center transition-all ${
-                              isSelected ? "bg-sky-500 text-white border-sky-600 shadow-inner border-2" : 
-                              isUsed ? "bg-slate-100 text-slate-300 border-2 border-slate-200 cursor-not-allowed" : 
-                              "bg-white text-slate-600 border-2 border-slate-200 hover:border-sky-300 hover:text-sky-600"
+                          <div
+                            key={pairId}
+                            className={`flex items-center gap-1 rounded-lg border-2 transition-all ${
+                              isSelected ? "bg-sky-50 border-sky-500 shadow-inner" :
+                              isFull ? "bg-slate-100 border-slate-200" :
+                              "bg-white border-slate-200 hover:border-sky-300"
                             }`}
                           >
-                            {lbl.slice(-1)}
-                          </button>
+                            <button
+                              onClick={() => !isFull && handleLabelClick(pairId)}
+                              disabled={isFull && !isSelected}
+                              className={`flex-1 flex items-center justify-between px-3 py-2 text-left min-w-0 ${isFull && !isSelected ? 'cursor-not-allowed' : ''}`}
+                            >
+                              <span className={`font-black text-sm truncate ${isSelected ? 'text-sky-700' : 'text-slate-700'}`}>
+                                {pairId}
+                              </span>
+                              <span className={`shrink-0 ml-2 text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                                isSelected ? "bg-sky-500 text-white" : isFull ? "bg-slate-300 text-white" : "bg-slate-100 text-slate-500"
+                              }`}>
+                                {count}/{MAX_CHROMOSOMES_PER_PAIR}
+                              </span>
+                            </button>
+                            <button
+                              onClick={() => handleRenamePair(pairId)}
+                              className="shrink-0 p-2 text-slate-300 hover:text-sky-600 hover:bg-sky-50 rounded-md transition-colors"
+                              title="Rename pair"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              onClick={() => handleDeletePair(pairId)}
+                              className="shrink-0 p-2 mr-1 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-md transition-colors"
+                              title="Delete pair"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         );
                       })}
                     </div>
                   </div>
-                ))}
-                <button
-                  onClick={() => handleLabelClick('Unassigned')}
-                  className={`mt-4 py-3 rounded-lg font-bold text-sm border-2 transition-all ${
-                    currentDisplayLabel === 'Unassigned' ? "border-sky-500 bg-sky-50 text-sky-700" : "border-slate-200 bg-white text-slate-600 hover:border-slate-300"
-                  }`}
-                >
-                  Unassigned
-                </button>
+                )}
+
+                <div className="flex flex-col gap-2">
+                  <button
+                    onClick={handleAddPair}
+                    className="py-3 rounded-lg font-bold text-sm border-2 border-dashed border-slate-200 bg-white text-slate-500 hover:border-sky-300 hover:text-sky-600 transition-all flex items-center justify-center gap-2"
+                  >
+                    <Plus className="w-4 h-4" /> Add Pair
+                  </button>
+                  <button
+                    onClick={() => handleLabelClick('Unassigned')}
+                    className={`py-3 rounded-lg font-bold text-sm border-2 transition-all ${
+                      currentDisplayLabel === 'Unassigned' ? "border-sky-500 bg-sky-50 text-sky-700" : "border-slate-200 bg-white text-slate-600 hover:border-slate-300"
+                    }`}
+                  >
+                    Unassigned
+                  </button>
+                </div>
               </div>
             </div>
             {mode === 'edit' && selectedStrokeId && (

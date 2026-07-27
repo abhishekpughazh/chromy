@@ -1,5 +1,2 @@
 # Supabase local development config.
 # See docs/RESEND_SETUP.md for Resend deployment steps.
-
-[functions.send-email]
-verify_jwt = false
