@@ -28,11 +28,19 @@ import {
   type CollisionDetection
 } from '@dnd-kit/core';
 import { cn } from './lib/utils';
+import { NonInteractivePointerSensor, NonInteractiveTouchSensor } from './lib/dndSensors';
+import { storageObjectPathFromPublicUrl } from './lib/imageUrl';
 import { normalizePairId, comparePairIds, MAX_CHROMOSOMES_PER_PAIR } from './lib/chromosomePairs';
+import { normalizeRotation, rotationsMatch, chromosomeTransform } from './lib/orientation';
+import {
+  type AnnotationStatus,
+  countLabeledChromosomes,
+  getAnnotationStatus,
+} from './lib/annotationStatus';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Info, RotateCcw, CheckCircle2, ChevronRight, Dna, Undo2, 
-  ShieldCheck, Upload, Play, Beaker, X, Loader, ImageIcon, Zap, Pencil, Trash2, RotateCw, FlipHorizontal, FlipVertical, Expand, Download, FolderPlus, Folder
+  ShieldCheck, Upload, Play, Beaker, X, Loader, ImageIcon, Zap, Pencil, Trash2, FlipHorizontal, FlipVertical, Expand, Download, FolderPlus, Folder
 } from 'lucide-react';
 
 // --- Types ---
@@ -110,10 +118,6 @@ const createInitialChromosomes = (): ChromosomeData[] => {
 
 const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewing = false }: { chromosome: ChromosomeData, className?: string, isDragging?: boolean, isReviewing?: boolean }) => {
   if (chromosome.imageUrl) {
-    const rot = chromosome.userRotation || 0;
-    const fx = chromosome.userFlipX ? -1 : 1;
-    const fy = chromosome.userFlipY ? -1 : 1;
-
     return (
       <div 
         className={cn(
@@ -126,12 +130,12 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewi
         <img 
           src={chromosome.imageUrl} 
           className={cn(
-            "max-h-full max-w-[40px] object-contain transition-all print:!drop-shadow-none print:!filter-none",
-            !isReviewing && "drop-shadow-md filter group-hover:drop-shadow-lg"
+            "max-h-full max-w-[40px] object-contain print:!drop-shadow-none print:!filter-none",
+            !isReviewing && "drop-shadow-md filter group-hover:drop-shadow-lg transition-shadow"
           )}
           draggable={false}
           alt={chromosome.type}
-          style={{ transform: `rotate(${rot}deg) scaleX(${fx}) scaleY(${fy})` }}
+          style={{ transform: chromosomeTransform(chromosome.userRotation, chromosome.userFlipX, chromosome.userFlipY) }}
         />
         {!isDragging && !isReviewing && (
           <div className="absolute -bottom-5 text-[10px] font-mono text-slate-400 opacity-0 hover:opacity-100 transition-opacity print:hidden">
@@ -192,8 +196,22 @@ const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing }: { id: st
         <ChromosomeVisual chromosome={chromosome} isDragging={isDragging} isReviewing={isReviewing} />
       </div>
       {onUpdate && chromosome.imageUrl && !isDragging && !isReviewing && (
-        <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-white border border-slate-200 shadow-lg rounded-lg p-1 flex gap-1 z-50 opacity-0 group-hover/chrom:opacity-100 transition-opacity cursor-default print:hidden">
-          <button onClick={(e) => { e.stopPropagation(); onUpdate(id, { userRotation: ((chromosome.userRotation || 0) + 45) % 360 }) }} className="p-1 hover:bg-slate-100 rounded text-slate-600"><RotateCw className="w-3 h-3" /></button>
+        <div
+          className="absolute -top-11 left-1/2 -translate-x-1/2 bg-white border border-slate-200 shadow-lg rounded-lg px-2 py-1.5 flex items-center gap-1.5 z-50 opacity-0 group-hover/chrom:opacity-100 focus-within:opacity-100 hover:opacity-100 transition-opacity cursor-default print:hidden"
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <input
+            type="range"
+            min={0}
+            max={359}
+            step={1}
+            value={normalizeRotation(chromosome.userRotation)}
+            aria-label="Rotate chromosome"
+            onChange={(e) => onUpdate(id, { userRotation: Number(e.target.value) })}
+            className="w-20 h-1.5 accent-sky-500 cursor-pointer"
+          />
+          <span className="text-[9px] font-mono text-slate-500 w-7 tabular-nums">{normalizeRotation(chromosome.userRotation)}°</span>
           <button onClick={(e) => { e.stopPropagation(); onUpdate(id, { userFlipX: !chromosome.userFlipX }) }} className="p-1 hover:bg-slate-100 rounded text-slate-600"><FlipHorizontal className="w-3 h-3" /></button>
           <button onClick={(e) => { e.stopPropagation(); onUpdate(id, { userFlipY: !chromosome.userFlipY }) }} className="p-1 hover:bg-slate-100 rounded text-slate-600"><FlipVertical className="w-3 h-3" /></button>
         </div>
@@ -261,7 +279,7 @@ const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedCh
     if (chrom.type !== pairId) return 'wrong';
 
     if (chrom.imageUrl) {
-      if (chrom.userRotation === chrom.expectedRotation && 
+      if (rotationsMatch(chrom.userRotation, chrom.expectedRotation) && 
           chrom.userFlipX === chrom.expectedFlipX && 
           chrom.userFlipY === chrom.expectedFlipY) {
         return 'fully-correct';
@@ -437,7 +455,7 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
       const ordinal = ordinalByPair.get(pairId) || 0;
       ordinalByPair.set(pairId, ordinal + 1);
 
-      const rotation = parseFloat(el.getAttribute('rotation') || '0');
+      const rotation = normalizeRotation(parseFloat(el.getAttribute('rotation') || '0'));
       const flipX = el.getAttribute('flipX') === 'true';
       const flipY = el.getAttribute('flipY') === 'true';
 
@@ -531,9 +549,11 @@ interface AdminImage {
   id: string;
   originalUrl: string;
   xml?: string;
+  userId?: string;
   uploaderEmail?: string;
   bucketId?: string | null;
   karyotype?: string;
+  annotationComplete?: boolean;
 }
 
 const formatBucketLabel = (bucket: Bucket) =>
@@ -700,6 +720,8 @@ const BucketHeader: React.FC<{
 };
 
 import ImageAnnotationModal from './components/ImageAnnotationModal';
+import { LazyThumb } from './components/LazyThumb';
+import { ConfirmDeleteSampleModal } from './components/ConfirmDeleteSampleModal';
 
 interface AdminPanelProps {
   onClose: () => void;
@@ -867,6 +889,21 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [annotateImageUrl, setAnnotateImageUrl] = useState<string | null>(null);
   const [annotateImageId, setAnnotateImageId] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<'all' | AnnotationStatus>('all');
+  const [pendingDelete, setPendingDelete] = useState<AdminImage | null>(null);
+  const [deletingSample, setDeletingSample] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const deletingLockRef = useRef(false);
+
+  const canDeleteSample = (img: AdminImage) => {
+    if (!session?.user) return false;
+    if (img.userId && img.userId === session.user.id) return true;
+    return userRole === 'ADMIN' || userRole === 'SUPER ADMIN';
+  };
+
+  const stopCardDrag = (e: React.SyntheticEvent) => {
+    e.stopPropagation();
+  };
 
   const loadBuckets = async () => {
     if (!session?.user) return;
@@ -988,8 +1025,8 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
   };
 
   const folderDragSensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } })
+    useSensor(NonInteractivePointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(NonInteractiveTouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } })
   );
 
   const resolveTargetBucketId = (overId: string): string | null | undefined => {
@@ -1015,7 +1052,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
     const { active, over } = event;
     setDraggingSample(null);
 
-    if (!over) return;
+    if (!over) return; // drop outside a bucket: leave the sample where it is
 
     const imageId = String(active.id).replace('dataset-', '');
     const currentBucketId =
@@ -1055,32 +1092,92 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
     }
   };
 
-  const renderSampleCard = (img: AdminImage) => (
+  const persistAnnotationComplete = async (imageId: string, complete: boolean) => {
+    const { error } = await supabase
+      .from('samples')
+      .update({ annotation_complete: complete })
+      .eq('id', imageId);
+    if (error) throw error;
+    setImages(prev => prev.map(img => img.id === imageId ? { ...img, annotationComplete: complete } : img));
+  };
+
+  const filterByStatus = (list: AdminImage[]) =>
+    statusFilter === 'all'
+      ? list
+      : list.filter(img => getAnnotationStatus(img.xml, img.annotationComplete) === statusFilter);
+
+  const renderStatusFilters = (list: AdminImage[]) => {
+    const counts: Record<AnnotationStatus, number> = { never_started: 0, in_progress: 0, complete: 0 };
+    list.forEach(img => {
+      counts[getAnnotationStatus(img.xml, img.annotationComplete)]++;
+    });
+    const chips: { id: 'all' | AnnotationStatus; label: string; count: number }[] = [
+      { id: 'all', label: 'All', count: list.length },
+      { id: 'never_started', label: 'Not started', count: counts.never_started },
+      { id: 'in_progress', label: 'In progress', count: counts.in_progress },
+      { id: 'complete', label: 'Complete', count: counts.complete },
+    ];
+    return (
+      <div className="flex flex-wrap items-center gap-1.5 mb-4">
+        {chips.map(chip => (
+          <button
+            key={chip.id}
+            type="button"
+            onClick={() => setStatusFilter(chip.id)}
+            className={cn(
+              "px-2 py-1 rounded-full text-[10px] font-bold transition-colors",
+              statusFilter === chip.id
+                ? chip.id === 'complete'
+                  ? "bg-emerald-500 text-white"
+                  : chip.id === 'in_progress'
+                    ? "bg-amber-500 text-white"
+                    : "bg-slate-900 text-white"
+                : "bg-white border border-slate-200 text-slate-500 hover:bg-slate-100"
+            )}
+          >
+            {chip.label} {chip.count}
+          </button>
+        ))}
+      </div>
+    );
+  };
+
+  const renderSampleCard = (img: AdminImage) => {
+    const status = getAnnotationStatus(img.xml, img.annotationComplete);
+    const labeled = countLabeledChromosomes(img.xml);
+    const showDelete = canDeleteSample(img);
+
+    return (
     <DraggableDatasetImage key={img.id} img={img}>
       <div
-        className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden group relative aspect-square flex flex-col"
-        onClick={() => {
+        className={cn(
+          "bg-white rounded-xl shadow-sm overflow-hidden group relative aspect-square flex flex-col border-2",
+          status === 'complete' ? "border-emerald-500" : status === 'in_progress' ? "border-amber-400" : "border-slate-200"
+        )}
+        onClick={(e) => {
+          if ((e.target as HTMLElement).closest('button, [data-no-dnd]')) return;
           const url = img.originalUrl;
           if (!url) return;
           setAnnotateImageUrl(url);
           setAnnotateImageId(img.id);
         }}
       >
-        <button
-          onClick={(e) => deleteImage(img.id, e)}
-          className="absolute top-2 right-2 z-10 w-7 h-7 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
-          title="Delete Sample"
-        >
-          <Trash2 className="w-3.5 h-3.5" />
-        </button>
-
         <div className="relative flex-1 bg-slate-100 overflow-hidden">
-          <img
+          <LazyThumb
             src={img.originalUrl}
             alt="Sample"
             draggable={false}
+            width={400}
+            height={400}
             className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
           />
+
+          <div
+            className="absolute top-1.5 right-1.5 z-10 h-4 min-w-4 px-1 rounded-full bg-black/70 text-white text-[8px] leading-none font-mono font-bold flex items-center justify-center tabular-nums pointer-events-none"
+            title={`${labeled} chromosome${labeled === 1 ? '' : 's'} annotated`}
+          >
+            {labeled}
+          </div>
 
           <div className="absolute inset-0 pointer-events-none bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
             <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 flex items-center gap-2 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-lg shadow-xl">
@@ -1092,19 +1189,48 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
           </div>
         </div>
 
-        <button
-          onClick={(e) => handleEditKaryotype(img, e)}
-          title="Edit ISCN karyotype designation"
-          className="shrink-0 flex items-center gap-1 px-2 py-1.5 bg-slate-50 border-t border-slate-200 text-left hover:bg-slate-100 transition-colors"
-        >
-          <span className="text-[10px] font-mono font-bold text-slate-600 truncate flex-1">
+        <div className="shrink-0 border-t border-slate-200 bg-slate-50 px-2 py-1.5 flex flex-col items-center gap-1">
+          <p className="text-[10px] font-mono font-bold text-slate-600 text-center w-full leading-tight break-words">
             {img.karyotype || 'No karyotype set'}
-          </span>
-          <Pencil className="w-3 h-3 text-slate-400 shrink-0" />
-        </button>
+          </p>
+          <div className="flex items-center justify-center gap-0.5">
+            <button
+              type="button"
+              data-no-dnd
+              onPointerDown={stopCardDrag}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                handleEditKaryotype(img, e);
+              }}
+              title="Edit ISCN karyotype designation"
+              className="p-1 rounded-md text-slate-400 hover:text-sky-600 hover:bg-sky-50 transition-colors"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+            </button>
+            {showDelete && (
+              <button
+                type="button"
+                data-no-dnd
+                onPointerDown={stopCardDrag}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setDeleteError(null);
+                  setPendingDelete(img);
+                }}
+                title="Delete this metaphase spread"
+                className="p-1 rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
       </div>
     </DraggableDatasetImage>
-  );
+    );
+  };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1166,9 +1292,11 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
         id: dbData.id,
         originalUrl: publicUrl,
         xml: '',
+        userId: session.user.id,
         uploaderEmail: session.user.email,
         bucketId: selectedBucketId,
-        karyotype
+        karyotype,
+        annotationComplete: false
       };
       
       setImages(prev => [newImage, ...prev]);
@@ -1181,23 +1309,51 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
     }
   };
 
-  const deleteImage = async (id: string, e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (!window.confirm('Are you sure you want to delete this sample?')) return;
-    
-    const img = images.find(i => i.id === id);
-    if (!img) return;
+  const confirmDeleteSample = async () => {
+    const img = pendingDelete;
+    if (!img?.id || deletingLockRef.current) return;
+    if (!canDeleteSample(img)) {
+      setDeleteError('You do not have permission to delete this spread.');
+      return;
+    }
+
+    deletingLockRef.current = true;
+    setDeletingSample(true);
+    setDeleteError(null);
 
     try {
-      const fileName = img.originalUrl.split('/').slice(-2).join('/');
-      await supabase.storage.from('images').remove([fileName]);
-      await supabase.from('samples').delete().eq('id', id);
+      const { data, error } = await supabase
+        .from('samples')
+        .delete()
+        .eq('id', img.id)
+        .select('id');
 
-      setImages(prev => prev.filter(i => i.id !== id));
-      if (lastUpload?.id === id) setLastUpload(null);
-    } catch (err) {
-      console.error('Failed to delete image:', err);
+      if (error) throw error;
+      if (!data?.length) {
+        throw new Error('This spread was not deleted. You may not have permission, or it was already removed.');
+      }
+
+      const filePath = storageObjectPathFromPublicUrl(img.originalUrl);
+      if (filePath) {
+        const { error: storageError } = await supabase.storage.from('images').remove([filePath]);
+        if (storageError) {
+          console.warn('Sample row deleted but storage file could not be removed:', storageError);
+        }
+      }
+
+      setImages(prev => prev.filter(i => i.id !== img.id));
+      if (lastUpload?.id === img.id) setLastUpload(null);
+      if (annotateImageId === img.id) {
+        setAnnotateImageUrl(null);
+        setAnnotateImageId(null);
+      }
+      setPendingDelete(null);
+    } catch (err: any) {
+      console.error('Failed to delete sample:', err);
+      setDeleteError(err.message || 'Failed to delete this metaphase spread.');
+    } finally {
+      deletingLockRef.current = false;
+      setDeletingSample(false);
     }
   };
 
@@ -1223,6 +1379,13 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
       window.alert('Failed to update karyotype designation.');
     }
   };
+
+  const displayedImages =
+    activeBucketId === null
+      ? []
+      : activeBucketId === 'unassigned'
+        ? filterByStatus(unassignedImages)
+        : filterByStatus(imagesByBucket[activeBucketId] ?? []);
 
   return (
     <motion.div
@@ -1422,9 +1585,12 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
                 <p className="text-xs font-mono text-slate-400">
                   IMAGE PREVIEW
                 </p>
-                <img
+                <LazyThumb
                   src={lastUpload.originalUrl}
                   alt="Uploaded"
+                  width={800}
+                  resize="contain"
+                  fallbackToOriginal
                   className="w-full rounded-xl border border-slate-100"
                 />
                 {lastUpload.karyotype && (
@@ -1551,9 +1717,23 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
           </div>
 
           <div className="bg-slate-50 rounded-3xl p-8 border border-slate-100 flex flex-col h-full max-h-[800px]">
-            <div className="flex items-center justify-between mb-6 shrink-0">
+            <div className="flex items-center justify-between mb-2 shrink-0">
               <h3 className="text-xl font-black">Available Dataset</h3>
               <span className="text-xs font-mono font-bold text-slate-400 bg-slate-200 px-2 py-1 rounded-md">{images.length} SAMPLES</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 mb-6 shrink-0 text-[10px] font-bold text-slate-500">
+              <span className="flex items-center gap-1.5">
+                <span className="w-3.5 h-3.5 rounded-sm border-2 border-amber-400 bg-white" />
+                In progress
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-3.5 h-3.5 rounded-sm border-2 border-emerald-500 bg-white" />
+                Complete
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="h-4 min-w-4 px-1 rounded-full bg-slate-800 text-white text-[8px] font-mono flex items-center justify-center">n</span>
+                Chromosomes annotated
+              </span>
             </div>
 
             {moveError && (
@@ -1571,14 +1751,22 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
               ) : (
                   activeBucketId === 'unassigned' ? (
                     <UnassignedFolder sampleCount={unassignedImages.length}>
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 min-h-[4rem]">
-                        {unassignedImages.map(img => renderSampleCard(img))}
-                      </div>
+                      {renderStatusFilters(unassignedImages)}
+                      {filterByStatus(unassignedImages).length === 0 ? (
+                        <div className="flex flex-col items-center justify-center py-12 text-slate-300 text-center">
+                          <p className="text-xs font-medium">No samples match this filter</p>
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 min-h-[4rem]">
+                          {filterByStatus(unassignedImages).map(img => renderSampleCard(img))}
+                        </div>
+                      )}
                     </UnassignedFolder>
                   ) : (() => {
                     const bucket = buckets.find(b => b.id === activeBucketId);
                     if (!bucket) return null;
                     const bucketImages = imagesByBucket[bucket.id] ?? [];
+                    const visibleImages = filterByStatus(bucketImages);
                     return (
                       <BucketFolder
                         bucket={bucket}
@@ -1592,9 +1780,18 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
                             <p className="text-xs mt-1">Upload a spread or drag one here from another bucket</p>
                           </div>
                         ) : (
-                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 min-h-[4rem]">
-                            {bucketImages.map(img => renderSampleCard(img))}
-                          </div>
+                          <>
+                            {renderStatusFilters(bucketImages)}
+                            {visibleImages.length === 0 ? (
+                              <div className="flex flex-col items-center justify-center py-12 text-slate-300 text-center">
+                                <p className="text-xs font-medium">No samples match this filter</p>
+                              </div>
+                            ) : (
+                              <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 min-h-[4rem]">
+                                {visibleImages.map(img => renderSampleCard(img))}
+                              </div>
+                            )}
+                          </>
                         )}
                       </BucketFolder>
                     );
@@ -1606,11 +1803,13 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
         <DragOverlay dropAnimation={null}>
           {draggingSample ? (
             <div className="w-28 aspect-square rounded-xl overflow-hidden border-2 border-sky-400 shadow-2xl bg-white rotate-2 cursor-grabbing">
-              <img
+              <LazyThumb
                 src={draggingSample.originalUrl}
                 alt="Moving sample"
-                className="w-full h-full object-cover"
+                width={200}
+                height={200}
                 draggable={false}
+                className="w-full h-full object-cover"
               />
             </div>
           ) : null}
@@ -1621,18 +1820,35 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
           imageUrl={annotateImageUrl}
           imageId={annotateImageId}
           initialXml={images.find(img => img.id === annotateImageId)?.xml}
+          karyotype={images.find(img => img.id === annotateImageId)?.karyotype}
+          annotationComplete={images.find(img => img.id === annotateImageId)?.annotationComplete}
           onSave={async (xml) => {
             try {
+              const labeled = countLabeledChromosomes(xml);
+              const payload: { xml: string; annotation_complete?: boolean } = { xml };
+              if (labeled === 0) payload.annotation_complete = false;
+
               const { error } = await supabase
                 .from('samples')
-                .update({ xml })
+                .update(payload)
                 .eq('id', annotateImageId);
               
               if (error) throw error;
-              setImages(prev => prev.map(img => img.id === annotateImageId ? { ...img, xml } : img));
+              setImages(prev => prev.map(img => img.id === annotateImageId
+                ? { ...img, xml, ...(labeled === 0 ? { annotationComplete: false } : {}) }
+                : img));
             } catch (err) {
               console.error('Failed to save annotations to DB:', err);
               alert('Failed to save annotations to database.');
+              throw err;
+            }
+          }}
+          onSetComplete={async (complete) => {
+            try {
+              await persistAnnotationComplete(annotateImageId, complete);
+            } catch (err) {
+              console.error('Failed to update annotation status:', err);
+              alert('Failed to update annotation status.');
               throw err;
             }
           }}
@@ -1640,6 +1856,22 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
             setAnnotateImageUrl(null);
             setAnnotateImageId(null);
           }}
+        />
+      )}
+      {pendingDelete && (
+        <ConfirmDeleteSampleModal
+          key={pendingDelete.id}
+          originalUrl={pendingDelete.originalUrl}
+          karyotype={pendingDelete.karyotype}
+          labeledCount={countLabeledChromosomes(pendingDelete.xml)}
+          deleting={deletingSample}
+          error={deleteError}
+          onCancel={() => {
+            if (deletingSample) return;
+            setPendingDelete(null);
+            setDeleteError(null);
+          }}
+          onConfirm={confirmDeleteSample}
         />
       )}
     </motion.div>
@@ -1688,6 +1920,7 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, o
             <p className="text-sm mt-1">Please ask the administrator to upload and annotate samples.</p>
           </div>
         ) : (
+          <>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
             {images.map(img => (
               <div
@@ -1705,9 +1938,11 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, o
                   </div>
                 )}
                 <div className="relative flex-1 bg-slate-100 overflow-hidden">
-                  <img
+                  <LazyThumb
                     src={img.originalUrl}
                     alt="Spread"
+                    width={400}
+                    height={400}
                     className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110"
                   />
                   <div className="absolute inset-0 bg-sky-900/0 group-hover:bg-sky-900/10 transition-colors" />
@@ -1724,6 +1959,7 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, o
               </div>
             ))}
           </div>
+          </>
         )}
       </div>
     </motion.div>
@@ -1976,9 +2212,11 @@ export default function Chromy() {
             id: row.id,
             originalUrl: row.original_url,
             xml: row.xml,
+            userId: row.user_id,
             uploaderEmail: row.uploader_email,
             bucketId: row.bucket_id ?? null,
-            karyotype: row.karyotype ?? undefined
+            karyotype: row.karyotype ?? undefined,
+            annotationComplete: row.annotation_complete === true
           })));
         }
       } catch (e: any) {
@@ -2150,7 +2388,7 @@ export default function Chromy() {
       if (expectedPairId === undefined || chrom.type !== expectedPairId) return;
 
       if (chrom.imageUrl) {
-        if (chrom.userRotation === chrom.expectedRotation && 
+        if (rotationsMatch(chrom.userRotation, chrom.expectedRotation) && 
             chrom.userFlipX === chrom.expectedFlipX && 
             chrom.userFlipY === chrom.expectedFlipY) {
           correctCount++;

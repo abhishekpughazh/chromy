@@ -1,6 +1,10 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { X, Save, PenLine, Trash2, Undo2, Hand, ZoomIn, ZoomOut, Maximize, MousePointer2, Eye, EyeOff, RotateCw, FlipHorizontal, FlipVertical, Plus, Pencil } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { X, Save, PenLine, Trash2, Undo2, Hand, ZoomIn, ZoomOut, Maximize, MousePointer2, Eye, EyeOff, RotateCw, FlipHorizontal, FlipVertical, Plus, Pencil, LayoutGrid } from 'lucide-react';
 import { STANDARD_PAIR_IDS, MAX_CHROMOSOMES_PER_PAIR, normalizePairId, isStandardPairId } from '../lib/chromosomePairs';
+import { normalizeRotation, pointerAngleDeg, chromosomeTransform, toggleDisplayedFlipX, toggleDisplayedFlipY } from '../lib/orientation';
+import { countLabeledStrokes, parseExpectedChromosomeCount, markCompleteMismatchMessage } from '../lib/annotationStatus';
+import { cropPolygonFromImage } from '../lib/chromosomeCrop';
+import KaryotypePreview, { type KaryotypePreviewChromosome } from './KaryotypePreview';
 
 interface Point { x: number; y: number }
 interface Stroke {
@@ -15,17 +19,25 @@ interface Stroke {
 }
 
 /**
- * Returns the next pair ID (in the order given - standard pairs first, then
- * custom pairs in the order they were added) that still has room for
- * another chromosome (fewer than MAX_CHROMOSOMES_PER_PAIR strokes assigned).
+ * Returns a pair ID that still has room for another chromosome (fewer than
+ * MAX_CHROMOSOMES_PER_PAIR strokes assigned).
+ *
+ * If `preferId` still has room, it is returned as-is so finishing a stroke
+ * does not snap the selector back to chromosome 1. Otherwise the first pair
+ * in `allPairIds` with remaining capacity is used (standard pairs first,
+ * then custom pairs in the order they were added).
  */
-function nextAvailablePair(strokes: Stroke[], allPairIds: string[]): string | null {
+function nextAvailablePair(strokes: Stroke[], allPairIds: string[], preferId?: string): string | null {
   const counts = new Map<string, number>();
   strokes.forEach(s => {
     if (!s.label || s.label === 'Unassigned') return;
     const pid = normalizePairId(s.label);
     counts.set(pid, (counts.get(pid) || 0) + 1);
   });
+  if (preferId && preferId !== 'Unassigned') {
+    const preferred = normalizePairId(preferId);
+    if ((counts.get(preferred) || 0) < MAX_CHROMOSOMES_PER_PAIR) return preferred;
+  }
   for (const id of allPairIds) {
     if ((counts.get(id) || 0) < MAX_CHROMOSOMES_PER_PAIR) return id;
   }
@@ -36,7 +48,10 @@ interface ImageAnnotationModalProps {
   imageUrl: string;
   imageId: string;
   initialXml?: string;
+  karyotype?: string;
+  annotationComplete?: boolean;
   onSave: (xml: string) => Promise<void>;
+  onSetComplete: (complete: boolean) => Promise<void>;
   onClose: () => void;
 }
 
@@ -44,7 +59,7 @@ function strokesToXml(strokes: Stroke[], imageId: string, imgWidth: number, imgH
   let xml = `<?xml version="1.0" encoding="UTF-8"?>\n`;
   xml += `<annotations imageId="${imageId}" width="${imgWidth}" height="${imgHeight}">\n`;
   for (const s of strokes) {
-    xml += `  <stroke color="${s.color}" width="${s.width}" label="${s.label || 'Unassigned'}" rotation="${s.rotation || 0}" flipX="${s.flipX || false}" flipY="${s.flipY || false}">\n`;
+    xml += `  <stroke color="${s.color}" width="${s.width}" label="${s.label || 'Unassigned'}" rotation="${normalizeRotation(s.rotation)}" flipX="${s.flipX || false}" flipY="${s.flipY || false}">\n`;
     for (const p of s.points) {
       xml += `    <point x="${p.x.toFixed(2)}" y="${p.y.toFixed(2)}"/>\n`;
     }
@@ -64,7 +79,7 @@ function xmlToStrokes(xmlText: string): Stroke[] | null {
       const color = el.getAttribute('color') || '#ff0000';
       const width = parseFloat(el.getAttribute('width') || '2');
       const label = el.getAttribute('label') || 'Unassigned';
-      const rotation = parseFloat(el.getAttribute('rotation') || '0');
+      const rotation = normalizeRotation(parseFloat(el.getAttribute('rotation') || '0'));
       const flipX = el.getAttribute('flipX') === 'true';
       const flipY = el.getAttribute('flipY') === 'true';
       const pointEls = el.querySelectorAll('point');
@@ -96,10 +111,13 @@ const OrientationDialog = ({
   onEdit: () => void,
   onRedo: () => void
 }) => {
-  const [rotation, setRotation] = useState(stroke.rotation || 0);
+  const [rotation, setRotation] = useState(() => normalizeRotation(stroke.rotation));
   const [flipX, setFlipX] = useState(stroke.flipX || false);
   const [flipY, setFlipY] = useState(stroke.flipY || false);
   const [dataUrl, setDataUrl] = useState<string>('');
+  const [isDraggingRotation, setIsDraggingRotation] = useState(false);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ startPointerAngle: number; startRotation: number } | null>(null);
 
   useEffect(() => {
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -151,6 +169,40 @@ const OrientationDialog = ({
     safeImg.src = img.src;
   }, [stroke, img]);
 
+  const handlePreviewPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const el = previewRef.current;
+    if (!el) return;
+    el.setPointerCapture(e.pointerId);
+    dragRef.current = {
+      startPointerAngle: pointerAngleDeg(e.clientX, e.clientY, el),
+      startRotation: rotation,
+    };
+    setIsDraggingRotation(true);
+  };
+
+  const handlePreviewPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    const el = previewRef.current;
+    if (!drag || !el) return;
+    const current = pointerAngleDeg(e.clientX, e.clientY, el);
+    setRotation(normalizeRotation(drag.startRotation + (current - drag.startPointerAngle)));
+  };
+
+  const endPreviewDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    setIsDraggingRotation(false);
+    setRotation((r) => normalizeRotation(r));
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // capture may already have been released
+    }
+  };
+
+  const displayRotation = normalizeRotation(rotation);
+
   return (
     <div 
       className="fixed inset-0 z-[300] bg-black/60 flex items-center justify-center p-4 backdrop-blur-sm"
@@ -161,16 +213,25 @@ const OrientationDialog = ({
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="text-2xl font-black text-slate-900 mb-2">Orient Chromosome</h3>
-        <p className="text-sm text-slate-500 mb-8 text-center font-medium">Adjust the orientation before extracting. The p-arm should typically point upwards.</p>
+        <p className="text-sm text-slate-500 mb-8 text-center font-medium">Drag the preview or use the slider to rotate. The p-arm should typically point upwards.</p>
 
-        <div className="w-64 h-64 border-2 border-slate-100 bg-slate-50/50 rounded-2xl mb-8 flex items-center justify-center overflow-hidden shadow-inner">
+        <div
+          ref={previewRef}
+          className="w-64 h-64 border-2 border-slate-100 bg-slate-50/50 rounded-2xl mb-4 flex items-center justify-center overflow-hidden shadow-inner touch-none select-none"
+          style={{ cursor: isDraggingRotation ? 'grabbing' : 'grab' }}
+          onPointerDown={handlePreviewPointerDown}
+          onPointerMove={handlePreviewPointerMove}
+          onPointerUp={endPreviewDrag}
+          onPointerCancel={endPreviewDrag}
+        >
           {dataUrl ? (
             <img
               src={dataUrl}
               alt="Chromosome Preview"
-              className="max-w-[80%] max-h-[80%] object-contain transition-transform duration-300 drop-shadow-lg"
+              draggable={false}
+              className="max-w-[80%] max-h-[80%] object-contain drop-shadow-lg pointer-events-none"
               style={{
-                transform: `rotate(${rotation}deg) scaleX(${flipX ? -1 : 1}) scaleY(${flipY ? -1 : 1})`
+                transform: chromosomeTransform(rotation, flipX, flipY)
               }}
             />
           ) : (
@@ -178,17 +239,51 @@ const OrientationDialog = ({
           )}
         </div>
 
+        <div className="w-full mb-6">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-bold text-slate-500 uppercase tracking-wide">Rotation</span>
+            <label className="flex items-center gap-1 text-sm font-mono font-bold text-slate-700">
+              <input
+                type="number"
+                min={0}
+                max={359}
+                value={displayRotation}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  if (Number.isFinite(n)) setRotation(normalizeRotation(n));
+                }}
+                className="w-16 text-right px-2 py-1 border border-slate-200 rounded-lg text-sm font-mono font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-sky-500"
+              />
+              °
+            </label>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={359}
+            step={1}
+            value={displayRotation}
+            aria-label="Rotation in degrees"
+            onChange={(e) => setRotation(Number(e.target.value))}
+            className="w-full accent-sky-500 cursor-pointer"
+          />
+        </div>
+
         <div className="grid grid-cols-2 gap-3 w-full mb-8">
-          <button onClick={() => setRotation((r) => (r - 45 + 360) % 360)} className="py-3 border-2 border-slate-200 rounded-xl hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600 font-bold text-slate-600 text-sm flex items-center justify-center gap-2 transition-all">
-            <RotateCw className="w-4 h-4 scale-x-[-1]" /> -45°
-          </button>
-          <button onClick={() => setRotation((r) => (r + 45) % 360)} className="py-3 border-2 border-slate-200 rounded-xl hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600 font-bold text-slate-600 text-sm flex items-center justify-center gap-2 transition-all">
-            <RotateCw className="w-4 h-4" /> +45°
-          </button>
-          <button onClick={() => setFlipX(!flipX)} className="py-3 border-2 border-slate-200 rounded-xl hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600 font-bold text-slate-600 text-sm flex items-center justify-center gap-2 transition-all">
+          <button onClick={() => {
+            const next = toggleDisplayedFlipX({ rotation, flipX, flipY });
+            setRotation(next.rotation);
+            setFlipX(next.flipX);
+            setFlipY(next.flipY);
+          }} className="py-3 border-2 border-slate-200 rounded-xl hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600 font-bold text-slate-600 text-sm flex items-center justify-center gap-2 transition-all">
             <FlipHorizontal className="w-4 h-4" /> Flip X
           </button>
-          <button onClick={() => setFlipY(!flipY)} className="py-3 border-2 border-slate-200 rounded-xl hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600 font-bold text-slate-600 text-sm flex items-center justify-center gap-2 transition-all">
+          <button onClick={() => {
+            const next = toggleDisplayedFlipY({ rotation, flipX, flipY });
+            setRotation(next.rotation);
+            setFlipX(next.flipX);
+            setFlipY(next.flipY);
+          }} className="py-3 border-2 border-slate-200 rounded-xl hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600 font-bold text-slate-600 text-sm flex items-center justify-center gap-2 transition-all">
             <FlipVertical className="w-4 h-4" /> Flip Y
           </button>
         </div>
@@ -198,7 +293,7 @@ const OrientationDialog = ({
             onClick={(e) => {
               e.preventDefault();
               e.stopPropagation();
-              onComplete({ rotation, flipX, flipY });
+              onComplete({ rotation: normalizeRotation(rotation), flipX, flipY });
             }}
             className="w-full py-4 bg-sky-500 text-white rounded-xl font-black text-lg hover:bg-sky-600 hover:-translate-y-0.5 active:translate-y-0 transition-all shadow-lg shadow-sky-500/30"
           >
@@ -254,7 +349,7 @@ function distToSegment(p: Point, v: Point, w: Point) {
 
 type Mode = 'draw' | 'pan' | 'edit';
 
-export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, onSave, onClose }: ImageAnnotationModalProps) {
+export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, karyotype, annotationComplete, onSave, onSetComplete, onClose }: ImageAnnotationModalProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
@@ -273,10 +368,14 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
   const [imgSize, setImgSize] = useState({ width: 0, height: 0 });
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [complete, setComplete] = useState(!!annotationComplete);
   const [loaded, setLoaded] = useState(false);
   const [previewPoint, setPreviewPoint] = useState<Point | null>(null);
 
   const [showLabels, setShowLabels] = useState(true);
+  const [showKaryotypePreview, setShowKaryotypePreview] = useState(false);
+  const [cropUrls, setCropUrls] = useState<Record<string, string>>({});
+  const cropCacheRef = useRef<Map<string, { sig: string; dataUrl: string }>>(new Map());
   const [mode, setMode] = useState<Mode>('draw');
   const [drawStyle, setDrawStyle] = useState<'polygon' | 'freehand'>('freehand');
   const [activeLabel, setActiveLabel] = useState<string>(STANDARD_PAIR_IDS[0]);
@@ -445,8 +544,48 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     gestureRef.current.drawStroke = null;
     pointersRef.current.clear();
     setShowLabels(true);
+    setShowKaryotypePreview(false);
+    cropCacheRef.current.clear();
+    setCropUrls({});
+    setComplete(!!annotationComplete);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageId]);
+
+  useEffect(() => {
+    if (!showKaryotypePreview || !loaded) return;
+    const img = imgRef.current;
+    if (!img || !img.naturalWidth) return;
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      const next: Record<string, string> = {};
+      const liveIds = new Set<string>();
+      for (const s of strokes) {
+        if (!s.label || s.label === 'Unassigned' || s.points.length < 3) continue;
+        liveIds.add(s.id);
+        const sig = s.points.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join('|');
+        const cached = cropCacheRef.current.get(s.id);
+        if (cached && cached.sig === sig) {
+          next[s.id] = cached.dataUrl;
+          continue;
+        }
+        const url = cropPolygonFromImage(img, s.points);
+        if (url) {
+          cropCacheRef.current.set(s.id, { sig, dataUrl: url });
+          next[s.id] = url;
+        }
+      }
+      for (const id of [...cropCacheRef.current.keys()]) {
+        if (!liveIds.has(id)) cropCacheRef.current.delete(id);
+      }
+      if (!cancelled) setCropUrls(next);
+    }, 80);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [strokes, loaded, showKaryotypePreview, imageId]);
 
   useEffect(() => {
     const preventPinch = (e: TouchEvent) => {
@@ -489,7 +628,21 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (orientingStrokeId) return; // Prevent interference when dialog is open
-      
+      if (showKaryotypePreview) {
+        if (e.key === 'Escape') {
+          if (selectedStrokeId) setSelectedStrokeId(null);
+          else setShowKaryotypePreview(false);
+          return;
+        }
+        if (e.key === 'Delete' && selectedStrokeId) {
+          const tag = (e.target as HTMLElement)?.tagName;
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+          setStrokes(prev => prev.filter(s => s.id !== selectedStrokeId));
+          setSelectedStrokeId(null);
+        }
+        return;
+      }
+
       if (e.key === 'Escape' && currentStroke) {
         setCurrentStroke(null);
         setPreviewPoint(null);
@@ -497,7 +650,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
         const newStroke = currentStroke;
         setStrokes(prev => {
           const newStrokes = [...prev, newStroke];
-          const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
+          const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs], newStroke.label);
           if (next) setActiveLabel(next);
           return newStrokes;
         });
@@ -511,7 +664,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [currentStroke, selectedStrokeId, orientingStrokeId, pairOrder, customPairs]);
+  }, [currentStroke, selectedStrokeId, orientingStrokeId, pairOrder, customPairs, showKaryotypePreview]);
 
   useEffect(() => {
     redrawAll(strokes, currentStroke, previewPoint, selectedStrokeId, showLabels);
@@ -635,7 +788,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
               setStrokes(newStrokes);
               setCurrentStroke(null);
               setPreviewPoint(null);
-              const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
+              const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs], newStroke.label);
               if (next) setActiveLabel(next);
               setOrientingStrokeId(newStroke.id);
             } else {
@@ -658,7 +811,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
               setStrokes(newStrokes);
               setCurrentStroke(null);
               setPreviewPoint(null);
-              const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
+              const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs], newStroke.label);
               if (next) setActiveLabel(next);
               setOrientingStrokeId(newStroke.id);
             } else {
@@ -697,7 +850,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
             setCurrentStroke(null);
             setPreviewPoint(null);
             gestureRef.current.type = null;
-            const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
+            const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs], newStroke.label);
             if (next) setActiveLabel(next);
             setOrientingStrokeId(newStroke.id);
           } else {
@@ -775,7 +928,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
       setCurrentStroke(null);
       setPreviewPoint(null);
       gestureRef.current.type = null;
-      const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs]);
+      const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs], newStroke.label);
       if (next) setActiveLabel(next);
       setOrientingStrokeId(newStroke.id);
     } else if (mode === 'edit' && selectedStrokeId) {
@@ -812,7 +965,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     }
   };
 
-  const saveAnnotations = async (e?: React.MouseEvent) => {
+  const saveAnnotations = async (e?: React.MouseEvent): Promise<boolean> => {
     if (e) {
       e.preventDefault();
       e.stopPropagation();
@@ -822,13 +975,36 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
     try {
       const xml = strokesToXml(strokes, imageId, imgSize.width, imgSize.height);
       await onSave(xml);
+      if (countLabeledStrokes(strokes) === 0) setComplete(false);
       setSaveMsg('Saved');
       setIsDirty(false);
       setTimeout(() => setSaveMsg(null), 2000);
+      return true;
     } catch {
       setSaveMsg('Error saving');
+      return false;
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleToggleComplete = async () => {
+    const labeled = countLabeledStrokes(strokes);
+    if (!complete) {
+      if (labeled === 0) return;
+      const mismatch = markCompleteMismatchMessage(labeled, karyotype);
+      if (mismatch && !window.confirm(mismatch)) return;
+    }
+    if (isDirty) {
+      const saved = await saveAnnotations();
+      if (!saved) return;
+    }
+    const next = !complete;
+    try {
+      await onSetComplete(next);
+      setComplete(next);
+    } catch {
+      setSaveMsg('Error updating status');
     }
   };
 
@@ -880,6 +1056,49 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
   const selectedStroke = strokes.find(s => s.id === selectedStrokeId);
   const rawDisplayLabel = (mode === 'edit' && selectedStroke) ? (selectedStroke.label || 'Unassigned') : activeLabel;
   const currentDisplayLabel = rawDisplayLabel === 'Unassigned' ? 'Unassigned' : normalizePairId(rawDisplayLabel);
+  const labeledCount = countLabeledStrokes(strokes);
+  const expectedCount = parseExpectedChromosomeCount(karyotype);
+
+  const previewChromosomes: KaryotypePreviewChromosome[] = useMemo(() => (
+    strokes
+      .filter(s => s.label && s.label !== 'Unassigned' && s.points.length >= 3)
+      .map(s => ({
+        strokeId: s.id,
+        pairId: normalizePairId(s.label!),
+        dataUrl: cropUrls[s.id] || null,
+        rotation: normalizeRotation(s.rotation),
+        flipX: !!s.flipX,
+        flipY: !!s.flipY,
+      }))
+  ), [strokes, cropUrls]);
+
+  const selectPreviewStroke = useCallback((strokeId: string) => {
+    setSelectedStrokeId(strokeId);
+  }, []);
+
+  const updatePreviewStroke = useCallback((strokeId: string, updates: { rotation?: number; flipX?: boolean; flipY?: boolean; label?: string }) => {
+    setStrokes(prev => {
+      if (updates.label && updates.label !== 'Unassigned') {
+        const pid = normalizePairId(updates.label);
+        const count = prev.filter(s =>
+          s.id !== strokeId && s.label && s.label !== 'Unassigned' && normalizePairId(s.label) === pid
+        ).length;
+        if (count >= MAX_CHROMOSOMES_PER_PAIR) return prev;
+      }
+      return prev.map(s => s.id !== strokeId ? s : {
+        ...s,
+        ...(updates.rotation != null ? { rotation: normalizeRotation(updates.rotation) } : {}),
+        ...(updates.flipX != null ? { flipX: updates.flipX } : {}),
+        ...(updates.flipY != null ? { flipY: updates.flipY } : {}),
+        ...(updates.label != null ? { label: updates.label } : {}),
+      });
+    });
+  }, []);
+
+  const deletePreviewStroke = useCallback((strokeId: string) => {
+    setStrokes(prev => prev.filter(s => s.id !== strokeId));
+    setSelectedStrokeId(id => id === strokeId ? null : id);
+  }, []);
 
   const handleLabelClick = (pairId: string) => {
     if (mode === 'edit' && selectedStrokeId) {
@@ -1042,6 +1261,13 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
             >
               {showLabels ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />} Labels
             </button>
+            <button
+              onClick={() => setShowKaryotypePreview(true)}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold transition-colors bg-slate-200 text-slate-600 hover:bg-slate-300"
+              title="Preview karyotype"
+            >
+              <LayoutGrid className="w-3.5 h-3.5" /> Karyotype
+            </button>
 
             <div className="h-6 w-px bg-slate-300 mx-1" />
 
@@ -1073,6 +1299,20 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
             </button>
             <button onClick={clearAll} className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500" title="Clear all">
               <Trash2 className="w-4 h-4" />
+            </button>
+            <span className="text-[10px] font-mono font-bold text-slate-500 px-2 whitespace-nowrap">
+              {expectedCount != null ? `${labeledCount} / ${expectedCount} labeled` : `${labeledCount} labeled`}
+            </span>
+            <button
+              onClick={handleToggleComplete}
+              disabled={saving || (!complete && labeledCount === 0)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors disabled:opacity-50 ${
+                complete
+                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'
+                  : 'bg-emerald-500 text-white hover:bg-emerald-600'
+              }`}
+            >
+              {complete ? 'Unmark complete' : 'Mark as complete'}
             </button>
             <button
               onClick={saveAnnotations}
@@ -1295,6 +1535,24 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, on
         </div>
       </div>
 
+      {showKaryotypePreview && (
+        <KaryotypePreview
+          pairOrder={pairOrder}
+          customPairs={customPairs}
+          chromosomes={previewChromosomes}
+          selectedStrokeId={selectedStrokeId}
+          karyotype={karyotype}
+          labeledCount={labeledCount}
+          expectedCount={expectedCount}
+          onSelect={selectPreviewStroke}
+          onUpdate={updatePreviewStroke}
+          onDelete={deletePreviewStroke}
+          onClose={() => {
+            setSelectedStrokeId(null);
+            setShowKaryotypePreview(false);
+          }}
+        />
+      )}
       {orientingStrokeId && strokes.find(s => s.id === orientingStrokeId) && imgRef.current && (
         <OrientationDialog
           stroke={strokes.find(s => s.id === orientingStrokeId)!}

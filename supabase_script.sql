@@ -60,6 +60,9 @@ alter table public.samples add column if not exists uploader_email text;
 -- Add karyotype column (ISCN karyotype designation entered at upload time) if the table already existed
 alter table public.samples add column if not exists karyotype text;
 
+-- Explicit reversible complete flag; never stored in annotation XML (XML is rebuilt on every stroke save)
+alter table public.samples add column if not exists annotation_complete boolean not null default false;
+
 -- 2b. Create buckets table for grouping metaphase spreads
 create table if not exists public.buckets (
   id uuid default gen_random_uuid() primary key,
@@ -187,10 +190,21 @@ create policy "Admins can update all samples"
     )
   );
 
--- Delete: Only the owner can delete
+-- Delete: owner, or ADMIN / SUPER ADMIN curating the dataset
 create policy "Users can delete their own samples"
   on public.samples for delete
   using ( auth.uid() = user_id );
+
+drop policy if exists "Admins can delete all samples" on public.samples;
+create policy "Admins can delete all samples"
+  on public.samples for delete
+  using (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
+    )
+  );
 
 -- 5. Create a storage bucket for the uploaded images
 insert into storage.buckets (id, name, public) 
@@ -201,6 +215,7 @@ on conflict (id) do nothing; -- Prevent error if already exists
 drop policy if exists "Anyone can view images" on storage.objects;
 drop policy if exists "Users can upload images" on storage.objects;
 drop policy if exists "Users can delete their own uploaded images" on storage.objects;
+drop policy if exists "Admins can delete any images" on storage.objects;
 
 create policy "Anyone can view images"
   on storage.objects for select
@@ -213,3 +228,14 @@ create policy "Users can upload images"
 create policy "Users can delete their own uploaded images"
   on storage.objects for delete
   using ( bucket_id = 'images' and auth.uid() = owner );
+
+create policy "Admins can delete any images"
+  on storage.objects for delete
+  using (
+    bucket_id = 'images'
+    and exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
+    )
+  );
