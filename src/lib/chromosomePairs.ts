@@ -10,6 +10,24 @@
 
 export const STANDARD_PAIR_IDS: string[] = Array.from({ length: 22 }, (_, i) => String(i + 1)).concat(['X', 'Y']);
 
+/** Four-row clinical display order, with X and Y following chromosome 22. */
+export const CLINICAL_KARYOTYPE_ROWS: { id: string; pairIds: string[] }[][] = [
+  [
+    { id: 'A', pairIds: ['1', '2', '3'] },
+    { id: 'B', pairIds: ['4', '5'] },
+  ],
+  [{ id: 'C', pairIds: ['6', '7', '8', '9', '10', '11', '12'] }],
+  [
+    { id: 'D', pairIds: ['13', '14', '15'] },
+    { id: 'E', pairIds: ['16', '17', '18'] },
+  ],
+  [
+    { id: 'F', pairIds: ['19', '20'] },
+    { id: 'G', pairIds: ['21', '22'] },
+    { id: 'SEX', pairIds: ['X', 'Y'] },
+  ],
+];
+
 export const MAX_CHROMOSOMES_PER_PAIR = 4;
 
 const STANDARD_PAIR_ID_SET = new Set(STANDARD_PAIR_IDS);

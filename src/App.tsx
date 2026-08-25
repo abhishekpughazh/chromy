@@ -30,7 +30,7 @@ import {
 import { cn } from './lib/utils';
 import { NonInteractivePointerSensor, NonInteractiveTouchSensor } from './lib/dndSensors';
 import { storageObjectPathFromPublicUrl } from './lib/imageUrl';
-import { normalizePairId, comparePairIds, MAX_CHROMOSOMES_PER_PAIR } from './lib/chromosomePairs';
+import { CLINICAL_KARYOTYPE_ROWS, normalizePairId, comparePairIds, MAX_CHROMOSOMES_PER_PAIR, STANDARD_PAIR_IDS } from './lib/chromosomePairs';
 import { normalizeRotation, rotationsMatch, chromosomeTransform } from './lib/orientation';
 import {
   type AnnotationStatus,
@@ -38,8 +38,8 @@ import {
   getAnnotationStatus,
 } from './lib/annotationStatus';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  Info, RotateCcw, CheckCircle2, ChevronRight, Dna, Undo2, 
+import {
+  Info, CheckCircle2, ChevronRight, Dna, Undo2, ArrowLeft,
   ShieldCheck, Upload, Play, Beaker, X, Loader, ImageIcon, Zap, Pencil, Trash2, FlipHorizontal, FlipVertical, Expand, Download, FolderPlus, Folder
 } from 'lucide-react';
 
@@ -66,6 +66,24 @@ interface ChromosomeData {
   userRotation?: number;
   userFlipX?: boolean;
   userFlipY?: boolean;
+}
+
+interface SavedChromosomeState {
+  id: string;
+  userRotation: number;
+  userFlipX: boolean;
+  userFlipY: boolean;
+}
+
+interface SavedKaryotypeState {
+  jumbled: SavedChromosomeState[];
+  placed: Record<string, SavedChromosomeState>;
+}
+
+interface KaryotypeProgressSummary {
+  status: 'in_progress' | 'complete';
+  correctCount: number;
+  totalCount: number;
 }
 
 const CHROMOSOME_TYPES: ChromosomeType[] = [
@@ -112,6 +130,73 @@ const createInitialChromosomes = (): ChromosomeData[] => {
     }
   });
   return chromosomes;
+};
+
+const annotationSignature = (xml?: string) => {
+  let hash = 2166136261;
+  const value = xml || '';
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+};
+
+const serializeChromosome = (chromosome: ChromosomeData): SavedChromosomeState => ({
+  id: chromosome.id,
+  userRotation: normalizeRotation(chromosome.userRotation),
+  userFlipX: !!chromosome.userFlipX,
+  userFlipY: !!chromosome.userFlipY,
+});
+
+const serializeKaryotypeState = (
+  jumbled: ChromosomeData[],
+  placed: Record<string, ChromosomeData>,
+): SavedKaryotypeState => ({
+  jumbled: jumbled.map(serializeChromosome),
+  placed: Object.fromEntries(
+    Object.entries(placed).map(([slotId, chromosome]) => [slotId, serializeChromosome(chromosome)])
+  ),
+});
+
+const hydrateKaryotypeState = (
+  extracted: ChromosomeData[],
+  saved: unknown,
+): { jumbled: ChromosomeData[]; placed: Record<string, ChromosomeData> } | null => {
+  if (!saved || typeof saved !== 'object') return null;
+  const candidate = saved as Partial<SavedKaryotypeState>;
+  if (!Array.isArray(candidate.jumbled) || !candidate.placed || typeof candidate.placed !== 'object') return null;
+
+  const byId = new Map(extracted.map(chromosome => [chromosome.id, chromosome]));
+  const used = new Set<string>();
+  const restore = (value: SavedChromosomeState): ChromosomeData | null => {
+    if (!value || typeof value.id !== 'string' || used.has(value.id)) return null;
+    const original = byId.get(value.id);
+    if (!original) return null;
+    used.add(value.id);
+    return {
+      ...original,
+      userRotation: normalizeRotation(Number(value.userRotation) || 0),
+      userFlipX: !!value.userFlipX,
+      userFlipY: !!value.userFlipY,
+    };
+  };
+
+  const jumbled: ChromosomeData[] = [];
+  for (const value of candidate.jumbled) {
+    const restored = restore(value);
+    if (!restored) return null;
+    jumbled.push(restored);
+  }
+
+  const placed: Record<string, ChromosomeData> = {};
+  for (const [slotId, value] of Object.entries(candidate.placed)) {
+    const restored = restore(value);
+    if (!restored) return null;
+    placed[slotId] = restored;
+  }
+
+  return used.size === extracted.length ? { jumbled, placed } : null;
 };
 
 // --- Components ---
@@ -180,7 +265,7 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewi
   );
 };
 
-const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void, isReviewing?: boolean }) => {
+const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, visualClassName }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void, isReviewing?: boolean, visualClassName?: string }) => {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id,
     data: chromosome,
@@ -193,7 +278,7 @@ const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing }: { id: st
   return (
     <div className="relative group/chrom">
       <div ref={setNodeRef} style={style} {...listeners} {...attributes} className="z-10">
-        <ChromosomeVisual chromosome={chromosome} isDragging={isDragging} isReviewing={isReviewing} />
+        <ChromosomeVisual chromosome={chromosome} className={visualClassName} isDragging={isDragging} isReviewing={isReviewing} />
       </div>
       {onUpdate && chromosome.imageUrl && !isDragging && !isReviewing && (
         <div
@@ -232,7 +317,7 @@ const DroppableSlot = ({ id, acceptType, children, isOccupied, state, isReviewin
       animate={!isReviewing && isOccupied && state === 'fully-correct' ? { scale: [1, 1.05, 1] } : { scale: 1 }}
       transition={{ duration: 0.3 }}
       className={cn(
-        "w-8 h-24 flex items-center justify-center transition-all duration-200 relative group/slot print:!border-none print:!bg-transparent print:!shadow-none",
+        "w-8 lg:w-10 h-[clamp(4rem,14vh,6rem)] flex items-center justify-center transition-all duration-200 relative group/slot print:!border-none print:!bg-transparent print:!shadow-none",
         isReviewing ? "bg-transparent" : "border-2 border-dashed rounded-lg",
         !isReviewing && (isOver ? "border-sky-500 bg-sky-50 scale-105" : "border-slate-200 bg-slate-50/50"),
         !isReviewing && isOccupied && state === 'wrong' ? "border-solid border-slate-300 bg-white" : "",
@@ -298,12 +383,12 @@ const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedCh
   const allCorrect = slots.length > 0 && slots.every(s => !!s.chrom && s.state === 'fully-correct');
 
   return (
-    <div className={cn("flex flex-col items-center gap-2 p-3 rounded-xl transition-colors group", !isReviewing && "hover:bg-slate-100/50")}>
+    <div className={cn("flex flex-col items-center gap-1 p-1 lg:p-2 rounded-xl transition-colors group", !isReviewing && "hover:bg-slate-100/50")}>
       <div className="flex gap-1">
         {slots.map(({ slotId, chrom, state }) => (
           <div key={slotId}>
             <DroppableSlot id={slotId} acceptType={pairId} isOccupied={!!chrom} state={state} isReviewing={isReviewing}>
-              {chrom && <DraggableChromosome id={chrom.id} chromosome={chrom} onUpdate={(id, updates) => onUpdateChromosome(slotId, updates)} isReviewing={isReviewing} />}
+              {chrom && <DraggableChromosome id={chrom.id} chromosome={chrom} onUpdate={(id, updates) => onUpdateChromosome(slotId, updates)} isReviewing={isReviewing} visualClassName="!h-[clamp(3.5rem,12vh,5rem)]" />}
             </DroppableSlot>
           </div>
         ))}
@@ -503,7 +588,7 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
       ctx.drawImage(img, minX, minY, w, h, 0, 0, w, h);
       
       extracted.push({
-        id: `chrom-${pairId}-${idx}-${Date.now()}`,
+        id: `chrom-${idx}`,
         type: pairId,
         ordinal,
         size: 1,
@@ -1926,11 +2011,12 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
 interface SpreadSelectionScreenProps {
   images: AdminImage[];
   imagesLoaded: boolean;
-  onSelect: (img: AdminImage, extracted: ChromosomeData[]) => void;
+  progressBySample: Record<string, KaryotypeProgressSummary>;
+  onSelect: (img: AdminImage, extracted: ChromosomeData[]) => Promise<void>;
   onBack: () => void;
 }
 
-const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, imagesLoaded, onSelect, onBack }) => {
+const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, imagesLoaded, progressBySample, onSelect, onBack }) => {
   const firstSpreadLoaded = useFirstSpreadLoaded(images, imagesLoaded);
   const [extractingId, setExtractingId] = useState<string | null>(null);
 
@@ -1938,7 +2024,7 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
     if (extractingId) return;
     setExtractingId(img.id);
     const extracted = await extractChromosomes(img);
-    onSelect(img, extracted);
+    await onSelect(img, extracted);
     setExtractingId(null);
   };
 
@@ -1975,7 +2061,9 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
             </div>
           ) : (
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
-              {images.map(img => (
+              {images.map(img => {
+                const savedProgress = progressBySample[img.id];
+                return (
                 <div
                   key={img.id}
                   onClick={() => handleSelect(img)}
@@ -2004,13 +2092,24 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
                     <div>
                       <p className="text-[10px] font-mono text-slate-400 font-bold">SAMPLE ID</p>
                       <p className="font-bold text-sm text-slate-700 truncate w-32">{img.id.slice(0, 12)}</p>
+                      {savedProgress && (
+                        <p className={cn(
+                          "mt-1 text-[10px] font-bold",
+                          savedProgress.status === 'complete' ? "text-emerald-600" : "text-sky-600"
+                        )}>
+                          {savedProgress.status === 'complete'
+                            ? 'Completed'
+                            : `Resume ${savedProgress.correctCount}/${savedProgress.totalCount}`}
+                        </p>
+                      )}
                     </div>
                     <div className="w-8 h-8 rounded-full bg-slate-50 flex items-center justify-center group-hover:bg-sky-50 transition-colors">
                       <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-sky-500" />
                     </div>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -2227,6 +2326,10 @@ export default function Chromy() {
   const [certificateName, setCertificateName] = useState('');
   const [activeId, setActiveId] = useState<string | null>(null);
   const [score, setScore] = useState({ correct: 0, total: 0 });
+  const [progressBySample, setProgressBySample] = useState<Record<string, KaryotypeProgressSummary>>({});
+  const [progressReady, setProgressReady] = useState(false);
+  const [progressError, setProgressError] = useState<string | null>(null);
+  const progressSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -2293,6 +2396,44 @@ export default function Chromy() {
   }, [session]);
 
   useEffect(() => {
+    if (!session?.user || !imagesLoaded) return;
+    let cancelled = false;
+
+    const loadProgressSummaries = async () => {
+      const { data, error } = await supabase
+        .from('karyotype_progress')
+        .select('sample_id, annotation_signature, status, correct_count, total_count')
+        .eq('user_id', session.user.id);
+
+      if (cancelled) return;
+      if (error) {
+        console.error('Failed to load karyotyping progress summaries', error);
+        return;
+      }
+
+      const imageById = new Map<string, AdminImage>(
+        images.map(image => [image.id, image] as const)
+      );
+      const summaries: Record<string, KaryotypeProgressSummary> = {};
+      for (const row of data ?? []) {
+        const image = imageById.get(row.sample_id);
+        if (!image || row.annotation_signature !== annotationSignature(image.xml)) continue;
+        summaries[row.sample_id] = {
+          status: row.status === 'complete' ? 'complete' : 'in_progress',
+          correctCount: row.correct_count ?? 0,
+          totalCount: row.total_count ?? 0,
+        };
+      }
+      setProgressBySample(summaries);
+    };
+
+    loadProgressSummaries();
+    return () => {
+      cancelled = true;
+    };
+  }, [images, imagesLoaded, session?.user?.id]);
+
+  useEffect(() => {
     const initial = createInitialChromosomes();
     setOriginalExtracted(initial);
     setJumbled([...initial].sort(() => Math.random() - 0.5));
@@ -2310,6 +2451,7 @@ export default function Chromy() {
   const handleDragEnd = (event: DragEndEvent) => {
     const { over, active } = event;
     setActiveId(null);
+    setProgressReady(true);
 
     const chromosome = active.data.current as ChromosomeData;
 
@@ -2368,10 +2510,12 @@ export default function Chromy() {
   };
 
   const updateJumbled = (id: string, updates: Partial<ChromosomeData>) => {
+    setProgressReady(true);
     setJumbled(prev => prev.map(c => c.id === id ? { ...c, ...updates } : c));
   };
 
   const updatePlaced = (slotId: string, updates: Partial<ChromosomeData>) => {
+    setProgressReady(true);
     setPlaced(prev => {
       const existing = prev[slotId];
       if (!existing) return prev;
@@ -2384,6 +2528,7 @@ export default function Chromy() {
 
   const undo = () => {
     if (history.length === 0) return;
+    setProgressReady(true);
     const lastState = history[history.length - 1];
     setJumbled(lastState.jumbled);
     setPlaced(lastState.placed);
@@ -2391,6 +2536,7 @@ export default function Chromy() {
   };
 
   const resetGame = () => {
+    setProgressReady(false);
     if (originalExtracted.length > 0) {
       setJumbled([...originalExtracted].sort(() => Math.random() - 0.5));
     } else {
@@ -2401,6 +2547,37 @@ export default function Chromy() {
     setPlaced({});
     setHistory([]);
     setGameState('playing');
+
+    if (session?.user && selectedImage) {
+      const sampleId = selectedImage.id;
+      const userId = session.user.id;
+      setProgressBySample(prev => {
+        const next = { ...prev };
+        delete next[sampleId];
+        return next;
+      });
+      progressSaveQueueRef.current = progressSaveQueueRef.current
+        .catch(() => undefined)
+        .then(async () => {
+          const { error } = await supabase
+            .from('karyotype_progress')
+            .delete()
+            .eq('user_id', userId)
+            .eq('sample_id', sampleId);
+          if (error) {
+            console.error('Failed to clear karyotyping progress', error);
+            setProgressError('Your saved progress could not be cleared. Please try resetting again.');
+            throw error;
+          }
+          setProgressError(null);
+        });
+    }
+  };
+
+  const confirmResetGame = () => {
+    if (window.confirm('Reset this karyotype? Your current progress will be cleared.')) {
+      resetGame();
+    }
   };
 
 
@@ -2436,6 +2613,16 @@ export default function Chromy() {
     });
   }, [originalExtracted]);
 
+  const pairGroupsById = useMemo(
+    () => new Map(pairGroups.map(group => [group.pairId, group] as const)),
+    [pairGroups]
+  );
+
+  const customPairGroups = useMemo(
+    () => pairGroups.filter(group => !STANDARD_PAIR_IDS.includes(group.pairId)),
+    [pairGroups]
+  );
+
   const slotPairMap = useMemo(() => {
     const map = new Map<string, string>();
     pairGroups.forEach(group => {
@@ -2470,6 +2657,66 @@ export default function Chromy() {
   const progress = (score.correct / score.total) * 100;
   const isComplete = progress === 100 && score.total > 0;
 
+  useEffect(() => {
+    if (
+      gameState !== 'playing' ||
+      !progressReady ||
+      !session?.user ||
+      !selectedImage ||
+      score.total === 0
+    ) return;
+
+    const status: KaryotypeProgressSummary['status'] = isComplete ? 'complete' : 'in_progress';
+    const savedState = serializeKaryotypeState(jumbled, placed);
+    const now = new Date().toISOString();
+    const userId = session.user.id;
+    const sampleId = selectedImage.id;
+
+    setProgressBySample(prev => ({
+      ...prev,
+      [sampleId]: {
+        status,
+        correctCount: score.correct,
+        totalCount: score.total,
+      },
+    }));
+
+    progressSaveQueueRef.current = progressSaveQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const { error } = await supabase
+          .from('karyotype_progress')
+          .upsert({
+            user_id: userId,
+            sample_id: sampleId,
+            state: savedState,
+            annotation_signature: annotationSignature(selectedImage.xml),
+            status,
+            correct_count: score.correct,
+            total_count: score.total,
+            completed_at: isComplete ? now : null,
+            updated_at: now,
+          }, { onConflict: 'user_id,sample_id' });
+
+        if (error) {
+          console.error('Failed to save karyotyping progress', error);
+          setProgressError('Your progress could not be saved. Your current board is still available in this session.');
+          throw error;
+        }
+        setProgressError(null);
+      });
+  }, [
+    gameState,
+    isComplete,
+    jumbled,
+    placed,
+    progressReady,
+    score.correct,
+    score.total,
+    selectedImage,
+    session?.user,
+  ]);
+
   const successPhrase = useMemo(() => {
     if (isComplete) {
       return SUCCESS_PHRASES[Math.floor(Math.random() * SUCCESS_PHRASES.length)];
@@ -2500,24 +2747,53 @@ export default function Chromy() {
             key="select"
             images={images.filter(img => hasAnnotations(img.xml))}
             imagesLoaded={imagesLoaded}
+            progressBySample={progressBySample}
             onBack={() => setGameState('welcome')}
-            onSelect={(img, extracted) => {
-              setSelectedImage(img);
-              setOriginalExtracted(extracted);
-              
-              if (extracted.length > 0) {
-                setJumbled([...extracted].sort(() => Math.random() - 0.5));
-                setScore({ correct: 0, total: extracted.length });
-              } else {
-                // Fallback to mock data if no annotations were found
-                const initial = createInitialChromosomes();
-                setOriginalExtracted(initial);
-                setJumbled([...initial].sort(() => Math.random() - 0.5));
-                setScore({ correct: 0, total: initial.length });
+            onSelect={async (img, extracted) => {
+              setProgressReady(false);
+              setProgressError(null);
+
+              const playableChromosomes = extracted.length > 0
+                ? extracted
+                : createInitialChromosomes();
+              let restored: { jumbled: ChromosomeData[]; placed: Record<string, ChromosomeData> } | null = null;
+              let restoredCorrectCount = 0;
+
+              if (session?.user) {
+                const { data, error } = await supabase
+                  .from('karyotype_progress')
+                  .select('state, annotation_signature, correct_count')
+                  .eq('user_id', session.user.id)
+                  .eq('sample_id', img.id)
+                  .maybeSingle();
+
+                if (error) {
+                  console.error('Failed to load karyotyping progress', error);
+                  setProgressError('Saved progress could not be loaded. A new board was started instead.');
+                } else if (data?.annotation_signature === annotationSignature(img.xml)) {
+                  restored = hydrateKaryotypeState(playableChromosomes, data.state);
+                  if (restored) {
+                    restoredCorrectCount = Math.max(
+                      0,
+                      Math.min(Number(data.correct_count) || 0, playableChromosomes.length)
+                    );
+                  }
+                }
               }
-              
-              setPlaced({});
+
+              setSelectedImage(img);
+              setOriginalExtracted(playableChromosomes);
+              setJumbled(restored?.jumbled ?? [...playableChromosomes].sort(() => Math.random() - 0.5));
+              setPlaced(restored?.placed ?? {});
+              setScore({
+                correct: restored ? restoredCorrectCount : 0,
+                total: playableChromosomes.length,
+              });
               setHistory([]);
+              setCertificateName('');
+              setIsReviewingCertificate(false);
+              // A fresh or restored board is not written until the user changes it.
+              setProgressReady(false);
               setGameState('playing');
             }}
           />
@@ -2546,15 +2822,25 @@ export default function Chromy() {
         >
           {/* Header */}
         <header className={cn("fixed top-0 left-0 right-0 h-16 bg-white border-b border-slate-200 z-50 px-6 flex items-center justify-between print:hidden", isReviewingCertificate && "hidden")}>
-          <div className="flex items-center gap-3 cursor-pointer" onClick={() => setGameState('welcome')}>
-            <div className="w-10 h-10 bg-slate-900 rounded-xl flex items-center justify-center text-white">
-              <Dna className="w-6 h-6" />
-            </div>
-            <div>
-              <h1 className="text-xl font-black tracking-tight flex items-center gap-1.5">
-                CHROMY <span className="text-[10px] bg-slate-100 px-1.5 py-0.5 rounded uppercase font-bold text-slate-500">v1.0</span>
-              </h1>
-              <p className="text-[10px] text-slate-400 font-mono tracking-widest uppercase">Karyotype Diagnostic Tool</p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setGameState('select')}
+              className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500 hover:text-slate-900"
+              title="Back to sample selection"
+              aria-label="Back to sample selection"
+            >
+              <ArrowLeft className="w-5 h-5" />
+            </button>
+            <div className="flex items-center gap-3 cursor-pointer" onClick={() => setGameState('welcome')}>
+              <div className="w-10 h-10 bg-slate-900 rounded-xl flex items-center justify-center text-white">
+                <Dna className="w-6 h-6" />
+              </div>
+              <div>
+                <h1 className="text-xl font-black tracking-tight flex items-center gap-1.5">
+                  CHROMY <span className="text-[10px] bg-slate-100 px-1.5 py-0.5 rounded uppercase font-bold text-slate-500">v1.0</span>
+                </h1>
+                <p className="text-[10px] text-slate-400 font-mono tracking-widest uppercase">Karyotype Diagnostic Tool</p>
+              </div>
             </div>
           </div>
 
@@ -2589,15 +2875,21 @@ export default function Chromy() {
                </button>
 
                <button 
-                  onClick={resetGame}
-                  className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-400 hover:text-slate-900"
+                  onClick={confirmResetGame}
+                  className="px-3 py-2 hover:bg-slate-100 rounded-lg transition-colors text-xs font-bold text-slate-400 hover:text-slate-900"
                   title="Reset Karyogram"
                 >
-                  <RotateCcw className="w-5 h-5" />
+                  RESET
                </button>
              </div>
           </div>
         </header>
+
+        {gameState === 'playing' && progressError && (
+          <div className="fixed top-20 left-1/2 -translate-x-1/2 z-[60] max-w-lg rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-medium text-amber-700 shadow-lg print:hidden">
+            {progressError}
+          </div>
+        )}
 
         {!isReviewingCertificate && selectedImage?.karyotype && (
           <footer className="fixed bottom-0 left-0 right-0 h-10 bg-white border-t border-slate-200 z-50 px-6 flex items-center justify-center gap-2 print:hidden">
@@ -2716,7 +3008,7 @@ export default function Chromy() {
 
           {/* Right Panel: Diagnostic Board */}
           <div className={cn(
-            "bg-white rounded-2xl border border-slate-200 p-8 shadow-sm overflow-y-auto print:border-none print:shadow-none print:p-0 flex flex-col print:overflow-visible print:h-auto min-h-0", 
+            "bg-white rounded-2xl border border-slate-200 p-4 lg:p-6 shadow-sm overflow-y-auto print:border-none print:shadow-none print:p-0 flex flex-col print:overflow-visible print:h-auto min-h-0",
             isReviewingCertificate && "col-span-full border-none shadow-none h-full pb-20"
           )}>
              {isReviewingCertificate && (
@@ -2732,19 +3024,52 @@ export default function Chromy() {
                </div>
              )}
 
-             <div className="flex flex-1 w-full max-w-6xl mx-auto h-full min-h-0">
-               <div className="flex flex-wrap w-full justify-center items-start content-start gap-4 md:gap-6">
-                 {pairGroups.map(group => (
-                   <div key={group.pairId} className="flex-shrink-0">
-                     <KaryotypePair
-                       pairId={group.pairId}
-                       slotIds={group.slotIds}
-                       placedChromosomes={placed}
-                       onUpdateChromosome={updatePlaced}
-                       isReviewing={isReviewingCertificate}
-                     />
+             <div className="flex flex-1 w-full max-w-6xl mx-auto h-full min-h-0 overflow-auto">
+               <div className="flex flex-col gap-2 items-center justify-evenly min-w-min h-full py-2 mx-auto">
+                 {CLINICAL_KARYOTYPE_ROWS.map((row, rowIndex) => (
+                   <div key={rowIndex} className="flex items-end justify-center gap-8 lg:gap-12">
+                     {row.map(group => {
+                       const visibleGroups = group.pairIds
+                         .map(pairId => pairGroupsById.get(pairId))
+                         .filter((entry): entry is NonNullable<typeof entry> => !!entry);
+                       if (visibleGroups.length === 0) return null;
+                       return (
+                         <div key={group.id} className="flex items-end gap-2">
+                           <span className="text-[10px] font-black text-slate-300 w-4 mb-5 select-none">
+                             {group.id}
+                           </span>
+                           {visibleGroups.map(pairGroup => (
+                             <div key={pairGroup.pairId} className="flex-shrink-0">
+                               <KaryotypePair
+                                 pairId={pairGroup.pairId}
+                                 slotIds={pairGroup.slotIds}
+                                 placedChromosomes={placed}
+                                 onUpdateChromosome={updatePlaced}
+                                 isReviewing={isReviewingCertificate}
+                               />
+                             </div>
+                           ))}
+                         </div>
+                       );
+                     })}
                    </div>
                  ))}
+                 {customPairGroups.length > 0 && (
+                   <div className="flex items-end justify-center gap-2 pt-2 border-t border-dashed border-slate-100">
+                     <span className="text-[10px] font-black text-slate-300 w-4 mb-5 select-none">+</span>
+                     {customPairGroups.map(pairGroup => (
+                       <div key={pairGroup.pairId} className="flex-shrink-0">
+                         <KaryotypePair
+                           pairId={pairGroup.pairId}
+                           slotIds={pairGroup.slotIds}
+                           placedChromosomes={placed}
+                           onUpdateChromosome={updatePlaced}
+                           isReviewing={isReviewingCertificate}
+                         />
+                       </div>
+                     ))}
+                   </div>
+                 )}
                </div>
              </div>
 

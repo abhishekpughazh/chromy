@@ -103,13 +103,15 @@ const OrientationDialog = ({
   img, 
   onComplete,
   onEdit,
-  onRedo
+  onRedo,
+  onClose
 }: { 
   stroke: Stroke, 
   img: HTMLImageElement, 
   onComplete: (updates: Partial<Stroke>) => void,
   onEdit: () => void,
-  onRedo: () => void
+  onRedo: () => void,
+  onClose: () => void
 }) => {
   const [rotation, setRotation] = useState(() => normalizeRotation(stroke.rotation));
   const [flipX, setFlipX] = useState(stroke.flipX || false);
@@ -209,9 +211,18 @@ const OrientationDialog = ({
       onClick={(e) => e.stopPropagation()}
     >
       <div 
-        className="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-md flex flex-col items-center"
+        className="relative bg-white rounded-3xl shadow-2xl p-8 w-full max-w-md flex flex-col items-center"
         onClick={(e) => e.stopPropagation()}
       >
+        <button
+          type="button"
+          onClick={onClose}
+          className="absolute top-5 right-5 p-2 rounded-full text-slate-400 hover:text-slate-900 hover:bg-slate-100 transition-colors"
+          title="Close orientation dialog"
+          aria-label="Close orientation dialog"
+        >
+          <X className="w-5 h-5" />
+        </button>
         <h3 className="text-2xl font-black text-slate-900 mb-2">Orient Chromosome</h3>
         <p className="text-sm text-slate-500 mb-8 text-center font-medium">Drag the preview or use the slider to rotate. The p-arm should typically point upwards.</p>
 
@@ -1578,6 +1589,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
             setStrokes(prev => prev.filter(s => s.id !== orientingStrokeId));
             setOrientingStrokeId(null);
           }}
+          onClose={() => setOrientingStrokeId(null)}
         />
       )}
     </div>

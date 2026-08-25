@@ -1,7 +1,7 @@
 import React, { useMemo, useRef, useState } from 'react';
 import { FlipHorizontal, FlipVertical, LayoutGrid, Trash2, X } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { MAX_CHROMOSOMES_PER_PAIR, STANDARD_PAIR_IDS } from '../lib/chromosomePairs';
+import { CLINICAL_KARYOTYPE_ROWS, MAX_CHROMOSOMES_PER_PAIR, STANDARD_PAIR_IDS } from '../lib/chromosomePairs';
 import { normalizeRotation, pointerAngleDeg, chromosomeTransform, toggleDisplayedFlipX, toggleDisplayedFlipY } from '../lib/orientation';
 
 export interface KaryotypePreviewChromosome {
@@ -19,23 +19,6 @@ export interface KaryotypePreviewEdits {
   flipY?: boolean;
   label?: string;
 }
-
-/** Classic 4-row karyogram: A+B, C, D+E, F+G. Indices map into `pairOrder`. */
-const KARYOTYPE_ROWS: { id: string; indices: number[] }[][] = [
-  [
-    { id: 'A', indices: [0, 1, 2] },
-    { id: 'B', indices: [3, 4] },
-  ],
-  [{ id: 'C', indices: [5, 6, 7, 8, 9, 10, 11, 22] }],
-  [
-    { id: 'D', indices: [12, 13, 14] },
-    { id: 'E', indices: [15, 16, 17] },
-  ],
-  [
-    { id: 'F', indices: [18, 19] },
-    { id: 'G', indices: [20, 21, 23] },
-  ],
-];
 
 interface KaryotypePreviewProps {
   pairOrder: string[];
@@ -401,14 +384,15 @@ export default function KaryotypePreview({
         <div className="flex flex-1 min-h-0">
           <div className="flex-1 overflow-auto p-6">
             <div className="flex flex-col gap-5 items-center min-w-min mx-auto">
-              {KARYOTYPE_ROWS.map((row, rowIdx) => (
+              {CLINICAL_KARYOTYPE_ROWS.map((row, rowIdx) => (
                 <div key={rowIdx} className="flex items-end justify-center gap-10">
                   {row.map((group) => (
                     <div key={group.id} className="flex items-end gap-4">
                       <span className="text-[10px] font-black text-slate-300 w-3 mb-5 select-none">
                         {group.id}
                       </span>
-                      {group.indices.map((index) => {
+                      {group.pairIds.map((standardPairId) => {
+                        const index = STANDARD_PAIR_IDS.indexOf(standardPairId);
                         const pairId = pairAt(index);
                         return (
                           <PairColumn

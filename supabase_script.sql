@@ -239,3 +239,49 @@ create policy "Admins can delete any images"
       and user_roles.role in ('SUPER ADMIN', 'ADMIN')
     )
   );
+
+-- 7. Persist each user's karyotyping board independently from sample annotations
+create table if not exists public.karyotype_progress (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users(id) on delete cascade not null,
+  sample_id uuid references public.samples(id) on delete cascade not null,
+  state jsonb not null default '{}'::jsonb,
+  annotation_signature text not null,
+  status text not null default 'in_progress'
+    check (status in ('in_progress', 'complete')),
+  correct_count integer not null default 0,
+  total_count integer not null default 0,
+  started_at timestamp with time zone default timezone('utc'::text, now()) not null,
+  completed_at timestamp with time zone,
+  updated_at timestamp with time zone default timezone('utc'::text, now()) not null,
+  unique (user_id, sample_id)
+);
+
+create index if not exists karyotype_progress_user_id_idx
+  on public.karyotype_progress (user_id);
+create index if not exists karyotype_progress_sample_id_idx
+  on public.karyotype_progress (sample_id);
+
+alter table public.karyotype_progress enable row level security;
+
+drop policy if exists "Users can view their own karyotype progress" on public.karyotype_progress;
+drop policy if exists "Users can insert their own karyotype progress" on public.karyotype_progress;
+drop policy if exists "Users can update their own karyotype progress" on public.karyotype_progress;
+drop policy if exists "Users can delete their own karyotype progress" on public.karyotype_progress;
+
+create policy "Users can view their own karyotype progress"
+  on public.karyotype_progress for select
+  using (auth.uid() = user_id);
+
+create policy "Users can insert their own karyotype progress"
+  on public.karyotype_progress for insert
+  with check (auth.uid() = user_id);
+
+create policy "Users can update their own karyotype progress"
+  on public.karyotype_progress for update
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+create policy "Users can delete their own karyotype progress"
+  on public.karyotype_progress for delete
+  using (auth.uid() = user_id);
