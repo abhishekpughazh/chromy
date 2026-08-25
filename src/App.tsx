@@ -256,7 +256,7 @@ const DroppableSlot = ({ id, acceptType, children, isOccupied, state, isReviewin
 
 const RawSampleDroppable = ({ id, children }: { id: string, children: React.ReactNode }) => {
   const { setNodeRef } = useDroppable({ id });
-  return <div ref={setNodeRef} className="h-full">{children}</div>;
+  return <div ref={setNodeRef} className="h-full min-h-0">{children}</div>;
 };
 
 interface KaryotypePairProps {
@@ -726,9 +726,47 @@ import { ConfirmDeleteSampleModal } from './components/ConfirmDeleteSampleModal'
 interface AdminPanelProps {
   onClose: () => void;
   images: AdminImage[];
+  imagesLoaded: boolean;
   setImages: React.Dispatch<React.SetStateAction<AdminImage[]>>;
   session: Session | null;
   userRole: 'SUPER ADMIN' | 'ADMIN' | 'USER' | null;
+}
+
+function useFirstSpreadLoaded(images: AdminImage[], metadataLoaded: boolean) {
+  const firstImageUrl = images[0]?.originalUrl;
+  const [firstSpreadLoaded, setFirstSpreadLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!metadataLoaded) {
+      setFirstSpreadLoaded(false);
+      return;
+    }
+
+    if (!firstImageUrl) {
+      setFirstSpreadLoaded(true);
+      return;
+    }
+
+    setFirstSpreadLoaded(false);
+    const image = new Image();
+    const finish = () => {
+      if (!cancelled) setFirstSpreadLoaded(true);
+    };
+    image.onload = finish;
+    // Do not leave the panel permanently blocked by an unavailable spread.
+    image.onerror = finish;
+    image.src = firstImageUrl;
+
+    return () => {
+      cancelled = true;
+      image.onload = null;
+      image.onerror = null;
+    };
+  }, [firstImageUrl, metadataLoaded]);
+
+  return metadataLoaded && firstSpreadLoaded;
 }
 
 /** Prefer the bucket under the pointer; fall back to nearest list row only when needed. */
@@ -871,8 +909,9 @@ const DroppableBucketListItem: React.FC<{
   );
 };
 
-const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, session, userRole }) => {
+const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, setImages, session, userRole }) => {
   const canCreateBuckets = userRole === 'SUPER ADMIN';
+  const firstSpreadLoaded = useFirstSpreadLoaded(images, imagesLoaded);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [moveError, setMoveError] = useState<string | null>(null);
@@ -1716,7 +1755,13 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
             </div>
           </div>
 
-          <div className="bg-slate-50 rounded-3xl p-8 border border-slate-100 flex flex-col h-full max-h-[800px]">
+          <div className="relative bg-slate-50 rounded-3xl p-8 border border-slate-100 flex flex-col h-full max-h-[800px] overflow-hidden">
+            {!firstSpreadLoaded && (
+              <div className="absolute inset-0 z-20 bg-slate-50 flex flex-col items-center justify-center">
+                <Loader className="w-12 h-12 text-sky-500 animate-spin" />
+                <p className="mt-4 text-sm font-bold text-slate-600">Loading metaphase spreads...</p>
+              </div>
+            )}
             <div className="flex items-center justify-between mb-2 shrink-0">
               <h3 className="text-xl font-black">Available Dataset</h3>
               <span className="text-xs font-mono font-bold text-slate-400 bg-slate-200 px-2 py-1 rounded-md">{images.length} SAMPLES</span>
@@ -1880,11 +1925,13 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, setImages, ses
 
 interface SpreadSelectionScreenProps {
   images: AdminImage[];
+  imagesLoaded: boolean;
   onSelect: (img: AdminImage, extracted: ChromosomeData[]) => void;
   onBack: () => void;
 }
 
-const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, onSelect, onBack }) => {
+const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, imagesLoaded, onSelect, onBack }) => {
+  const firstSpreadLoaded = useFirstSpreadLoaded(images, imagesLoaded);
   const [extractingId, setExtractingId] = useState<string | null>(null);
 
   const handleSelect = async (img: AdminImage) => {
@@ -1913,54 +1960,60 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, o
           </button>
         </header>
 
-        {images.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-64 text-slate-400 bg-white rounded-3xl border border-slate-200 shadow-sm p-8 text-center">
-            <ImageIcon className="w-12 h-12 mb-4 opacity-50 mx-auto" />
-            <p className="text-lg font-bold text-slate-700">No metaphase spreads available</p>
-            <p className="text-sm mt-1">Please ask the administrator to upload and annotate samples.</p>
-          </div>
-        ) : (
-          <>
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
-            {images.map(img => (
-              <div
-                key={img.id}
-                onClick={() => handleSelect(img)}
-                className={cn(
-                  "bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden cursor-pointer group hover:shadow-xl hover:border-sky-300 hover:-translate-y-1 transition-all flex flex-col aspect-square relative",
-                  extractingId === img.id && "pointer-events-none opacity-80"
-                )}
-              >
-                {extractingId === img.id && (
-                  <div className="absolute inset-0 z-10 bg-white/50 backdrop-blur-[2px] flex flex-col items-center justify-center">
-                    <Loader className="w-8 h-8 text-sky-500 animate-spin mb-2" />
-                    <span className="text-xs font-bold text-slate-700 bg-white px-2 py-1 rounded shadow-sm">Extracting...</span>
+        <div className="relative min-h-64 rounded-3xl overflow-hidden">
+          {!firstSpreadLoaded && (
+            <div className="absolute inset-0 z-20 bg-slate-50 flex flex-col items-center justify-center">
+              <Loader className="w-12 h-12 text-sky-500 animate-spin" />
+              <p className="mt-4 text-sm font-bold text-slate-600">Loading metaphase spreads...</p>
+            </div>
+          )}
+          {images.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-64 text-slate-400 bg-white rounded-3xl border border-slate-200 shadow-sm p-8 text-center">
+              <ImageIcon className="w-12 h-12 mb-4 opacity-50 mx-auto" />
+              <p className="text-lg font-bold text-slate-700">No metaphase spreads available</p>
+              <p className="text-sm mt-1">Please ask the administrator to upload and annotate samples.</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+              {images.map(img => (
+                <div
+                  key={img.id}
+                  onClick={() => handleSelect(img)}
+                  className={cn(
+                    "bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden cursor-pointer group hover:shadow-xl hover:border-sky-300 hover:-translate-y-1 transition-all flex flex-col aspect-square relative",
+                    extractingId === img.id && "pointer-events-none opacity-80"
+                  )}
+                >
+                  {extractingId === img.id && (
+                    <div className="absolute inset-0 z-10 bg-white/50 backdrop-blur-[2px] flex flex-col items-center justify-center">
+                      <Loader className="w-8 h-8 text-sky-500 animate-spin mb-2" />
+                      <span className="text-xs font-bold text-slate-700 bg-white px-2 py-1 rounded shadow-sm">Extracting...</span>
+                    </div>
+                  )}
+                  <div className="relative flex-1 bg-slate-100 overflow-hidden">
+                    <LazyThumb
+                      src={img.originalUrl}
+                      alt="Spread"
+                      width={400}
+                      height={400}
+                      className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110"
+                    />
+                    <div className="absolute inset-0 bg-sky-900/0 group-hover:bg-sky-900/10 transition-colors" />
                   </div>
-                )}
-                <div className="relative flex-1 bg-slate-100 overflow-hidden">
-                  <LazyThumb
-                    src={img.originalUrl}
-                    alt="Spread"
-                    width={400}
-                    height={400}
-                    className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110"
-                  />
-                  <div className="absolute inset-0 bg-sky-900/0 group-hover:bg-sky-900/10 transition-colors" />
+                  <div className="p-4 border-t border-slate-100 flex items-center justify-between bg-white shrink-0">
+                    <div>
+                      <p className="text-[10px] font-mono text-slate-400 font-bold">SAMPLE ID</p>
+                      <p className="font-bold text-sm text-slate-700 truncate w-32">{img.id.slice(0, 12)}</p>
+                    </div>
+                    <div className="w-8 h-8 rounded-full bg-slate-50 flex items-center justify-center group-hover:bg-sky-50 transition-colors">
+                      <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-sky-500" />
+                    </div>
+                  </div>
                 </div>
-                <div className="p-4 border-t border-slate-100 flex items-center justify-between bg-white shrink-0">
-                  <div>
-                    <p className="text-[10px] font-mono text-slate-400 font-bold">SAMPLE ID</p>
-                    <p className="font-bold text-sm text-slate-700 truncate w-32">{img.id.slice(0, 12)}</p>
-                  </div>
-                  <div className="w-8 h-8 rounded-full bg-slate-50 flex items-center justify-center group-hover:bg-sky-50 transition-colors">
-                    <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-sky-500" />
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-          </>
-        )}
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </motion.div>
   );
@@ -1996,15 +2049,21 @@ const AuthForm = () => {
     setError(null);
 
     try {
+      const normalizedEmail = email.trim().toLowerCase();
+
       if (isLogin) {
         const { error: signInError } = await supabase.auth.signInWithPassword({
-          email,
+          email: normalizedEmail,
           password,
         });
         if (signInError) throw signInError;
       } else {
+        if (!/^[^@\s]+@roswellpark\.org$/.test(normalizedEmail)) {
+          throw new Error('Please use your roswellpark.org email address.');
+        }
+
         const { error: signUpError } = await supabase.auth.signUp({
-          email,
+          email: normalizedEmail,
           password,
           options: {
             emailRedirectTo: window.location.origin,
@@ -2088,7 +2147,7 @@ const AuthForm = () => {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 className={inputClassName}
-                placeholder="you@lab.com"
+                placeholder={isLogin ? 'you@example.com' : 'you@roswellpark.org'}
                 required
               />
             </div>
@@ -2109,7 +2168,10 @@ const AuthForm = () => {
 
             {error && (
               <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600 font-medium">
-                {error}
+                <p>{error}</p>
+                <p className="mt-1.5 text-xs font-normal text-red-500">
+                  Friendly reminder: access is currently limited to Roswell Park users with an @roswellpark.org email address.
+                </p>
               </div>
             )}
 
@@ -2156,6 +2218,7 @@ export default function Chromy() {
   const [imagesLoaded, setImagesLoaded] = useState(false);
   const [gameState, setGameState] = useState<'welcome' | 'select' | 'playing' | 'admin'>('welcome');
   const [selectedImage, setSelectedImage] = useState<AdminImage | null>(null);
+  const [sourceImageLoaded, setSourceImageLoaded] = useState(false);
   const [originalExtracted, setOriginalExtracted] = useState<ChromosomeData[]>([]);
   const [jumbled, setJumbled] = useState<ChromosomeData[]>([]);
   const [placed, setPlaced] = useState<Record<string, ChromosomeData>>({});
@@ -2235,6 +2298,10 @@ export default function Chromy() {
     setJumbled([...initial].sort(() => Math.random() - 0.5));
     setScore({ correct: 0, total: initial.length });
   }, []);
+
+  useEffect(() => {
+    setSourceImageLoaded(false);
+  }, [selectedImage?.id]);
 
   const handleDragStart = (event: DragStartEvent) => {
     setActiveId(event.active.id as string);
@@ -2432,6 +2499,7 @@ export default function Chromy() {
           <SpreadSelectionScreen
             key="select"
             images={images.filter(img => hasAnnotations(img.xml))}
+            imagesLoaded={imagesLoaded}
             onBack={() => setGameState('welcome')}
             onSelect={(img, extracted) => {
               setSelectedImage(img);
@@ -2458,6 +2526,7 @@ export default function Chromy() {
           <AdminPanel 
             key="admin" 
             images={images}
+            imagesLoaded={imagesLoaded}
             setImages={setImages}
             session={session}
             userRole={userRole}
@@ -2542,7 +2611,7 @@ export default function Chromy() {
         )}
 
         <main className={cn(
-          "px-6 pb-6 grid gap-6 overflow-hidden print:h-auto print:overflow-visible print:block",
+          "px-6 pb-6 grid gap-6 overflow-y-auto overflow-x-hidden lg:overflow-hidden print:h-auto print:overflow-visible print:block",
           isReviewingCertificate
             ? "pt-6 h-screen grid-cols-1"
             : cn(
@@ -2554,7 +2623,7 @@ export default function Chromy() {
           {/* Left Panel: Jumbled Source */}
           {!isReviewingCertificate && (
             <RawSampleDroppable id="raw-sample-panel">
-              <div className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col shadow-sm overflow-hidden bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] h-full">
+              <div className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col shadow-sm overflow-hidden bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] h-full min-h-0">
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
                     <Info className="w-4 h-4" />
@@ -2567,10 +2636,21 @@ export default function Chromy() {
 
               {selectedImage && (
                 <div className="w-full h-48 mb-6 rounded-xl overflow-hidden border border-slate-200 relative shrink-0 shadow-sm bg-black group/source">
+                  {!sourceImageLoaded && (
+                    <div className="absolute inset-0 z-10 bg-slate-100 flex flex-col items-center justify-center">
+                      <Loader className="w-8 h-8 text-sky-500 animate-spin" />
+                      <span className="mt-2 text-xs font-bold text-slate-600">Loading spread...</span>
+                    </div>
+                  )}
                   <img 
                     src={selectedImage.originalUrl} 
                     alt="Selected Metaphase Spread"
-                    className="w-full h-full object-cover transition-transform duration-500 group-hover/source:scale-105"
+                    onLoad={() => setSourceImageLoaded(true)}
+                    onError={() => setSourceImageLoaded(true)}
+                    className={cn(
+                      "w-full h-full object-cover transition-all duration-500 group-hover/source:scale-105",
+                      sourceImageLoaded ? "opacity-100" : "opacity-0"
+                    )}
                   />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-transparent opacity-0 group-hover/source:opacity-100 transition-opacity" />
                   

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { X, Save, PenLine, Trash2, Undo2, Hand, ZoomIn, ZoomOut, Maximize, MousePointer2, Eye, EyeOff, RotateCw, FlipHorizontal, FlipVertical, Plus, Pencil, LayoutGrid } from 'lucide-react';
+import { X, Save, PenLine, Trash2, Undo2, Hand, ZoomIn, ZoomOut, Maximize, MousePointer2, Eye, EyeOff, RotateCw, FlipHorizontal, FlipVertical, Plus, Pencil, LayoutGrid, Loader } from 'lucide-react';
 import { STANDARD_PAIR_IDS, MAX_CHROMOSOMES_PER_PAIR, normalizePairId, isStandardPairId } from '../lib/chromosomePairs';
 import { normalizeRotation, pointerAngleDeg, chromosomeTransform, toggleDisplayedFlipX, toggleDisplayedFlipY } from '../lib/orientation';
 import { countLabeledStrokes, parseExpectedChromosomeCount, markCompleteMismatchMessage } from '../lib/annotationStatus';
@@ -527,6 +527,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
   }, []); // Only runs when called
 
   useEffect(() => {
+    setLoaded(false);
     setPairOrder([...STANDARD_PAIR_IDS]);
     setCustomPairs([]);
     if (initialXml) {
@@ -1374,6 +1375,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
                   
                   setLoaded(true);
                 }}
+                onError={() => setLoaded(true)}
               />
               <canvas
                 ref={canvasRef}
@@ -1386,6 +1388,12 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
                 style={{ touchAction: 'none' }}
               />
             </div>
+            {!loaded && (
+              <div className="absolute inset-0 z-20 bg-slate-100 flex flex-col items-center justify-center">
+                <Loader className="w-12 h-12 text-sky-500 animate-spin" />
+                <p className="mt-4 text-sm font-bold text-slate-600">Loading metaphase spread...</p>
+              </div>
+            )}
           </div>
 
           {/* Sidebar Panel for Labels */}
