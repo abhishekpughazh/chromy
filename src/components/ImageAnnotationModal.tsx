@@ -4,6 +4,7 @@ import { STANDARD_PAIR_IDS, MAX_CHROMOSOMES_PER_PAIR, normalizePairId, isStandar
 import { normalizeRotation, pointerAngleDeg, chromosomeTransform, toggleDisplayedFlipX, toggleDisplayedFlipY } from '../lib/orientation';
 import { countLabeledStrokes, parseExpectedChromosomeCount, markCompleteMismatchMessage } from '../lib/annotationStatus';
 import { cropPolygonFromImage } from '../lib/chromosomeCrop';
+import { cn } from '../lib/utils';
 import KaryotypePreview, { type KaryotypePreviewChromosome } from './KaryotypePreview';
 
 interface Point { x: number; y: number }
@@ -281,20 +282,38 @@ const OrientationDialog = ({
         </div>
 
         <div className="grid grid-cols-2 gap-3 w-full mb-8">
-          <button onClick={() => {
-            const next = toggleDisplayedFlipX({ rotation, flipX, flipY });
-            setRotation(next.rotation);
-            setFlipX(next.flipX);
-            setFlipY(next.flipY);
-          }} className="py-3 border-2 border-slate-200 rounded-xl hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600 font-bold text-slate-600 text-sm flex items-center justify-center gap-2 transition-all">
+          <button
+            aria-pressed={flipX}
+            onClick={() => {
+              const next = toggleDisplayedFlipX({ rotation, flipX, flipY });
+              setRotation(next.rotation);
+              setFlipX(next.flipX);
+              setFlipY(next.flipY);
+            }}
+            className={cn(
+              "py-3 border-2 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all",
+              flipX
+                ? "border-sky-500 bg-sky-500 text-white shadow-md shadow-sky-500/20"
+                : "border-slate-200 text-slate-600 hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600"
+            )}
+          >
             <FlipHorizontal className="w-4 h-4" /> Flip X
           </button>
-          <button onClick={() => {
-            const next = toggleDisplayedFlipY({ rotation, flipX, flipY });
-            setRotation(next.rotation);
-            setFlipX(next.flipX);
-            setFlipY(next.flipY);
-          }} className="py-3 border-2 border-slate-200 rounded-xl hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600 font-bold text-slate-600 text-sm flex items-center justify-center gap-2 transition-all">
+          <button
+            aria-pressed={flipY}
+            onClick={() => {
+              const next = toggleDisplayedFlipY({ rotation, flipX, flipY });
+              setRotation(next.rotation);
+              setFlipX(next.flipX);
+              setFlipY(next.flipY);
+            }}
+            className={cn(
+              "py-3 border-2 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all",
+              flipY
+                ? "border-sky-500 bg-sky-500 text-white shadow-md shadow-sky-500/20"
+                : "border-slate-200 text-slate-600 hover:border-sky-500 hover:bg-sky-50 hover:text-sky-600"
+            )}
+          >
             <FlipVertical className="w-4 h-4" /> Flip Y
           </button>
         </div>

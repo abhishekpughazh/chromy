@@ -1,5 +1,5 @@
 /** Default window (degrees) for treating a player's rotation as matching the annotated orientation. */
-export const ROTATION_MATCH_TOLERANCE_DEG = 8;
+export const ROTATION_MATCH_TOLERANCE_DEG = 15;
 
 /** Pointer angle in degrees, clockwise from +x — same sign as CSS rotate(). */
 export function pointerAngleDeg(clientX: number, clientY: number, el: HTMLElement): number {

@@ -39,9 +39,10 @@ import {
 } from './lib/annotationStatus';
 import { motion, AnimatePresence } from 'motion/react';
 import {
-  Info, CheckCircle2, ChevronRight, Dna, Undo2, ArrowLeft,
+  Info, CheckCircle2, ChevronRight, Dna, Undo2, ArrowLeft, Lightbulb,
   ShieldCheck, Upload, Play, Beaker, X, Loader, ImageIcon, Zap, Pencil, Trash2, FlipHorizontal, FlipVertical, Expand, Download, FolderPlus, Folder
 } from 'lucide-react';
+import KaryotypeHintModal, { type KaryotypeHintChromosome } from './components/KaryotypeHintModal';
 
 // --- Types ---
 
@@ -140,6 +141,17 @@ const annotationSignature = (xml?: string) => {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(16);
+};
+
+const shuffleChromosomes = (chromosomes: ChromosomeData[], seed: string) => {
+  const shuffled = [...chromosomes];
+  let state = parseInt(annotationSignature(seed), 16) || 1;
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    const j = state % (i + 1);
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
 };
 
 const serializeChromosome = (chromosome: ChromosomeData): SavedChromosomeState => ({
@@ -297,8 +309,32 @@ const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, visualClas
             className="w-20 h-1.5 accent-sky-500 cursor-pointer"
           />
           <span className="text-[9px] font-mono text-slate-500 w-7 tabular-nums">{normalizeRotation(chromosome.userRotation)}°</span>
-          <button onClick={(e) => { e.stopPropagation(); onUpdate(id, { userFlipX: !chromosome.userFlipX }) }} className="p-1 hover:bg-slate-100 rounded text-slate-600"><FlipHorizontal className="w-3 h-3" /></button>
-          <button onClick={(e) => { e.stopPropagation(); onUpdate(id, { userFlipY: !chromosome.userFlipY }) }} className="p-1 hover:bg-slate-100 rounded text-slate-600"><FlipVertical className="w-3 h-3" /></button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onUpdate(id, { userFlipX: !chromosome.userFlipX }); }}
+            aria-pressed={!!chromosome.userFlipX}
+            title="Flip horizontally"
+            className={cn(
+              "p-1 rounded border transition-colors",
+              chromosome.userFlipX
+                ? "bg-sky-500 border-sky-500 text-white shadow-sm"
+                : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
+            )}
+          >
+            <FlipHorizontal className="w-3 h-3" />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onUpdate(id, { userFlipY: !chromosome.userFlipY }); }}
+            aria-pressed={!!chromosome.userFlipY}
+            title="Flip vertically"
+            className={cn(
+              "p-1 rounded border transition-colors",
+              chromosome.userFlipY
+                ? "bg-sky-500 border-sky-500 text-white shadow-sm"
+                : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
+            )}
+          >
+            <FlipVertical className="w-3 h-3" />
+          </button>
         </div>
       )}
     </div>
@@ -1242,14 +1278,14 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
       { id: 'complete', label: 'Complete', count: counts.complete },
     ];
     return (
-      <div className="flex flex-wrap items-center gap-1.5 mb-4">
+      <div className="flex flex-nowrap items-center gap-1.5 mb-4 overflow-x-auto scrollbar-hide">
         {chips.map(chip => (
           <button
             key={chip.id}
             type="button"
             onClick={() => setStatusFilter(chip.id)}
             className={cn(
-              "px-2 py-1 rounded-full text-[10px] font-bold transition-colors",
+              "px-2 py-1 rounded-full text-[10px] font-bold transition-colors whitespace-nowrap shrink-0",
               statusFilter === chip.id
                 ? chip.id === 'complete'
                   ? "bg-emerald-500 text-white"
@@ -1304,11 +1340,8 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
           </div>
 
           <div className="absolute inset-0 pointer-events-none bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
-            <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 flex items-center gap-2 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-lg shadow-xl">
-              <Pencil className="w-3.5 h-3.5 text-slate-900" />
-              <span className="text-[10px] font-bold text-slate-900">
-                Annotate
-              </span>
+            <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 w-9 h-9 flex items-center justify-center bg-white/95 backdrop-blur-sm rounded-full shadow-xl">
+              <Pencil className="w-4 h-4 text-slate-900" />
             </div>
           </div>
         </div>
@@ -2329,6 +2362,7 @@ export default function Chromy() {
   const [progressBySample, setProgressBySample] = useState<Record<string, KaryotypeProgressSummary>>({});
   const [progressReady, setProgressReady] = useState(false);
   const [progressError, setProgressError] = useState<string | null>(null);
+  const [showHints, setShowHints] = useState(false);
   const progressSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const sensors = useSensors(
@@ -2436,7 +2470,7 @@ export default function Chromy() {
   useEffect(() => {
     const initial = createInitialChromosomes();
     setOriginalExtracted(initial);
-    setJumbled([...initial].sort(() => Math.random() - 0.5));
+    setJumbled(shuffleChromosomes(initial, 'default'));
     setScore({ correct: 0, total: initial.length });
   }, []);
 
@@ -2509,11 +2543,6 @@ export default function Chromy() {
     setJumbled(prev => prev.filter(c => c.id !== chromosome.id));
   };
 
-  const updateJumbled = (id: string, updates: Partial<ChromosomeData>) => {
-    setProgressReady(true);
-    setJumbled(prev => prev.map(c => c.id === id ? { ...c, ...updates } : c));
-  };
-
   const updatePlaced = (slotId: string, updates: Partial<ChromosomeData>) => {
     setProgressReady(true);
     setPlaced(prev => {
@@ -2538,11 +2567,11 @@ export default function Chromy() {
   const resetGame = () => {
     setProgressReady(false);
     if (originalExtracted.length > 0) {
-      setJumbled([...originalExtracted].sort(() => Math.random() - 0.5));
+      setJumbled(shuffleChromosomes(originalExtracted, selectedImage?.id ?? 'default'));
     } else {
       const initial = createInitialChromosomes();
       setOriginalExtracted(initial);
-      setJumbled([...initial].sort(() => Math.random() - 0.5));
+      setJumbled(shuffleChromosomes(initial, selectedImage?.id ?? 'default'));
     }
     setPlaced({});
     setHistory([]);
@@ -2630,6 +2659,66 @@ export default function Chromy() {
     });
     return map;
   }, [pairGroups]);
+
+  const hintChromosomes = useMemo<KaryotypeHintChromosome[]>(() => {
+    const currentById = new Map<string, ChromosomeData>();
+    jumbled.forEach(chromosome => currentById.set(chromosome.id, chromosome));
+    (Object.values(placed) as ChromosomeData[]).forEach(chromosome => currentById.set(chromosome.id, chromosome));
+
+    const placedSlotByChromosomeId = new Map<string, string>();
+    (Object.entries(placed) as [string, ChromosomeData][]).forEach(([slotId, chromosome]) => {
+      placedSlotByChromosomeId.set(chromosome.id, slotId);
+    });
+
+    const originalById = new Map(originalExtracted.map(chromosome => [chromosome.id, chromosome] as const));
+    const jumbledIds = new Set(jumbled.map(chromosome => chromosome.id));
+    const orderedCurrent = [
+      ...jumbled,
+      ...originalExtracted
+        .filter(chromosome => !jumbledIds.has(chromosome.id))
+        .map(chromosome => currentById.get(chromosome.id) ?? chromosome),
+    ];
+
+    return orderedCurrent
+      .map(current => {
+        const original = originalById.get(current.id) ?? current;
+        const slotId = placedSlotByChromosomeId.get(current.id);
+        return {
+          id: current.id,
+          imageUrl: original.imageUrl,
+          targetPair: original.type,
+          currentPair: slotId ? (slotPairMap.get(slotId) ?? null) : null,
+          currentRotation: normalizeRotation(current.userRotation),
+          currentFlipX: !!current.userFlipX,
+          currentFlipY: !!current.userFlipY,
+          expectedRotation: normalizeRotation(original.expectedRotation),
+          expectedFlipX: !!original.expectedFlipX,
+          expectedFlipY: !!original.expectedFlipY,
+        };
+      })
+      .filter(chromosome => !(
+        chromosome.currentPair === chromosome.targetPair &&
+        chromosome.currentFlipX === chromosome.expectedFlipX &&
+        chromosome.currentFlipY === chromosome.expectedFlipY &&
+        rotationsMatch(chromosome.currentRotation, chromosome.expectedRotation)
+      ));
+  }, [jumbled, originalExtracted, placed, slotPairMap]);
+
+  const fullHintKaryotype = useMemo<KaryotypeHintChromosome[]>(
+    () => originalExtracted.map(chromosome => ({
+      id: chromosome.id,
+      imageUrl: chromosome.imageUrl,
+      targetPair: chromosome.type,
+      currentPair: chromosome.type,
+      currentRotation: normalizeRotation(chromosome.expectedRotation),
+      currentFlipX: !!chromosome.expectedFlipX,
+      currentFlipY: !!chromosome.expectedFlipY,
+      expectedRotation: normalizeRotation(chromosome.expectedRotation),
+      expectedFlipX: !!chromosome.expectedFlipX,
+      expectedFlipY: !!chromosome.expectedFlipY,
+    })),
+    [originalExtracted]
+  );
 
   // Calculate score: a chromosome is correct if it's placed in a slot
   // belonging to its own pair (position within the pair no longer matters)
@@ -2783,7 +2872,7 @@ export default function Chromy() {
 
               setSelectedImage(img);
               setOriginalExtracted(playableChromosomes);
-              setJumbled(restored?.jumbled ?? [...playableChromosomes].sort(() => Math.random() - 0.5));
+              setJumbled(restored?.jumbled ?? shuffleChromosomes(playableChromosomes, img.id));
               setPlaced(restored?.placed ?? {});
               setScore({
                 correct: restored ? restoredCorrectCount : 0,
@@ -2847,7 +2936,7 @@ export default function Chromy() {
           <div className="flex items-center gap-6">
              <div className="flex flex-col items-end">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-mono text-slate-400">ACCURACY</span>
+                  <span className="text-xs font-mono text-slate-400">COMPLETION</span>
                   <span className={cn(
                     "text-lg font-black font-mono",
                     progress > 90 ? "text-emerald-600" : progress > 50 ? "text-amber-600" : "text-slate-900"
@@ -2865,6 +2954,15 @@ export default function Chromy() {
              </div>
 
              <div className="flex items-center gap-2">
+               <button
+                  onClick={() => setShowHints(true)}
+                  className="px-3 py-2 hover:bg-amber-50 rounded-lg transition-colors text-xs font-bold text-amber-600 hover:text-amber-700 flex items-center gap-1.5"
+                  title="Get a chromosome hint"
+                >
+                  <Lightbulb className="w-4 h-4" />
+                  HINT
+               </button>
+
                <button 
                   onClick={undo}
                   disabled={history.length === 0}
@@ -2984,7 +3082,7 @@ export default function Chromy() {
                             animate={{ opacity: 1, scale: 1 }}
                             exit={{ opacity: 0, scale: 0.8 }}
                           >
-                            <DraggableChromosome id={chrom.id} chromosome={chrom} onUpdate={updateJumbled} />
+                            <DraggableChromosome id={chrom.id} chromosome={chrom} />
                           </motion.div>
                         ))
                       ) : (
@@ -3075,6 +3173,14 @@ export default function Chromy() {
 
           </div>
         </main>
+
+        {showHints && (
+          <KaryotypeHintModal
+            chromosomes={hintChromosomes}
+            fullKaryotype={fullHintKaryotype}
+            onClose={() => setShowHints(false)}
+          />
+        )}
 
         <AnimatePresence>
           {isReviewingCertificate && (
