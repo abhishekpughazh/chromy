@@ -3,7 +3,7 @@ import { X, Save, PenLine, Trash2, Undo2, Hand, ZoomIn, ZoomOut, Maximize, Mouse
 import { STANDARD_PAIR_IDS, MAX_CHROMOSOMES_PER_PAIR, normalizePairId, isStandardPairId } from '../lib/chromosomePairs';
 import { normalizeRotation, pointerAngleDeg, chromosomeTransform, toggleDisplayedFlipX, toggleDisplayedFlipY } from '../lib/orientation';
 import { countLabeledStrokes, parseExpectedChromosomeCount, markCompleteMismatchMessage } from '../lib/annotationStatus';
-import { cropPolygonFromImage } from '../lib/chromosomeCrop';
+import { cropBoundsFromPoints, cropPolygonFromImage } from '../lib/chromosomeCrop';
 import { cn } from '../lib/utils';
 import KaryotypePreview, { type KaryotypePreviewChromosome } from './KaryotypePreview';
 
@@ -1093,15 +1093,20 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
   const previewChromosomes: KaryotypePreviewChromosome[] = useMemo(() => (
     strokes
       .filter(s => s.label && s.label !== 'Unassigned' && s.points.length >= 3)
-      .map(s => ({
-        strokeId: s.id,
-        pairId: normalizePairId(s.label!),
-        dataUrl: cropUrls[s.id] || null,
-        rotation: normalizeRotation(s.rotation),
-        flipX: !!s.flipX,
-        flipY: !!s.flipY,
-      }))
-  ), [strokes, cropUrls]);
+      .map(s => {
+        const bounds = cropBoundsFromPoints(s.points, imgSize.width, imgSize.height);
+        return {
+          strokeId: s.id,
+          pairId: normalizePairId(s.label!),
+          dataUrl: cropUrls[s.id] || null,
+          rotation: normalizeRotation(s.rotation),
+          flipX: !!s.flipX,
+          flipY: !!s.flipY,
+          width: bounds?.width,
+          height: bounds?.height,
+        };
+      })
+  ), [strokes, cropUrls, imgSize.width, imgSize.height]);
 
   const selectPreviewStroke = useCallback((strokeId: string) => {
     setSelectedStrokeId(strokeId);

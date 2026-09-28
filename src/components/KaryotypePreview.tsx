@@ -3,6 +3,9 @@ import { FlipHorizontal, FlipVertical, LayoutGrid, Trash2, X } from 'lucide-reac
 import { cn } from '../lib/utils';
 import { CLINICAL_KARYOTYPE_ROWS, MAX_CHROMOSOMES_PER_PAIR, STANDARD_PAIR_IDS } from '../lib/chromosomePairs';
 import { normalizeRotation, pointerAngleDeg, chromosomeTransform, toggleDisplayedFlipX, toggleDisplayedFlipY } from '../lib/orientation';
+import { uniformDisplayScale } from '../lib/chromosomeCrop';
+
+const PREVIEW_MAX_EDGE = 64;
 
 export interface KaryotypePreviewChromosome {
   strokeId: string;
@@ -11,6 +14,8 @@ export interface KaryotypePreviewChromosome {
   rotation: number;
   flipX: boolean;
   flipY: boolean;
+  width?: number;
+  height?: number;
 }
 
 export interface KaryotypePreviewEdits {
@@ -38,6 +43,7 @@ interface PairColumnProps {
   pairId: string;
   chroms: KaryotypePreviewChromosome[];
   selectedStrokeId: string | null;
+  displayScale: number;
   onSelect: (strokeId: string) => void;
 }
 
@@ -45,15 +51,19 @@ const PairColumn: React.FC<PairColumnProps> = ({
   pairId,
   chroms,
   selectedStrokeId,
+  displayScale,
   onSelect,
 }) => {
   const emptySlots = chroms.length === 0 ? 2 : 0;
 
   return (
     <div className="flex flex-col items-center gap-1.5 min-w-[3.25rem]">
-      <div className="flex items-center justify-center gap-1 h-[5.5rem]">
+      <div className="flex items-end justify-center gap-1">
         {chroms.map((c) => {
           const selected = c.strokeId === selectedStrokeId;
+          const displayWidth = (c.width ?? 0) * displayScale;
+          const displayHeight = (c.height ?? 0) * displayScale;
+          const sized = displayWidth > 0 && displayHeight > 0;
           return (
             <button
               key={c.strokeId}
@@ -61,7 +71,7 @@ const PairColumn: React.FC<PairColumnProps> = ({
               onClick={() => onSelect(c.strokeId)}
               title="Edit this chromosome"
               className={cn(
-                'relative w-8 h-full flex items-center justify-center rounded-md p-1 transition-all',
+                'relative flex items-end justify-center rounded-md p-0.5 transition-all',
                 selected ? 'ring-2 ring-sky-500 bg-sky-50' : 'hover:bg-slate-100'
               )}
             >
@@ -70,8 +80,13 @@ const PairColumn: React.FC<PairColumnProps> = ({
                   src={c.dataUrl}
                   alt={pairId}
                   draggable={false}
-                  className="max-h-16 max-w-[28px] object-contain pointer-events-none"
+                  className={cn(
+                    'block pointer-events-none',
+                    !sized && 'max-h-16 max-w-[28px] object-contain'
+                  )}
                   style={{
+                    width: sized ? displayWidth : undefined,
+                    height: sized ? displayHeight : undefined,
                     transform: chromosomeTransform(c.rotation, c.flipX, c.flipY),
                     transformOrigin: 'center center',
                   }}
@@ -341,6 +356,10 @@ export default function KaryotypePreview({
 
   const selected = chromosomes.find((c) => c.strokeId === selectedStrokeId) || null;
   const pairAt = (index: number) => pairOrder[index] ?? STANDARD_PAIR_IDS[index];
+  const displayScale = useMemo(
+    () => uniformDisplayScale(chromosomes, PREVIEW_MAX_EDGE),
+    [chromosomes]
+  );
 
   return (
     <div
@@ -400,6 +419,7 @@ export default function KaryotypePreview({
                             pairId={pairId}
                             chroms={byPair.get(pairId) || []}
                             selectedStrokeId={selectedStrokeId}
+                            displayScale={displayScale}
                             onSelect={onSelect}
                           />
                         );
@@ -417,6 +437,7 @@ export default function KaryotypePreview({
                       pairId={pairId}
                       chroms={byPair.get(pairId) || []}
                       selectedStrokeId={selectedStrokeId}
+                      displayScale={displayScale}
                       onSelect={onSelect}
                     />
                   ))}

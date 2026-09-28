@@ -3,11 +3,16 @@ import { ChevronLeft, ChevronRight, Eye, Lightbulb, X } from 'lucide-react';
 import { motion } from 'motion/react';
 import { CLINICAL_KARYOTYPE_ROWS, STANDARD_PAIR_IDS } from '../lib/chromosomePairs';
 import { chromosomeTransform, normalizeRotation, rotationsMatch } from '../lib/orientation';
+import { uniformDisplayScale } from '../lib/chromosomeCrop';
 import { cn } from '../lib/utils';
+
+const ANSWER_SHEET_MAX_EDGE = 64;
 
 export interface KaryotypeHintChromosome {
   id: string;
   imageUrl?: string;
+  width?: number;
+  height?: number;
   targetPair: string;
   currentPair: string | null;
   currentRotation: number;
@@ -62,6 +67,36 @@ export function buildHintSteps(chromosome: KaryotypeHintChromosome): HintStep[] 
   ];
 }
 
+function AnswerChromosome({
+  chromosome,
+  displayScale,
+}: {
+  chromosome: KaryotypeHintChromosome;
+  displayScale: number;
+}) {
+  if (!chromosome.imageUrl) return null;
+  const width = (chromosome.width ?? 0) * displayScale;
+  const height = (chromosome.height ?? 0) * displayScale;
+  const sized = width > 0 && height > 0;
+  return (
+    <img
+      src={chromosome.imageUrl}
+      alt=""
+      draggable={false}
+      className={cn('block', !sized && 'max-h-16 max-w-7 object-contain')}
+      style={{
+        width: sized ? width : undefined,
+        height: sized ? height : undefined,
+        transform: chromosomeTransform(
+          chromosome.expectedRotation,
+          chromosome.expectedFlipX,
+          chromosome.expectedFlipY
+        ),
+      }}
+    />
+  );
+}
+
 export default function KaryotypeHintModal({
   chromosomes,
   fullKaryotype,
@@ -89,6 +124,10 @@ export default function KaryotypeHintModal({
   const customPairIds = useMemo(
     () => [...fullKaryotypeByPair.keys()].filter(pairId => !STANDARD_PAIR_IDS.includes(pairId)),
     [fullKaryotypeByPair]
+  );
+  const answerDisplayScale = useMemo(
+    () => uniformDisplayScale(fullKaryotype, ANSWER_SHEET_MAX_EDGE),
+    [fullKaryotype]
   );
 
   useEffect(() => {
@@ -210,24 +249,10 @@ export default function KaryotypeHintModal({
                         const pair = fullKaryotypeByPair.get(pairId) ?? [];
                         return (
                           <div key={pairId} className="flex flex-col items-center gap-1.5 min-w-[3.25rem]">
-                            <div className="flex items-center justify-center gap-1 h-[5.5rem]">
+                            <div className="flex items-end justify-center gap-1">
                               {pair.map(chromosome => (
-                                <div key={chromosome.id} className="w-8 h-full flex items-center justify-center p-1">
-                                  {chromosome.imageUrl && (
-                                    <img
-                                      src={chromosome.imageUrl}
-                                      alt=""
-                                      draggable={false}
-                                      className="max-h-16 max-w-7 object-contain"
-                                      style={{
-                                        transform: chromosomeTransform(
-                                          chromosome.expectedRotation,
-                                          chromosome.expectedFlipX,
-                                          chromosome.expectedFlipY
-                                        ),
-                                      }}
-                                    />
-                                  )}
+                                <div key={chromosome.id} className="flex items-end justify-center">
+                                  <AnswerChromosome chromosome={chromosome} displayScale={answerDisplayScale} />
                                 </div>
                               ))}
                             </div>
@@ -243,24 +268,10 @@ export default function KaryotypeHintModal({
                 <div className="flex items-end justify-center gap-4 pt-2 border-t border-dashed border-slate-100">
                   {customPairIds.map(pairId => (
                     <div key={pairId} className="flex flex-col items-center gap-1.5 min-w-[3.25rem]">
-                      <div className="flex items-center justify-center gap-1 h-[5.5rem]">
+                      <div className="flex items-end justify-center gap-1">
                         {(fullKaryotypeByPair.get(pairId) ?? []).map(chromosome => (
-                          <div key={chromosome.id} className="w-8 h-full flex items-center justify-center p-1">
-                            {chromosome.imageUrl && (
-                              <img
-                                src={chromosome.imageUrl}
-                                alt=""
-                                draggable={false}
-                                className="max-h-16 max-w-7 object-contain"
-                                style={{
-                                  transform: chromosomeTransform(
-                                    chromosome.expectedRotation,
-                                    chromosome.expectedFlipX,
-                                    chromosome.expectedFlipY
-                                  ),
-                                }}
-                              />
-                            )}
+                          <div key={chromosome.id} className="flex items-end justify-center">
+                            <AnswerChromosome chromosome={chromosome} displayScale={answerDisplayScale} />
                           </div>
                         ))}
                       </div>

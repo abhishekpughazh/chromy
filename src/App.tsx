@@ -32,6 +32,7 @@ import { NonInteractivePointerSensor, NonInteractiveTouchSensor } from './lib/dn
 import { storageObjectPathFromPublicUrl } from './lib/imageUrl';
 import { CLINICAL_KARYOTYPE_ROWS, normalizePairId, comparePairIds, MAX_CHROMOSOMES_PER_PAIR, STANDARD_PAIR_IDS } from './lib/chromosomePairs';
 import { normalizeRotation, rotationsMatch, chromosomeTransform } from './lib/orientation';
+import { cropBoundsFromPoints, uniformDisplayScale } from './lib/chromosomeCrop';
 import {
   type AnnotationStatus,
   countLabeledChromosomes,
@@ -51,6 +52,9 @@ import KaryotypeHintModal, { type KaryotypeHintChromosome } from './components/K
 // longer has any meaning - any chromosome belonging to a pair is
 // interchangeable with any other, as long as its own orientation matches.
 type ChromosomeType = string;
+
+/** Longest crop edge in the raw tray, board, and drag preview, in CSS pixels. */
+const CHROMOSOME_DISPLAY_MAX_EDGE = 72;
 
 interface ChromosomeData {
   id: string;
@@ -213,26 +217,33 @@ const hydrateKaryotypeState = (
 
 // --- Components ---
 
-const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewing = false }: { chromosome: ChromosomeData, className?: string, isDragging?: boolean, isReviewing?: boolean }) => {
+const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewing = false, displayScale = 1 }: { chromosome: ChromosomeData, className?: string, isDragging?: boolean, isReviewing?: boolean, displayScale?: number }) => {
   if (chromosome.imageUrl) {
+    const displayWidth = (chromosome.width ?? 0) * displayScale;
+    const displayHeight = (chromosome.height ?? 0) * displayScale;
+    const sized = displayWidth > 0 && displayHeight > 0;
     return (
       <div 
         className={cn(
-          "relative flex flex-col items-center justify-center p-1 cursor-grab active:cursor-grabbing group",
+          "relative flex flex-col items-center justify-end p-1 cursor-grab active:cursor-grabbing group",
           isDragging && "opacity-50",
           className
         )}
-        style={{ height: '80px', width: 'auto' }}
       >
         <img 
           src={chromosome.imageUrl} 
           className={cn(
-            "max-h-full max-w-[40px] object-contain print:!drop-shadow-none print:!filter-none",
+            "block print:!drop-shadow-none print:!filter-none",
+            !sized && "max-h-[72px] max-w-[36px] object-contain",
             !isReviewing && "drop-shadow-md filter group-hover:drop-shadow-lg transition-shadow"
           )}
           draggable={false}
           alt={chromosome.type}
-          style={{ transform: chromosomeTransform(chromosome.userRotation, chromosome.userFlipX, chromosome.userFlipY) }}
+          style={{
+            width: sized ? displayWidth : undefined,
+            height: sized ? displayHeight : undefined,
+            transform: chromosomeTransform(chromosome.userRotation, chromosome.userFlipX, chromosome.userFlipY),
+          }}
         />
         {!isDragging && !isReviewing && (
           <div className="absolute -bottom-5 text-[10px] font-mono text-slate-400 opacity-0 hover:opacity-100 transition-opacity print:hidden">
@@ -277,7 +288,7 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewi
   );
 };
 
-const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, visualClassName }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void, isReviewing?: boolean, visualClassName?: string }) => {
+const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, displayScale }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void, isReviewing?: boolean, displayScale?: number }) => {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id,
     data: chromosome,
@@ -290,7 +301,7 @@ const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, visualClas
   return (
     <div className="relative group/chrom">
       <div ref={setNodeRef} style={style} {...listeners} {...attributes} className="z-10">
-        <ChromosomeVisual chromosome={chromosome} className={visualClassName} isDragging={isDragging} isReviewing={isReviewing} />
+        <ChromosomeVisual chromosome={chromosome} isDragging={isDragging} isReviewing={isReviewing} displayScale={displayScale} />
       </div>
       {onUpdate && chromosome.imageUrl && !isDragging && !isReviewing && (
         <div
@@ -353,7 +364,7 @@ const DroppableSlot = ({ id, acceptType, children, isOccupied, state, isReviewin
       animate={!isReviewing && isOccupied && state === 'fully-correct' ? { scale: [1, 1.05, 1] } : { scale: 1 }}
       transition={{ duration: 0.3 }}
       className={cn(
-        "w-8 lg:w-10 h-[clamp(4rem,14vh,6rem)] flex items-center justify-center transition-all duration-200 relative group/slot print:!border-none print:!bg-transparent print:!shadow-none",
+        "min-w-8 lg:min-w-10 min-h-16 flex items-end justify-center transition-all duration-200 relative group/slot print:!border-none print:!bg-transparent print:!shadow-none",
         isReviewing ? "bg-transparent" : "border-2 border-dashed rounded-lg",
         !isReviewing && (isOver ? "border-sky-500 bg-sky-50 scale-105" : "border-slate-200 bg-slate-50/50"),
         !isReviewing && isOccupied && state === 'wrong' ? "border-solid border-slate-300 bg-white" : "",
@@ -386,6 +397,7 @@ interface KaryotypePairProps {
   placedChromosomes: Record<string, ChromosomeData>;
   onUpdateChromosome: (slotId: string, updates: Partial<ChromosomeData>) => void;
   isReviewing?: boolean;
+  displayScale?: number;
 }
 
 /**
@@ -394,7 +406,7 @@ interface KaryotypePairProps {
  * no meaning - any chromosome belonging to this pair is valid in any of its
  * slots, as long as its own recorded orientation matches.
  */
-const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedChromosomes, onUpdateChromosome, isReviewing }) => {
+const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedChromosomes, onUpdateChromosome, isReviewing, displayScale }) => {
   const getSlotState = (chrom: ChromosomeData | undefined): 'empty' | 'wrong' | 'type-correct' | 'fully-correct' => {
     if (!chrom) return 'empty';
     if (chrom.type !== pairId) return 'wrong';
@@ -420,11 +432,11 @@ const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedCh
 
   return (
     <div className={cn("flex flex-col items-center gap-1 p-1 lg:p-2 rounded-xl transition-colors group", !isReviewing && "hover:bg-slate-100/50")}>
-      <div className="flex gap-1">
+      <div className="flex items-end gap-1">
         {slots.map(({ slotId, chrom, state }) => (
           <div key={slotId}>
             <DroppableSlot id={slotId} acceptType={pairId} isOccupied={!!chrom} state={state} isReviewing={isReviewing}>
-              {chrom && <DraggableChromosome id={chrom.id} chromosome={chrom} onUpdate={(id, updates) => onUpdateChromosome(slotId, updates)} isReviewing={isReviewing} visualClassName="!h-[clamp(3.5rem,12vh,5rem)]" />}
+              {chrom && <DraggableChromosome id={chrom.id} chromosome={chrom} onUpdate={(id, updates) => onUpdateChromosome(slotId, updates)} isReviewing={isReviewing} displayScale={displayScale} />}
             </DroppableSlot>
           </div>
         ))}
@@ -588,24 +600,10 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
         y: parseFloat(p.getAttribute('y') || '0')
       }));
       
-      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-      points.forEach(p => {
-        if (p.x < minX) minX = p.x;
-        if (p.x > maxX) maxX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.y > maxY) maxY = p.y;
-      });
-      
-      const padding = 10;
-      minX = Math.max(0, minX - padding);
-      minY = Math.max(0, minY - padding);
-      maxX = Math.min(img.naturalWidth, maxX + padding);
-      maxY = Math.min(img.naturalHeight, maxY + padding);
-      
-      const w = maxX - minX;
-      const h = maxY - minY;
-      
-      if (w <= 0 || h <= 0) return;
+      const bounds = cropBoundsFromPoints(points, img.naturalWidth, img.naturalHeight);
+      if (!bounds) return;
+
+      const { minX, minY, width: w, height: h } = bounds;
 
       const canvas = document.createElement('canvas');
       canvas.width = w;
@@ -2615,6 +2613,14 @@ export default function Chromy() {
     return (jumbled.find(c => c.id === activeId) || Object.values(placed).find((c: ChromosomeData) => c.id === activeId)) as ChromosomeData | undefined;
   }, [activeId, jumbled, placed]);
 
+  const chromosomeDisplayScale = useMemo(
+    () => uniformDisplayScale(
+      [...jumbled, ...Object.values(placed)],
+      CHROMOSOME_DISPLAY_MAX_EDGE
+    ),
+    [jumbled, placed]
+  );
+
   // Derive the board's pair groups (and their slot IDs) from the full set of
   // chromosomes for this sample. Slot IDs are opaque (`slot-${pairIndex}-${slotIndex}`)
   // so a pair ID containing arbitrary characters (custom names) can never
@@ -2686,6 +2692,8 @@ export default function Chromy() {
         return {
           id: current.id,
           imageUrl: original.imageUrl,
+          width: original.width,
+          height: original.height,
           targetPair: original.type,
           currentPair: slotId ? (slotPairMap.get(slotId) ?? null) : null,
           currentRotation: normalizeRotation(current.userRotation),
@@ -2708,6 +2716,8 @@ export default function Chromy() {
     () => originalExtracted.map(chromosome => ({
       id: chromosome.id,
       imageUrl: chromosome.imageUrl,
+      width: chromosome.width,
+      height: chromosome.height,
       targetPair: chromosome.type,
       currentPair: chromosome.type,
       currentRotation: normalizeRotation(chromosome.expectedRotation),
@@ -3082,7 +3092,7 @@ export default function Chromy() {
                             animate={{ opacity: 1, scale: 1 }}
                             exit={{ opacity: 0, scale: 0.8 }}
                           >
-                            <DraggableChromosome id={chrom.id} chromosome={chrom} />
+                            <DraggableChromosome id={chrom.id} chromosome={chrom} displayScale={chromosomeDisplayScale} />
                           </motion.div>
                         ))
                       ) : (
@@ -3144,6 +3154,7 @@ export default function Chromy() {
                                  placedChromosomes={placed}
                                  onUpdateChromosome={updatePlaced}
                                  isReviewing={isReviewingCertificate}
+                                 displayScale={chromosomeDisplayScale}
                                />
                              </div>
                            ))}
@@ -3163,6 +3174,7 @@ export default function Chromy() {
                            placedChromosomes={placed}
                            onUpdateChromosome={updatePlaced}
                            isReviewing={isReviewingCertificate}
+                           displayScale={chromosomeDisplayScale}
                          />
                        </div>
                      ))}
@@ -3270,7 +3282,7 @@ export default function Chromy() {
           <DragOverlay dropAnimation={null}>
             {activeId && currentActiveChromosome ? (
               <div className="z-50 pointer-events-none drop-shadow-2xl">
-                <ChromosomeVisual chromosome={currentActiveChromosome} />
+                <ChromosomeVisual chromosome={currentActiveChromosome} displayScale={chromosomeDisplayScale} />
               </div>
             ) : null}
           </DragOverlay>

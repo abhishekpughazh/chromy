@@ -3,17 +3,25 @@ export interface CropPoint {
   y: number;
 }
 
+export interface CropBounds {
+  minX: number;
+  minY: number;
+  width: number;
+  height: number;
+}
+
 /**
- * Clip a polygon out of a metaphase image and return a PNG data URL.
- * Matches the crop used by gameplay extraction so the annotation preview
- * looks like the assembled karyotype.
+ * Axis-aligned crop box for a polygon, including padding and clamped to the
+ * source image. Width and height match the canvas produced by
+ * cropPolygonFromImage.
  */
-export function cropPolygonFromImage(
-  img: HTMLImageElement,
+export function cropBoundsFromPoints(
   points: CropPoint[],
+  imageWidth: number,
+  imageHeight: number,
   padding = 10
-): string | null {
-  if (!img.naturalWidth || !img.naturalHeight || points.length < 3) return null;
+): CropBounds | null {
+  if (imageWidth <= 0 || imageHeight <= 0 || points.length < 3) return null;
 
   let minX = Infinity;
   let maxX = -Infinity;
@@ -28,13 +36,49 @@ export function cropPolygonFromImage(
 
   minX = Math.max(0, minX - padding);
   minY = Math.max(0, minY - padding);
-  maxX = Math.min(img.naturalWidth, maxX + padding);
-  maxY = Math.min(img.naturalHeight, maxY + padding);
+  maxX = Math.min(imageWidth, maxX + padding);
+  maxY = Math.min(imageHeight, maxY + padding);
 
-  const w = Math.ceil(maxX - minX);
-  const h = Math.ceil(maxY - minY);
-  if (w <= 0 || h <= 0) return null;
+  const width = Math.ceil(maxX - minX);
+  const height = Math.ceil(maxY - minY);
+  if (width <= 0 || height <= 0) return null;
 
+  return { minX, minY, width, height };
+}
+
+/**
+ * One CSS-pixel-per-source-pixel scale for a whole sample.
+ * The longest crop edge maps to maxEdgePx; every other chromosome uses the
+ * same factor so relative size matches the metaphase spread.
+ * Returns 1 when no chromosome has a positive size.
+ */
+export function uniformDisplayScale(
+  items: ReadonlyArray<{ width?: number; height?: number }>,
+  maxEdgePx: number
+): number {
+  let longest = 0;
+  for (const item of items) {
+    const edge = Math.max(item.width ?? 0, item.height ?? 0);
+    if (edge > longest) longest = edge;
+  }
+  if (longest <= 0) return 1;
+  return maxEdgePx / longest;
+}
+
+/**
+ * Clip a polygon out of a metaphase image and return a PNG data URL.
+ * Matches the crop used by gameplay extraction so the annotation preview
+ * looks like the assembled karyotype.
+ */
+export function cropPolygonFromImage(
+  img: HTMLImageElement,
+  points: CropPoint[],
+  padding = 10
+): string | null {
+  const bounds = cropBoundsFromPoints(points, img.naturalWidth, img.naturalHeight, padding);
+  if (!bounds) return null;
+
+  const { minX, minY, width: w, height: h } = bounds;
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
