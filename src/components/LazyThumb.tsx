@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { disableImageTransforms, thumbnailUrl } from '../lib/imageUrl';
 
 /**
@@ -28,6 +28,18 @@ export function LazyThumb({
 }) {
   const thumb = thumbnailUrl(src, { width, height, resize });
   const [displaySrc, setDisplaySrc] = useState(thumb);
+  const loadedRef = useRef(false);
+
+  useEffect(() => {
+    loadedRef.current = false;
+    if (displaySrc === src) return;
+    const timer = window.setTimeout(() => {
+      if (loadedRef.current) return;
+      disableImageTransforms();
+      setDisplaySrc(src);
+    }, 6000);
+    return () => window.clearTimeout(timer);
+  }, [displaySrc, src]);
 
   return (
     <img
@@ -37,6 +49,9 @@ export function LazyThumb({
       loading={loading}
       decoding="async"
       draggable={draggable}
+      onLoad={() => {
+        loadedRef.current = true;
+      }}
       onError={() => {
         if (fallbackToOriginal && displaySrc !== src) {
           disableImageTransforms();

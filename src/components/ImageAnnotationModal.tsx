@@ -3,6 +3,7 @@ import { X, Save, PenLine, Trash2, Undo2, Hand, ZoomIn, ZoomOut, Maximize, Mouse
 import { STANDARD_PAIR_IDS, MAX_CHROMOSOMES_PER_PAIR, normalizePairId, isStandardPairId } from '../lib/chromosomePairs';
 import { normalizeRotation, pointerAngleDeg, chromosomeTransform, toggleDisplayedFlipX, toggleDisplayedFlipY } from '../lib/orientation';
 import { countLabeledStrokes, parseExpectedChromosomeCount, markCompleteMismatchMessage } from '../lib/annotationStatus';
+import { DIFFICULTIES, DIFFICULTY_LABELS, type SpreadDifficulty } from '../lib/difficulty';
 import { cropBoundsFromPoints, cropPolygonFromImage } from '../lib/chromosomeCrop';
 import { cn } from '../lib/utils';
 import KaryotypePreview, { type KaryotypePreviewChromosome } from './KaryotypePreview';
@@ -17,6 +18,30 @@ interface Stroke {
   rotation?: number;
   flipX?: boolean;
   flipY?: boolean;
+  /** Learner-facing sentence shared by every chromosome in this pair. */
+  info?: string;
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function labeledPairId(stroke: { label?: string }): string | null {
+  if (!stroke.label || stroke.label === 'Unassigned') return null;
+  return normalizePairId(stroke.label);
+}
+
+/** First non-empty learner note among every chromosome in the pair. */
+function sharedPairNote(strokes: { label?: string; info?: string }[], pairId: string): string {
+  for (const stroke of strokes) {
+    if (labeledPairId(stroke) !== pairId) continue;
+    const note = stroke.info?.trim();
+    if (note) return note;
+  }
+  return '';
 }
 
 /**
@@ -51,8 +76,13 @@ interface ImageAnnotationModalProps {
   initialXml?: string;
   karyotype?: string;
   annotationComplete?: boolean;
-  onSave: (xml: string) => Promise<void>;
+  difficulty?: SpreadDifficulty | null;
+  /** Bucket sentences for this spread. A local override replaces one pair on this spread only. */
+  bucketPairNotes?: Record<string, string>;
+  initialPairNoteOverrides?: Record<string, string>;
+  onSave: (xml: string, pairNoteOverrides: Record<string, string>) => Promise<void>;
   onSetComplete: (complete: boolean) => Promise<void>;
+  onSetDifficulty: (difficulty: SpreadDifficulty | null) => Promise<void>;
   onClose: () => void;
 }
 
@@ -61,6 +91,10 @@ function strokesToXml(strokes: Stroke[], imageId: string, imgWidth: number, imgH
   xml += `<annotations imageId="${imageId}" width="${imgWidth}" height="${imgHeight}">\n`;
   for (const s of strokes) {
     xml += `  <stroke color="${s.color}" width="${s.width}" label="${s.label || 'Unassigned'}" rotation="${normalizeRotation(s.rotation)}" flipX="${s.flipX || false}" flipY="${s.flipY || false}">\n`;
+    // Keep the sentence that was already stored on this stroke. New sentences
+    // live in pair_note_overrides so a note edit does not change the annotation hash.
+    const note = s.info?.trim();
+    if (note) xml += `    <info>${escapeXml(note)}</info>\n`;
     for (const p of s.points) {
       xml += `    <point x="${p.x.toFixed(2)}" y="${p.y.toFixed(2)}"/>\n`;
     }
@@ -83,6 +117,7 @@ function xmlToStrokes(xmlText: string): Stroke[] | null {
       const rotation = normalizeRotation(parseFloat(el.getAttribute('rotation') || '0'));
       const flipX = el.getAttribute('flipX') === 'true';
       const flipY = el.getAttribute('flipY') === 'true';
+      const info = el.querySelector('info')?.textContent?.trim() || undefined;
       const pointEls = el.querySelectorAll('point');
       const points: Point[] = [];
       pointEls.forEach((p) => {
@@ -91,7 +126,7 @@ function xmlToStrokes(xmlText: string): Stroke[] | null {
           y: parseFloat(p.getAttribute('y') || '0'),
         });
       });
-      strokes.push({ id: `loaded-${idx}`, color, width, points, label, rotation, flipX, flipY });
+      strokes.push({ id: `loaded-${idx}`, color, width, points, label, rotation, flipX, flipY, info });
     });
     return strokes;
   } catch {
@@ -212,7 +247,7 @@ const OrientationDialog = ({
       onClick={(e) => e.stopPropagation()}
     >
       <div 
-        className="relative bg-white rounded-3xl shadow-2xl p-8 w-full max-w-md flex flex-col items-center"
+        className="relative bg-white rounded-3xl shadow-2xl p-8 w-full max-w-md max-h-[90vh] overflow-y-auto flex flex-col items-center"
         onClick={(e) => e.stopPropagation()}
       >
         <button
@@ -379,13 +414,17 @@ function distToSegment(p: Point, v: Point, w: Point) {
 
 type Mode = 'draw' | 'pan' | 'edit';
 
-export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, karyotype, annotationComplete, onSave, onSetComplete, onClose }: ImageAnnotationModalProps) {
+export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, karyotype, annotationComplete, difficulty: initialDifficulty = null, bucketPairNotes = {}, initialPairNoteOverrides = {}, onSave, onSetComplete, onSetDifficulty, onClose }: ImageAnnotationModalProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
 
   const [strokes, _setStrokes] = useState<Stroke[]>([]);
+  const [pairNoteOverrides, setPairNoteOverrides] = useState<Record<string, string>>(initialPairNoteOverrides);
+  const [noteDrafts, setNoteDrafts] = useState<Record<string, string>>({});
   const [isDirty, setIsDirty] = useState(false);
+  const initialOverridesRef = useRef(initialPairNoteOverrides);
+  initialOverridesRef.current = initialPairNoteOverrides;
 
   const setStrokes = useCallback((val: React.SetStateAction<Stroke[]>) => {
     _setStrokes(val);
@@ -399,6 +438,8 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
   const [complete, setComplete] = useState(!!annotationComplete);
+  const [difficulty, setDifficulty] = useState<SpreadDifficulty | null>(initialDifficulty);
+  const [difficultyBusy, setDifficultyBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [previewPoint, setPreviewPoint] = useState<Point | null>(null);
 
@@ -578,7 +619,10 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
     setShowKaryotypePreview(false);
     cropCacheRef.current.clear();
     setCropUrls({});
+    setPairNoteOverrides({ ...(initialOverridesRef.current ?? {}) });
+    setNoteDrafts({});
     setComplete(!!annotationComplete);
+    setDifficulty(initialDifficulty);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageId]);
 
@@ -1005,7 +1049,10 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
     setSaveMsg(null);
     try {
       const xml = strokesToXml(strokes, imageId, imgSize.width, imgSize.height);
-      await onSave(xml);
+      const overrides = committedPairNoteOverrides();
+      await onSave(xml, overrides);
+      setPairNoteOverrides(overrides);
+      setNoteDrafts({});
       if (countLabeledStrokes(strokes) === 0) setComplete(false);
       setSaveMsg('Saved');
       setIsDirty(false);
@@ -1016,6 +1063,21 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       return false;
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSetDifficulty = async (next: SpreadDifficulty | null) => {
+    if (saving || difficultyBusy || next === difficulty) return;
+    const previous = difficulty;
+    setDifficulty(next);
+    setDifficultyBusy(true);
+    try {
+      await onSetDifficulty(next);
+    } catch {
+      setDifficulty(previous);
+      setSaveMsg('Error updating difficulty');
+    } finally {
+      setDifficultyBusy(false);
     }
   };
 
@@ -1090,6 +1152,85 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
   const labeledCount = countLabeledStrokes(strokes);
   const expectedCount = parseExpectedChromosomeCount(karyotype);
 
+  const bucketNoteFor = (pairId: string) => (bucketPairNotes[pairId] ?? '').trim();
+
+  const inheritedPairNote = (pairId: string) => {
+    const bucket = bucketNoteFor(pairId);
+    if (bucket) return bucket;
+    return sharedPairNote(strokes, pairId);
+  };
+
+  const displayedPairNote = (pairId: string) => {
+    if (Object.prototype.hasOwnProperty.call(noteDrafts, pairId)) return noteDrafts[pairId];
+    const saved = pairNoteOverrides[pairId]?.trim();
+    if (saved) return saved;
+    return inheritedPairNote(pairId);
+  };
+
+  const pairNoteIsCustom = (pairId: string) =>
+    displayedPairNote(pairId).trim() !== inheritedPairNote(pairId).trim();
+
+  const committedPairNoteOverrides = () => {
+    const next = { ...pairNoteOverrides };
+    for (const [pairId, draft] of Object.entries(noteDrafts)) {
+      const text = String(draft).trim();
+      if (!text || text === inheritedPairNote(pairId).trim()) delete next[pairId];
+      else next[pairId] = text;
+    }
+    for (const [pairId, text] of Object.entries(next)) {
+      const sentence = String(text).trim();
+      if (!sentence || sentence === inheritedPairNote(pairId).trim()) delete next[pairId];
+    }
+    return next;
+  };
+
+  const editPairNote = (pairId: string, value: string) => {
+    setNoteDrafts(prev => ({ ...prev, [pairId]: value }));
+    setIsDirty(true);
+  };
+
+  const resetPairNote = (pairId: string) => {
+    setNoteDrafts(prev => {
+      if (!(pairId in prev)) return prev;
+      const next = { ...prev };
+      delete next[pairId];
+      return next;
+    });
+    setPairNoteOverrides(prev => {
+      if (!(pairId in prev)) return prev;
+      const next = { ...prev };
+      delete next[pairId];
+      return next;
+    });
+    setIsDirty(true);
+  };
+
+  const movePairNoteKey = (pairId: string, nextId: string) => {
+    const move = (prev: Record<string, string>) => {
+      if (!(pairId in prev)) return prev;
+      const next = { ...prev, [nextId]: prev[pairId] };
+      delete next[pairId];
+      return next;
+    };
+    setPairNoteOverrides(move);
+    setNoteDrafts(move);
+  };
+
+  const dropPairNote = (pairId: string) => {
+    setPairNoteOverrides(prev => {
+      if (!(pairId in prev)) return prev;
+      const next = { ...prev };
+      delete next[pairId];
+      return next;
+    });
+    setNoteDrafts(prev => {
+      if (!(pairId in prev)) return prev;
+      const next = { ...prev };
+      delete next[pairId];
+      return next;
+    });
+  };
+
   const previewChromosomes: KaryotypePreviewChromosome[] = useMemo(() => (
     strokes
       .filter(s => s.label && s.label !== 'Unassigned' && s.points.length >= 3)
@@ -1102,17 +1243,27 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
           rotation: normalizeRotation(s.rotation),
           flipX: !!s.flipX,
           flipY: !!s.flipY,
+          info: displayedPairNote(normalizePairId(s.label!)),
+          inheritedInfo: inheritedPairNote(normalizePairId(s.label!)),
+          bucketNote: bucketNoteFor(normalizePairId(s.label!)) || undefined,
           width: bounds?.width,
           height: bounds?.height,
         };
       })
-  ), [strokes, cropUrls, imgSize.width, imgSize.height]);
+  ), [strokes, cropUrls, imgSize.width, imgSize.height, noteDrafts, pairNoteOverrides, bucketPairNotes]);
 
   const selectPreviewStroke = useCallback((strokeId: string) => {
     setSelectedStrokeId(strokeId);
   }, []);
 
-  const updatePreviewStroke = useCallback((strokeId: string, updates: { rotation?: number; flipX?: boolean; flipY?: boolean; label?: string }) => {
+  const updatePreviewStroke = useCallback((strokeId: string, updates: { rotation?: number; flipX?: boolean; flipY?: boolean; label?: string; info?: string }) => {
+    if (updates.info != null) {
+      const edited = strokes.find(stroke => stroke.id === strokeId);
+      const pairId = edited ? labeledPairId(edited) : null;
+      if (pairId) editPairNote(pairId, updates.info);
+    }
+    const hasGeometry = updates.rotation != null || updates.flipX != null || updates.flipY != null || updates.label != null;
+    if (!hasGeometry) return;
     setStrokes(prev => {
       if (updates.label && updates.label !== 'Unassigned') {
         const pid = normalizePairId(updates.label);
@@ -1121,15 +1272,19 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
         ).length;
         if (count >= MAX_CHROMOSOMES_PER_PAIR) return prev;
       }
-      return prev.map(s => s.id !== strokeId ? s : {
-        ...s,
-        ...(updates.rotation != null ? { rotation: normalizeRotation(updates.rotation) } : {}),
-        ...(updates.flipX != null ? { flipX: updates.flipX } : {}),
-        ...(updates.flipY != null ? { flipY: updates.flipY } : {}),
-        ...(updates.label != null ? { label: updates.label } : {}),
+      return prev.map(s => {
+        if (s.id !== strokeId) return s;
+        const updated: Stroke = {
+          ...s,
+          ...(updates.rotation != null ? { rotation: normalizeRotation(updates.rotation) } : {}),
+          ...(updates.flipX != null ? { flipX: updates.flipX } : {}),
+          ...(updates.flipY != null ? { flipY: updates.flipY } : {}),
+        };
+        if (updates.label != null) updated.label = updates.label;
+        return updated;
       });
     });
-  }, []);
+  }, [strokes]);
 
   const deletePreviewStroke = useCallback((strokeId: string) => {
     setStrokes(prev => prev.filter(s => s.id !== strokeId));
@@ -1138,7 +1293,10 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
 
   const handleLabelClick = (pairId: string) => {
     if (mode === 'edit' && selectedStrokeId) {
-      setStrokes(prev => prev.map(s => s.id === selectedStrokeId ? { ...s, label: pairId } : s));
+      setStrokes(prev => prev.map(s => {
+        if (s.id !== selectedStrokeId) return s;
+        return { ...s, label: pairId };
+      }));
     } else {
       setActiveLabel(pairId);
       if (currentStroke) {
@@ -1171,6 +1329,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
     }
     const affectedIds = new Set(affected.map(s => s.id));
     setStrokes(prev => prev.filter(s => !affectedIds.has(s.id)));
+    dropPairNote(pairId);
     setCustomPairs(prev => prev.filter(p => p !== pairId));
     if (selectedStrokeId && affectedIds.has(selectedStrokeId)) {
       setSelectedStrokeId(null);
@@ -1196,6 +1355,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       return;
     }
     setStrokes(prev => prev.map(s => (s.label && normalizePairId(s.label) === pairId) ? { ...s, label: trimmed } : s));
+    movePairNoteKey(pairId, normalizePairId(trimmed));
     // Rename in place - whichever list (standard slot order or custom pairs)
     // currently holds this ID keeps its position/section, it just gets a
     // new name. This avoids leaving a stray empty entry behind.
@@ -1225,7 +1385,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
         onPointerDown={(e) => e.stopPropagation()}
       >
         {/* Toolbar */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 bg-slate-50">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-slate-200 bg-slate-50">
           <div className="flex items-center gap-4">
             <span className="text-xs font-mono text-slate-400 uppercase">Annotation Mode</span>
             <div className="flex items-center gap-2">
@@ -1319,7 +1479,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
             </button>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {selectedStrokeId && (
               <>
                 <button onClick={() => setOrientingStrokeId(selectedStrokeId)} className="p-2 hover:bg-sky-100 rounded-full transition-colors text-sky-500" title="Adjust Orientation">
@@ -1336,6 +1496,29 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
             <button onClick={clearAll} className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500" title="Clear all">
               <Trash2 className="w-4 h-4" />
             </button>
+            <div className="flex items-center rounded-lg border border-slate-200 bg-white p-0.5" role="group" aria-label="Difficulty">
+              {DIFFICULTIES.map(id => (
+                <button
+                  key={id}
+                  type="button"
+                  aria-pressed={difficulty === id}
+                  disabled={saving || difficultyBusy}
+                  onClick={() => handleSetDifficulty(difficulty === id ? null : id)}
+                  className={cn(
+                    'px-2 py-1 rounded-md text-[10px] font-bold transition-colors disabled:opacity-50',
+                    difficulty === id
+                      ? id === 'easy'
+                        ? 'bg-emerald-500 text-white'
+                        : id === 'moderate'
+                          ? 'bg-amber-500 text-white'
+                          : 'bg-rose-500 text-white'
+                      : 'text-slate-500 hover:bg-slate-100'
+                  )}
+                >
+                  {DIFFICULTY_LABELS[id]}
+                </button>
+              ))}
+            </div>
             <span className="text-[10px] font-mono font-bold text-slate-500 px-2 whitespace-nowrap">
               {expectedCount != null ? `${labeledCount} / ${expectedCount} labeled` : `${labeledCount} labeled`}
             </span>
@@ -1554,7 +1737,42 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
                 </div>
               </div>
             </div>
-            {mode === 'edit' && selectedStrokeId && (
+            {currentDisplayLabel !== 'Unassigned' && (
+              <div className="p-4 border-t border-slate-200 bg-white flex flex-col gap-3">
+                <label className="block">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                    Learner note · Chromosome {currentDisplayLabel}
+                  </span>
+                  <textarea
+                    value={displayedPairNote(currentDisplayLabel)}
+                    onChange={(e) => editPairNote(currentDisplayLabel, e.target.value)}
+                    rows={4}
+                    placeholder="What should learners know about this pair?"
+                    className="mt-2 w-full resize-y rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                  />
+                  <span className="mt-1 block text-[11px] text-slate-400">A change here is saved only on this spread.</span>
+                  {pairNoteIsCustom(currentDisplayLabel) && (
+                    <button
+                      type="button"
+                      onClick={() => resetPairNote(currentDisplayLabel)}
+                      className="mt-2 text-left text-[11px] font-bold text-sky-600 hover:text-sky-700"
+                    >
+                      {bucketNoteFor(currentDisplayLabel) ? 'Reset to bucket description' : 'Clear custom sentence'}
+                    </button>
+                  )}
+                </label>
+                {mode === 'edit' && selectedStroke && (
+                  <button
+                    onClick={() => setOrientingStrokeId(selectedStrokeId)}
+                    className="w-full py-3 rounded-lg font-bold text-sm bg-sky-500 text-white hover:bg-sky-600 transition-colors shadow-lg shadow-sky-500/30 flex items-center justify-center gap-2"
+                  >
+                    <RotateCw className="w-5 h-5" />
+                    Adjust Orientation
+                  </button>
+                )}
+              </div>
+            )}
+            {mode === 'edit' && selectedStroke && currentDisplayLabel === 'Unassigned' && (
               <div className="p-4 border-t border-slate-200 bg-white shadow-[0_-4px_10px_rgba(0,0,0,0.02)]">
                 <button
                   onClick={() => setOrientingStrokeId(selectedStrokeId)}
@@ -1590,15 +1808,19 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
           onSelect={selectPreviewStroke}
           onUpdate={updatePreviewStroke}
           onDelete={deletePreviewStroke}
+          onResetNote={resetPairNote}
           onClose={() => {
             setSelectedStrokeId(null);
             setShowKaryotypePreview(false);
           }}
         />
       )}
-      {orientingStrokeId && strokes.find(s => s.id === orientingStrokeId) && imgRef.current && (
+      {orientingStrokeId && imgRef.current && (() => {
+        const orientingStroke = strokes.find(s => s.id === orientingStrokeId);
+        if (!orientingStroke) return null;
+        return (
         <OrientationDialog
-          stroke={strokes.find(s => s.id === orientingStrokeId)!}
+          stroke={orientingStroke}
           img={imgRef.current}
           onComplete={(updates) => {
             setStrokes(prev => prev.map(s => s.id === orientingStrokeId ? { ...s, ...updates } : s));
@@ -1615,7 +1837,8 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
           }}
           onClose={() => setOrientingStrokeId(null)}
         />
-      )}
+        );
+      })()}
     </div>
   );
 }

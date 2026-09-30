@@ -16,6 +16,9 @@ export interface KaryotypePreviewChromosome {
   flipY: boolean;
   width?: number;
   height?: number;
+  info?: string;
+  inheritedInfo?: string;
+  bucketNote?: string;
 }
 
 export interface KaryotypePreviewEdits {
@@ -23,6 +26,7 @@ export interface KaryotypePreviewEdits {
   flipX?: boolean;
   flipY?: boolean;
   label?: string;
+  info?: string;
 }
 
 interface KaryotypePreviewProps {
@@ -36,6 +40,7 @@ interface KaryotypePreviewProps {
   onSelect: (strokeId: string) => void;
   onUpdate: (strokeId: string, updates: KaryotypePreviewEdits) => void;
   onDelete: (strokeId: string) => void;
+  onResetNote?: (pairId: string) => void;
   onClose: () => void;
 }
 
@@ -124,7 +129,8 @@ const ChromosomeEditor: React.FC<{
   pairCounts: Map<string, number>;
   onUpdate: (updates: KaryotypePreviewEdits) => void;
   onDelete: () => void;
-}> = ({ chromosome, pairOrder, customPairs, pairCounts, onUpdate, onDelete }) => {
+  onResetNote?: () => void;
+}> = ({ chromosome, pairOrder, customPairs, pairCounts, onUpdate, onDelete, onResetNote }) => {
   const previewRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ startPointerAngle: number; startRotation: number } | null>(null);
   const [isDraggingRotation, setIsDraggingRotation] = useState(false);
@@ -197,6 +203,27 @@ const ChromosomeEditor: React.FC<{
           )}
         </div>
         <p className="text-[11px] text-slate-400 text-center -mt-3">Drag to rotate. p-arm should point up.</p>
+
+        <label className="block">
+          <span className="text-xs font-bold text-slate-500 uppercase tracking-wide">Pair note</span>
+          <textarea
+            value={chromosome.info ?? ''}
+            onChange={(e) => onUpdate({ info: e.target.value })}
+            rows={4}
+            placeholder="What should learners know about this pair?"
+            className="mt-2 w-full resize-y rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm leading-relaxed text-slate-700 focus:outline-none focus:ring-2 focus:ring-sky-500"
+          />
+          <span className="mt-1 block text-[11px] text-slate-400">A change here is saved only on this spread. Every copy of this pair uses it.</span>
+          {(chromosome.info ?? '').trim() !== (chromosome.inheritedInfo ?? '').trim() && onResetNote && (
+            <button
+              type="button"
+              onClick={onResetNote}
+              className="mt-2 text-left text-[11px] font-bold text-sky-600 hover:text-sky-700"
+            >
+              {chromosome.bucketNote?.trim() ? 'Reset to bucket description' : 'Clear custom sentence'}
+            </button>
+          )}
+        </label>
 
         <div>
           <div className="flex items-center justify-between mb-2">
@@ -333,6 +360,7 @@ export default function KaryotypePreview({
   onSelect,
   onUpdate,
   onDelete,
+  onResetNote,
   onClose,
 }: KaryotypePreviewProps) {
   const byPair = useMemo(() => {
@@ -381,7 +409,7 @@ export default function KaryotypePreview({
             <div className="min-w-0">
               <h3 className="text-lg font-black text-slate-900 leading-tight">Karyotype preview</h3>
               <p className="text-xs text-slate-500 font-medium truncate">
-                {karyotype ? `ISCN ${karyotype}` : 'Click a chromosome to rotate, flip, or reassign it'}
+                One sentence per pair. An edit stays on this spread{karyotype ? ` · ISCN ${karyotype}` : ''}
               </p>
             </div>
           </div>
@@ -454,11 +482,12 @@ export default function KaryotypePreview({
               pairCounts={pairCounts}
               onUpdate={(updates) => onUpdate(selected.strokeId, updates)}
               onDelete={() => onDelete(selected.strokeId)}
+              onResetNote={onResetNote ? () => onResetNote(selected.pairId) : undefined}
             />
           ) : (
             <div className="w-80 shrink-0 border-l border-slate-100 bg-slate-50 flex items-center justify-center p-8 text-center">
               <p className="text-sm text-slate-400 font-medium leading-relaxed">
-                Click a chromosome to rotate, flip, or reassign it here.
+                Click a chromosome to rotate, flip, or reassign it. A custom sentence stays on this spread.
               </p>
             </div>
           )}

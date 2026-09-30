@@ -133,9 +133,81 @@ create policy "Only Super Admins can delete buckets"
     )
   );
 
+-- Pair sentences shared by every metaphase spread in a bucket.
+-- Kept off the buckets table so admins can edit them without renaming buckets.
+create table if not exists public.bucket_pair_descriptions (
+  id uuid default gen_random_uuid() primary key,
+  bucket_id uuid references public.buckets(id) on delete cascade not null,
+  pair_id text not null,
+  description text not null,
+  unique (bucket_id, pair_id)
+);
+
+alter table public.bucket_pair_descriptions enable row level security;
+
+drop policy if exists "Authenticated users can view bucket pair descriptions" on public.bucket_pair_descriptions;
+drop policy if exists "Admins can insert bucket pair descriptions" on public.bucket_pair_descriptions;
+drop policy if exists "Admins can update bucket pair descriptions" on public.bucket_pair_descriptions;
+drop policy if exists "Admins can delete bucket pair descriptions" on public.bucket_pair_descriptions;
+
+create policy "Authenticated users can view bucket pair descriptions"
+  on public.bucket_pair_descriptions for select
+  to authenticated
+  using ( true );
+
+create policy "Admins can insert bucket pair descriptions"
+  on public.bucket_pair_descriptions for insert
+  to authenticated
+  with check (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
+    )
+  );
+
+create policy "Admins can update bucket pair descriptions"
+  on public.bucket_pair_descriptions for update
+  to authenticated
+  using (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
+    )
+  )
+  with check (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
+    )
+  );
+
+create policy "Admins can delete bucket pair descriptions"
+  on public.bucket_pair_descriptions for delete
+  to authenticated
+  using (
+    exists (
+      select 1 from public.user_roles
+      where user_roles.user_id = auth.uid()
+      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
+    )
+  );
+
 -- Link samples to buckets (replaces legacy level column)
 alter table public.samples add column if not exists bucket_id uuid references public.buckets(id) on delete set null;
 alter table public.samples drop column if exists level;
+
+-- Sentences edited on one metaphase spread. Absent keys inherit the bucket description.
+alter table public.samples add column if not exists pair_note_overrides jsonb not null default '{}'::jsonb;
+
+-- Annotator-assigned difficulty of this metaphase spread. Null until rated.
+-- Separate from karyotype_progress.level, which stores the learner game step.
+alter table public.samples add column if not exists difficulty text;
+alter table public.samples drop constraint if exists samples_difficulty_check;
+alter table public.samples add constraint samples_difficulty_check
+  check (difficulty is null or difficulty in ('easy', 'moderate', 'hard'));
 
 -- 3. Enable Row Level Security (RLS) on the samples table
 alter table public.samples enable row level security;
@@ -148,18 +220,14 @@ drop policy if exists "Users can insert their own samples" on public.samples;
 drop policy if exists "Users can update their own samples" on public.samples;
 drop policy if exists "Users can delete their own samples" on public.samples;
 
--- Select: Owner can view, ADMIN and SUPER ADMIN can view all
-create policy "Users can view their own samples and Admins can view all"
+-- Select: every signed-in user can open the shared metaphase library.
+-- Writes stay limited to the owner and admins.
+drop policy if exists "Users can view their own samples and Admins can view all" on public.samples;
+drop policy if exists "Authenticated users can view samples" on public.samples;
+create policy "Authenticated users can view samples"
   on public.samples for select
-  using ( 
-    auth.uid() = user_id 
-    or 
-    exists (
-      select 1 from public.user_roles 
-      where user_roles.user_id = auth.uid() 
-      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
-    )
-  );
+  to authenticated
+  using ( true );
 
 -- Insert: Only the owner can create samples
 create policy "Users can insert their own samples"
@@ -240,11 +308,20 @@ create policy "Admins can delete any images"
     )
   );
 
--- 7. Persist each user's karyotyping board independently from sample annotations
+-- 7. Persist each user's progress per sample and level.
+-- Level 1 is Learn.
+-- Level 2 is Match, shown as 2.1 (one chromosome of each pair is already placed).
+-- Level 4 is Pair, shown as 2.2 (both chromosomes start in the tray, already oriented).
+-- Level 3 is Arrange, shown as 2.3. Its stored id stays 3 so existing boards are unchanged.
+-- Level 5 is Mate, shown as 3.1 (one chromosome of each pair is already numbered on the spread).
+-- Level 6 is Label, shown as 3.2 (number every chromosome on the spread).
+-- Rows created before Match existed were stored as level 2; a one-time
+-- update below moves those Arrange boards to level 3.
 create table if not exists public.karyotype_progress (
   id uuid default gen_random_uuid() primary key,
   user_id uuid references auth.users(id) on delete cascade not null,
   sample_id uuid references public.samples(id) on delete cascade not null,
+  level integer not null default 3,
   state jsonb not null default '{}'::jsonb,
   annotation_signature text not null,
   status text not null default 'in_progress'
@@ -254,13 +331,59 @@ create table if not exists public.karyotype_progress (
   started_at timestamp with time zone default timezone('utc'::text, now()) not null,
   completed_at timestamp with time zone,
   updated_at timestamp with time zone default timezone('utc'::text, now()) not null,
-  unique (user_id, sample_id)
+  constraint karyotype_progress_user_sample_level_key unique (user_id, sample_id, level)
 );
 
 create index if not exists karyotype_progress_user_id_idx
   on public.karyotype_progress (user_id);
 create index if not exists karyotype_progress_sample_id_idx
   on public.karyotype_progress (sample_id);
+
+-- Existing databases: add level and replace the one-row-per-sample unique key.
+alter table public.karyotype_progress add column if not exists level integer not null default 3;
+alter table public.karyotype_progress alter column level set default 3;
+do $$
+declare
+  old_unique record;
+begin
+  for old_unique in
+    select conname
+    from pg_constraint
+    where conrelid = 'public.karyotype_progress'::regclass
+      and contype = 'u'
+      and conname <> 'karyotype_progress_user_sample_level_key'
+  loop
+    execute format('alter table public.karyotype_progress drop constraint %I', old_unique.conname);
+  end loop;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'karyotype_progress_user_sample_level_key'
+  ) then
+    alter table public.karyotype_progress
+      add constraint karyotype_progress_user_sample_level_key unique (user_id, sample_id, level);
+  end if;
+end $$;
+
+-- One-time: Arrange boards were saved as level 2 before Match existed.
+-- The column comment records that the move already ran, so a later re-run
+-- cannot move new Match progress from level 2 to level 3.
+do $$
+declare
+  marker text;
+begin
+  select col_description('public.karyotype_progress'::regclass, attnum)
+    into marker
+  from pg_attribute
+  where attrelid = 'public.karyotype_progress'::regclass
+    and attname = 'level'
+    and not attisdropped;
+
+  if marker is distinct from 'legacy-arrange-moved-to-level-3' then
+    update public.karyotype_progress set level = 3 where level = 2;
+    comment on column public.karyotype_progress.level is 'legacy-arrange-moved-to-level-3';
+  end if;
+end $$;
 
 alter table public.karyotype_progress enable row level security;
 

@@ -8,7 +8,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useLayoutEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { supabase } from './lib/supabase';
 import { Session } from '@supabase/supabase-js';
 import { 
@@ -30,20 +31,39 @@ import {
 import { cn } from './lib/utils';
 import { NonInteractivePointerSensor, NonInteractiveTouchSensor } from './lib/dndSensors';
 import { storageObjectPathFromPublicUrl } from './lib/imageUrl';
-import { CLINICAL_KARYOTYPE_ROWS, normalizePairId, comparePairIds, MAX_CHROMOSOMES_PER_PAIR, STANDARD_PAIR_IDS } from './lib/chromosomePairs';
+import { CLINICAL_KARYOTYPE_ROWS, normalizePairId, comparePairIds, MAX_CHROMOSOMES_PER_PAIR, STANDARD_PAIR_IDS, matchRowHighlightForGroup, pairIdsForMatchRow } from './lib/chromosomePairs';
 import { normalizeRotation, rotationsMatch, chromosomeTransform } from './lib/orientation';
 import { cropBoundsFromPoints, uniformDisplayScale } from './lib/chromosomeCrop';
+import { ARRANGE_LEVEL, GAMEPLAY_LEVELS, isGameplayLevel, isLabelLevel, isPresetOrientationLevel, LABEL_ALL_LEVEL, LABEL_MATE_LEVEL, LEARN_LEVEL, LEVELS, MATCH_LEVEL, PAIR_LEVEL, levelProgressLabel } from './lib/levels';
+import LabelSpreadLevel, { type NumberPlacement } from './components/LabelSpreadLevel';
+import {
+  buildPairDescriptionTemplate,
+  customPairIdsFromXml,
+  downloadTextFile,
+  normalizeCsvPairId,
+  parsePairDescriptionCsv,
+  parsePairNoteOverrides,
+  withResolvedPairSentences,
+  type PairNoteMap,
+} from './lib/pairDescriptions';
 import {
   type AnnotationStatus,
   countLabeledChromosomes,
   getAnnotationStatus,
 } from './lib/annotationStatus';
+import {
+  DIFFICULTIES,
+  DIFFICULTY_LABELS,
+  parseSpreadDifficulty,
+  type SpreadDifficulty,
+} from './lib/difficulty';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Info, CheckCircle2, ChevronRight, Dna, Undo2, ArrowLeft, Lightbulb,
-  ShieldCheck, Upload, Play, Beaker, X, Loader, ImageIcon, Zap, Pencil, Trash2, FlipHorizontal, FlipVertical, Expand, Download, FolderPlus, Folder
+  ShieldCheck, Upload, Play, Beaker, X, Loader, ImageIcon, Zap, Pencil, Trash2, FlipHorizontal, FlipVertical, Expand, Download, FolderPlus, Folder, ZoomIn, ZoomOut, Maximize
 } from 'lucide-react';
 import KaryotypeHintModal, { type KaryotypeHintChromosome } from './components/KaryotypeHintModal';
+import LearnLevel from './components/LearnLevel';
 
 // --- Types ---
 
@@ -71,6 +91,9 @@ interface ChromosomeData {
   userRotation?: number;
   userFlipX?: boolean;
   userFlipY?: boolean;
+  info?: string;
+  /** Annotation polygon in source-image pixels. Used to number the metaphase spread. */
+  points?: { x: number; y: number }[];
 }
 
 interface SavedChromosomeState {
@@ -90,6 +113,8 @@ interface KaryotypeProgressSummary {
   correctCount: number;
   totalCount: number;
 }
+
+type SampleLevelProgress = Partial<Record<number, KaryotypeProgressSummary>>;
 
 const CHROMOSOME_TYPES: ChromosomeType[] = [
   '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', 
@@ -158,6 +183,79 @@ const shuffleChromosomes = (chromosomes: ChromosomeData[], seed: string) => {
   return shuffled;
 };
 
+const orientToExpected = (chromosome: ChromosomeData): ChromosomeData => ({
+  ...chromosome,
+  userRotation: normalizeRotation(chromosome.expectedRotation),
+  userFlipX: !!chromosome.expectedFlipX,
+  userFlipY: !!chromosome.expectedFlipY,
+});
+
+/** Slot ids match the board: `slot-${pairIndex}-${slotIndex}` in clinical pair order. */
+const pairSlotGroups = (chromosomes: ChromosomeData[]) => {
+  const membersByPair = new Map<string, ChromosomeData[]>();
+  const firstAppearanceOrder: string[] = [];
+  chromosomes.forEach(chrom => {
+    if (!membersByPair.has(chrom.type)) {
+      membersByPair.set(chrom.type, []);
+      firstAppearanceOrder.push(chrom.type);
+    }
+    membersByPair.get(chrom.type)!.push(chrom);
+  });
+
+  const orderedPairIds = [...firstAppearanceOrder].sort((a, b) => comparePairIds(a, b, firstAppearanceOrder));
+  return orderedPairIds.map((pairId, pairIndex) => {
+    const members = membersByPair.get(pairId)!;
+    return {
+      pairId,
+      members,
+      slotIds: members.map((_, slotIndex) => `slot-${pairIndex}-${slotIndex}`),
+    };
+  });
+};
+
+/** Lowest-ordinal chromosome of every pair that has a partner. Locked on Match. */
+const scaffoldChromosomeIds = (chromosomes: ChromosomeData[]) => {
+  const ids = new Set<string>();
+  for (const group of pairSlotGroups(chromosomes)) {
+    if (group.members.length < 2) continue;
+    const first = group.members.reduce((best, current) => current.ordinal < best.ordinal ? current : best);
+    ids.add(first.id);
+  }
+  return ids;
+};
+
+const buildMatchBoard = (chromosomes: ChromosomeData[], seed: string) => {
+  const oriented = chromosomes.map(orientToExpected);
+  const placed: Record<string, ChromosomeData> = {};
+  const placedIds = new Set<string>();
+  for (const group of pairSlotGroups(oriented)) {
+    if (group.members.length < 2) continue;
+    const first = group.members.reduce((best, current) => current.ordinal < best.ordinal ? current : best);
+    placed[group.slotIds[0]] = first;
+    placedIds.add(first.id);
+  }
+  const remaining = oriented.filter(chromosome => !placedIds.has(chromosome.id));
+  return {
+    jumbled: shuffleChromosomes(remaining, seed),
+    placed,
+  };
+};
+
+/** Same preset orientation as Match, with every slot left empty. */
+const buildPairBoard = (chromosomes: ChromosomeData[], seed: string) => ({
+  jumbled: shuffleChromosomes(chromosomes.map(orientToExpected), seed),
+  placed: {} as Record<string, ChromosomeData>,
+});
+
+const buildFreshBoard = (levelId: number, chromosomes: ChromosomeData[], seed: string) => {
+  if (levelId === MATCH_LEVEL) return buildMatchBoard(chromosomes, seed);
+  if (levelId === PAIR_LEVEL) return buildPairBoard(chromosomes, seed);
+  return {
+    jumbled: shuffleChromosomes(chromosomes, seed),
+    placed: {} as Record<string, ChromosomeData>,
+  };
+};
+
 const serializeChromosome = (chromosome: ChromosomeData): SavedChromosomeState => ({
   id: chromosome.id,
   userRotation: normalizeRotation(chromosome.userRotation),
@@ -215,9 +313,73 @@ const hydrateKaryotypeState = (
   return used.size === extracted.length ? { jumbled, placed } : null;
 };
 
+/** Numbers the player has put on the spread, including ones on the wrong chromosome. */
+const hydrateLabelState = (
+  extracted: ChromosomeData[],
+  saved: unknown,
+  scaffoldIds: ReadonlySet<string>,
+): NumberPlacement[] | null => {
+  if (!saved || typeof saved !== 'object') return null;
+  const record = saved as { placements?: unknown; labeledIds?: unknown };
+  const byId = new Map(extracted.map(chromosome => [chromosome.id, chromosome]));
+  const available = new Map<string, number>();
+  for (const chromosome of extracted) {
+    if (scaffoldIds.has(chromosome.id)) continue;
+    available.set(chromosome.type, (available.get(chromosome.type) ?? 0) + 1);
+  }
+
+  const raw: NumberPlacement[] = [];
+  if (Array.isArray(record.placements)) {
+    for (const item of record.placements) {
+      if (!item || typeof item !== 'object') continue;
+      const chromosomeId = (item as { chromosomeId?: unknown }).chromosomeId;
+      const pairId = (item as { pairId?: unknown }).pairId;
+      if (typeof chromosomeId === 'string' && typeof pairId === 'string') {
+        raw.push({ chromosomeId, pairId });
+      }
+    }
+  } else if (Array.isArray(record.labeledIds)) {
+    for (const id of record.labeledIds) {
+      if (typeof id !== 'string') continue;
+      const chromosome = byId.get(id);
+      if (chromosome) raw.push({ chromosomeId: id, pairId: chromosome.type });
+    }
+  } else {
+    return null;
+  }
+
+  const used = new Map<string, number>();
+  const seen = new Set<string>();
+  const placements: NumberPlacement[] = [];
+  for (const item of raw) {
+    if (seen.has(item.chromosomeId) || scaffoldIds.has(item.chromosomeId) || !byId.has(item.chromosomeId)) continue;
+    const allowed = available.get(item.pairId) ?? 0;
+    const taken = used.get(item.pairId) ?? 0;
+    if (taken >= allowed) continue;
+    seen.add(item.chromosomeId);
+    used.set(item.pairId, taken + 1);
+    placements.push(item);
+  }
+  return placements;
+};
+
+const countCorrectLabels = (
+  chromosomes: ChromosomeData[],
+  placements: NumberPlacement[],
+  scaffoldIds: ReadonlySet<string>,
+) => {
+  const byId = new Map(chromosomes.map(chromosome => [chromosome.id, chromosome]));
+  let correct = scaffoldIds.size;
+  for (const placement of placements) {
+    const chromosome = byId.get(placement.chromosomeId);
+    if (chromosome && chromosome.type === placement.pairId && !scaffoldIds.has(chromosome.id)) correct++;
+  }
+  return correct;
+};
+
 // --- Components ---
 
-const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewing = false, displayScale = 1 }: { chromosome: ChromosomeData, className?: string, isDragging?: boolean, isReviewing?: boolean, displayScale?: number }) => {
+const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewing = false, displayScale = 1, locked = false, highlighted = false }: { chromosome: ChromosomeData, className?: string, isDragging?: boolean, isReviewing?: boolean, displayScale?: number, locked?: boolean, highlighted?: boolean }) => {
   if (chromosome.imageUrl) {
     const displayWidth = (chromosome.width ?? 0) * displayScale;
     const displayHeight = (chromosome.height ?? 0) * displayScale;
@@ -225,7 +387,8 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewi
     return (
       <div 
         className={cn(
-          "relative flex flex-col items-center justify-end p-1 cursor-grab active:cursor-grabbing group",
+          "relative flex flex-col items-center justify-end p-1 group",
+          locked ? "cursor-default" : "cursor-grab active:cursor-grabbing",
           isDragging && "opacity-50",
           className
         )}
@@ -235,7 +398,8 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewi
           className={cn(
             "block print:!drop-shadow-none print:!filter-none",
             !sized && "max-h-[72px] max-w-[36px] object-contain",
-            !isReviewing && "drop-shadow-md filter group-hover:drop-shadow-lg transition-shadow"
+            !isReviewing && !highlighted && "drop-shadow-md filter group-hover:drop-shadow-lg transition-shadow",
+            highlighted && "drop-shadow-[0_0_10px_rgba(14,165,233,0.95)]"
           )}
           draggable={false}
           alt={chromosome.type}
@@ -257,7 +421,8 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewi
   return (
     <div 
       className={cn(
-        "relative flex flex-col items-center justify-center p-1 cursor-grab active:cursor-grabbing",
+        "relative flex flex-col items-center justify-center p-1",
+        locked ? "cursor-default" : "cursor-grab active:cursor-grabbing",
         isDragging && "opacity-50",
         className
       )}
@@ -288,22 +453,19 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewi
   );
 };
 
-const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, displayScale }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void, isReviewing?: boolean, displayScale?: number }) => {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, displayScale, locked = false, allowOrientation = true, highlighted = false }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void, isReviewing?: boolean, displayScale?: number, locked?: boolean, allowOrientation?: boolean, highlighted?: boolean }) => {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id,
     data: chromosome,
+    disabled: locked,
   });
-
-  const style = transform ? {
-    transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`,
-  } : undefined;
 
   return (
     <div className="relative group/chrom">
-      <div ref={setNodeRef} style={style} {...listeners} {...attributes} className="z-10">
-        <ChromosomeVisual chromosome={chromosome} isDragging={isDragging} isReviewing={isReviewing} displayScale={displayScale} />
+      <div ref={setNodeRef} {...listeners} {...attributes} className="z-10">
+        <ChromosomeVisual chromosome={chromosome} isDragging={isDragging} isReviewing={isReviewing} displayScale={displayScale} locked={locked} highlighted={highlighted} />
       </div>
-      {onUpdate && chromosome.imageUrl && !isDragging && !isReviewing && (
+      {allowOrientation && onUpdate && chromosome.imageUrl && !isDragging && !isReviewing && !locked && (
         <div
           className="absolute -top-11 left-1/2 -translate-x-1/2 bg-white border border-slate-200 shadow-lg rounded-lg px-2 py-1.5 flex items-center gap-1.5 z-50 opacity-0 group-hover/chrom:opacity-100 focus-within:opacity-100 hover:opacity-100 transition-opacity cursor-default print:hidden"
           onPointerDown={(e) => e.stopPropagation()}
@@ -386,9 +548,9 @@ const DroppableSlot = ({ id, acceptType, children, isOccupied, state, isReviewin
   );
 };
 
-const RawSampleDroppable = ({ id, children }: { id: string, children: React.ReactNode }) => {
+const RawSampleDroppable = ({ id, children, className }: { id: string, children: React.ReactNode, className?: string }) => {
   const { setNodeRef } = useDroppable({ id });
-  return <div ref={setNodeRef} className="h-full min-h-0">{children}</div>;
+  return <div ref={setNodeRef} className={cn("h-full min-h-0", className)}>{children}</div>;
 };
 
 interface KaryotypePairProps {
@@ -398,6 +560,8 @@ interface KaryotypePairProps {
   onUpdateChromosome: (slotId: string, updates: Partial<ChromosomeData>) => void;
   isReviewing?: boolean;
   displayScale?: number;
+  lockedIds?: ReadonlySet<string>;
+  allowOrientation?: boolean;
 }
 
 /**
@@ -406,7 +570,7 @@ interface KaryotypePairProps {
  * no meaning - any chromosome belonging to this pair is valid in any of its
  * slots, as long as its own recorded orientation matches.
  */
-const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedChromosomes, onUpdateChromosome, isReviewing, displayScale }) => {
+const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedChromosomes, onUpdateChromosome, isReviewing, displayScale, lockedIds, allowOrientation = true }) => {
   const getSlotState = (chrom: ChromosomeData | undefined): 'empty' | 'wrong' | 'type-correct' | 'fully-correct' => {
     if (!chrom) return 'empty';
     if (chrom.type !== pairId) return 'wrong';
@@ -436,7 +600,17 @@ const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedCh
         {slots.map(({ slotId, chrom, state }) => (
           <div key={slotId}>
             <DroppableSlot id={slotId} acceptType={pairId} isOccupied={!!chrom} state={state} isReviewing={isReviewing}>
-              {chrom && <DraggableChromosome id={chrom.id} chromosome={chrom} onUpdate={(id, updates) => onUpdateChromosome(slotId, updates)} isReviewing={isReviewing} displayScale={displayScale} />}
+              {chrom && (
+                <DraggableChromosome
+                  id={chrom.id}
+                  chromosome={chrom}
+                  onUpdate={(id, updates) => onUpdateChromosome(slotId, updates)}
+                  isReviewing={isReviewing}
+                  displayScale={displayScale}
+                  locked={lockedIds?.has(chrom.id)}
+                  allowOrientation={allowOrientation}
+                />
+              )}
             </DroppableSlot>
           </div>
         ))}
@@ -554,6 +728,24 @@ export const hasAnnotations = (xml?: string): boolean => {
   }
 };
 
+const SAMPLE_LIST_COLUMNS = 'id, original_url, user_id, uploader_email, bucket_id, karyotype, annotation_complete, pair_note_overrides, difficulty';
+
+async function fetchSampleXml(id: string): Promise<string | undefined> {
+  const { data, error } = await supabase
+    .from('samples')
+    .select('xml')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.xml ?? undefined;
+}
+
+async function sampleWithXml(image: AdminImage): Promise<AdminImage> {
+  if (image.xml !== undefined) return image;
+  const xml = await fetchSampleXml(image.id);
+  return { ...image, xml: xml ?? '' };
+}
+
 export const extractChromosomes = async (imgObj: AdminImage): Promise<ChromosomeData[]> => {
   try {
     if (!imgObj.xml) return [];
@@ -570,8 +762,14 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
     const img = new Image();
     img.crossOrigin = "anonymous";
     await new Promise((resolve, reject) => {
-      img.onload = resolve;
-      img.onerror = reject;
+      const timer = window.setTimeout(() => reject(new Error('Metaphase image load timed out')), 20000);
+      const done = (ok: boolean) => {
+        window.clearTimeout(timer);
+        if (ok) resolve(null);
+        else reject(new Error('Metaphase image failed to load'));
+      };
+      img.onload = () => done(true);
+      img.onerror = () => done(false);
       img.src = imgUrl;
     });
 
@@ -591,6 +789,7 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
       const rotation = normalizeRotation(parseFloat(el.getAttribute('rotation') || '0'));
       const flipX = el.getAttribute('flipX') === 'true';
       const flipY = el.getAttribute('flipY') === 'true';
+      const info = el.querySelector('info')?.textContent?.trim() || undefined;
 
       const pointEls = el.querySelectorAll('point');
       if (pointEls.length < 3) return;
@@ -633,6 +832,8 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
         expectedRotation: rotation,
         expectedFlipX: flipX,
         expectedFlipY: flipY,
+        info,
+        points,
         userRotation: 0,
         userFlipX: false,
         userFlipY: false
@@ -673,6 +874,35 @@ interface AdminImage {
   bucketId?: string | null;
   karyotype?: string;
   annotationComplete?: boolean;
+  pairNoteOverrides?: PairNoteMap;
+  difficulty?: SpreadDifficulty | null;
+}
+
+function DifficultyBadge({
+  difficulty,
+  unsetLabel,
+}: {
+  difficulty: SpreadDifficulty | null | undefined;
+  unsetLabel?: string;
+}) {
+  if (!difficulty) {
+    if (!unsetLabel) return null;
+    return (
+      <span className="inline-flex items-center rounded-full bg-slate-100 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-slate-400">
+        {unsetLabel}
+      </span>
+    );
+  }
+  return (
+    <span className={cn(
+      'inline-flex items-center rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide',
+      difficulty === 'easy' && 'bg-emerald-100 text-emerald-700',
+      difficulty === 'moderate' && 'bg-amber-100 text-amber-700',
+      difficulty === 'hard' && 'bg-rose-100 text-rose-700',
+    )}>
+      {DIFFICULTY_LABELS[difficulty]}
+    </span>
+  );
 }
 
 const formatBucketLabel = (bucket: Bucket) =>
@@ -849,43 +1079,8 @@ interface AdminPanelProps {
   setImages: React.Dispatch<React.SetStateAction<AdminImage[]>>;
   session: Session | null;
   userRole: 'SUPER ADMIN' | 'ADMIN' | 'USER' | null;
-}
-
-function useFirstSpreadLoaded(images: AdminImage[], metadataLoaded: boolean) {
-  const firstImageUrl = images[0]?.originalUrl;
-  const [firstSpreadLoaded, setFirstSpreadLoaded] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    if (!metadataLoaded) {
-      setFirstSpreadLoaded(false);
-      return;
-    }
-
-    if (!firstImageUrl) {
-      setFirstSpreadLoaded(true);
-      return;
-    }
-
-    setFirstSpreadLoaded(false);
-    const image = new Image();
-    const finish = () => {
-      if (!cancelled) setFirstSpreadLoaded(true);
-    };
-    image.onload = finish;
-    // Do not leave the panel permanently blocked by an unavailable spread.
-    image.onerror = finish;
-    image.src = firstImageUrl;
-
-    return () => {
-      cancelled = true;
-      image.onload = null;
-      image.onerror = null;
-    };
-  }, [firstImageUrl, metadataLoaded]);
-
-  return metadataLoaded && firstSpreadLoaded;
+  bucketPairDescriptions: Record<string, PairNoteMap>;
+  onBucketPairDescriptionsChange: (bucketId: string, notes: PairNoteMap) => void;
 }
 
 /** Prefer the bucket under the pointer; fall back to nearest list row only when needed. */
@@ -1028,9 +1223,180 @@ const DroppableBucketListItem: React.FC<{
   );
 };
 
-const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, setImages, session, userRole }) => {
+const BucketPairCsvControls = ({
+  bucket,
+  samples,
+  notes,
+  onChange,
+}: {
+  bucket: Bucket;
+  samples: AdminImage[];
+  notes: PairNoteMap;
+  onChange: (notes: PairNoteMap) => void;
+}) => {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const downloadTemplate = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const xmls = await Promise.all(samples.map(async sample => {
+        if (sample.xml !== undefined) return sample.xml;
+        try {
+          return await fetchSampleXml(sample.id);
+        } catch {
+          return undefined;
+        }
+      }));
+      const customIds = customPairIdsFromXml(xmls.filter((xml): xml is string => !!xml));
+      downloadTextFile(
+        `bucket-${bucket.bucketNumber}-pair-descriptions.csv`,
+        buildPairDescriptionTemplate(customIds),
+      );
+    } catch (err: any) {
+      setError(err.message || 'Could not build the template.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uploadCsv = async (file: File) => {
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const parsed = parsePairDescriptionCsv(await file.text());
+      if (parsed.headerError) {
+        setError(parsed.headerError);
+        return;
+      }
+      if (parsed.rows.length === 0) {
+        const first = parsed.errors[0];
+        setError(first ? `Row ${first.line}: ${first.message}` : 'The CSV has no pair descriptions.');
+        return;
+      }
+
+      const clearing = parsed.rows.filter(row => !row.description && notes[row.pairId]);
+      if (clearing.length > 0) {
+        const noun = clearing.length === 1 ? 'description' : 'descriptions';
+        const ok = window.confirm(`This file clears ${clearing.length} ${noun} already saved on this bucket. Continue?`);
+        if (!ok) return;
+      }
+
+      const toSet = parsed.rows.filter(row => row.description);
+      const toClear = parsed.rows.filter(row => !row.description).map(row => row.pairId);
+      let next = { ...notes };
+
+      if (toClear.length > 0) {
+        const { error: deleteError } = await supabase
+          .from('bucket_pair_descriptions')
+          .delete()
+          .eq('bucket_id', bucket.id)
+          .in('pair_id', toClear);
+        if (deleteError) throw deleteError;
+        for (const pairId of toClear) delete next[pairId];
+        onChange({ ...next });
+      }
+
+      if (toSet.length > 0) {
+        const { error: upsertError } = await supabase
+          .from('bucket_pair_descriptions')
+          .upsert(
+            toSet.map(row => ({
+              bucket_id: bucket.id,
+              pair_id: row.pairId,
+              description: row.description,
+            })),
+            { onConflict: 'bucket_id,pair_id' },
+          );
+        if (upsertError) throw upsertError;
+        next = { ...next };
+        for (const row of toSet) next[row.pairId] = row.description;
+        onChange(next);
+      }
+
+      const touched = new Set(parsed.rows.map(row => row.pairId));
+      const kept = samples.flatMap(sample => {
+        const pairIds = Object.keys(sample.pairNoteOverrides ?? {}).filter(pairId => touched.has(pairId));
+        if (pairIds.length === 0) return [];
+        return [`${sample.id.slice(0, 8)} (${pairIds.join(', ')})`];
+      });
+
+      const lines = [
+        `Saved ${toSet.length} description${toSet.length === 1 ? '' : 's'}. Cleared ${toClear.length}.`,
+      ];
+      if (parsed.duplicatePairIds.length > 0) {
+        lines.push(`Repeated pair ${parsed.duplicatePairIds.join(', ')}; the last row was used.`);
+      }
+      for (const rowError of parsed.errors) {
+        lines.push(`Row ${rowError.line}: ${rowError.message}`);
+      }
+      if (kept.length > 0) {
+        lines.push(`These spreads keep a custom sentence the CSV did not change: ${kept.join('; ')}.`);
+      }
+      setMessage(lines);
+    } catch (err: any) {
+      setError(err.message || 'Could not save the CSV.');
+    } finally {
+      setBusy(false);
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  };
+
+  return (
+    <div className="mb-4 rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="text-xs font-bold text-slate-700 mr-auto">Pair descriptions</p>
+        <button
+          type="button"
+          onClick={() => { void downloadTemplate(); }}
+          disabled={busy}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-bold text-slate-600 hover:border-sky-300 hover:text-sky-700 disabled:opacity-50"
+        >
+          <Download className="w-3.5 h-3.5" />
+          Download template
+        </button>
+        <button
+          type="button"
+          onClick={() => fileRef.current?.click()}
+          disabled={busy}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-2.5 py-1.5 text-[11px] font-bold text-white hover:bg-slate-800 disabled:opacity-50"
+        >
+          <Upload className="w-3.5 h-3.5" />
+          {busy ? 'Working...' : 'Upload CSV'}
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".csv,text/csv"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) void uploadCsv(file);
+          }}
+        />
+      </div>
+      <p className="text-[11px] text-slate-400 leading-relaxed">
+        Columns: Chromosomal Pair Number, Description. A sentence here is used by every spread in this bucket unless that spread has its own sentence.
+      </p>
+      {error && <p className="text-[11px] font-medium text-red-600">{error}</p>}
+      {message && (
+        <div className="space-y-1">
+          {message.map(line => (
+            <p key={line} className="text-[11px] text-slate-600">{line}</p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, setImages, session, userRole, bucketPairDescriptions, onBucketPairDescriptionsChange }) => {
   const canCreateBuckets = userRole === 'SUPER ADMIN';
-  const firstSpreadLoaded = useFirstSpreadLoaded(images, imagesLoaded);
+  const canManagePairNotes = userRole === 'ADMIN' || userRole === 'SUPER ADMIN';
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [moveError, setMoveError] = useState<string | null>(null);
@@ -1047,7 +1413,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [annotateImageUrl, setAnnotateImageUrl] = useState<string | null>(null);
   const [annotateImageId, setAnnotateImageId] = useState<string | null>(null);
-  const [statusFilter, setStatusFilter] = useState<'all' | AnnotationStatus>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | AnnotationStatus | 'unrated'>('all');
   const [pendingDelete, setPendingDelete] = useState<AdminImage | null>(null);
   const [deletingSample, setDeletingSample] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -1259,21 +1625,33 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
     setImages(prev => prev.map(img => img.id === imageId ? { ...img, annotationComplete: complete } : img));
   };
 
-  const filterByStatus = (list: AdminImage[]) =>
-    statusFilter === 'all'
-      ? list
-      : list.filter(img => getAnnotationStatus(img.xml, img.annotationComplete) === statusFilter);
+  const persistSpreadDifficulty = async (imageId: string, difficulty: SpreadDifficulty | null) => {
+    const { error } = await supabase
+      .from('samples')
+      .update({ difficulty })
+      .eq('id', imageId);
+    if (error) throw error;
+    setImages(prev => prev.map(img => img.id === imageId ? { ...img, difficulty } : img));
+  };
+
+  const filterByStatus = (list: AdminImage[]) => {
+    if (statusFilter === 'all') return list;
+    if (statusFilter === 'unrated') return list.filter(img => !img.difficulty);
+    return list.filter(img => getAnnotationStatus(img.xml, img.annotationComplete) === statusFilter);
+  };
 
   const renderStatusFilters = (list: AdminImage[]) => {
     const counts: Record<AnnotationStatus, number> = { never_started: 0, in_progress: 0, complete: 0 };
     list.forEach(img => {
       counts[getAnnotationStatus(img.xml, img.annotationComplete)]++;
     });
-    const chips: { id: 'all' | AnnotationStatus; label: string; count: number }[] = [
+    const unrated = list.filter(img => !img.difficulty).length;
+    const chips: { id: 'all' | AnnotationStatus | 'unrated'; label: string; count: number }[] = [
       { id: 'all', label: 'All', count: list.length },
       { id: 'never_started', label: 'Not started', count: counts.never_started },
       { id: 'in_progress', label: 'In progress', count: counts.in_progress },
       { id: 'complete', label: 'Complete', count: counts.complete },
+      { id: 'unrated', label: 'Unrated', count: unrated },
     ];
     return (
       <div className="flex flex-nowrap items-center gap-1.5 mb-4 overflow-x-auto scrollbar-hide">
@@ -1301,8 +1679,9 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
   };
 
   const renderSampleCard = (img: AdminImage) => {
-    const status = getAnnotationStatus(img.xml, img.annotationComplete);
-    const labeled = countLabeledChromosomes(img.xml);
+    const xmlKnown = img.xml !== undefined;
+    const status = xmlKnown ? getAnnotationStatus(img.xml, img.annotationComplete) : 'never_started';
+    const labeled = xmlKnown ? countLabeledChromosomes(img.xml) : null;
     const showDelete = canDeleteSample(img);
 
     return (
@@ -1312,12 +1691,16 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
           "bg-white rounded-xl shadow-sm overflow-hidden group relative aspect-square flex flex-col border-2",
           status === 'complete' ? "border-emerald-500" : status === 'in_progress' ? "border-amber-400" : "border-slate-200"
         )}
-        onClick={(e) => {
+        onClick={async (e) => {
           if ((e.target as HTMLElement).closest('button, [data-no-dnd]')) return;
           const url = img.originalUrl;
           if (!url) return;
+          const sample = await sampleWithXml(img);
+          if (sample.xml !== img.xml) {
+            setImages(prev => prev.map(item => item.id === sample.id ? sample : item));
+          }
           setAnnotateImageUrl(url);
-          setAnnotateImageId(img.id);
+          setAnnotateImageId(sample.id);
         }}
       >
         <div className="relative flex-1 bg-slate-100 overflow-hidden">
@@ -1330,12 +1713,14 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
             className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
           />
 
-          <div
-            className="absolute top-1.5 right-1.5 z-10 h-4 min-w-4 px-1 rounded-full bg-black/70 text-white text-[8px] leading-none font-mono font-bold flex items-center justify-center tabular-nums pointer-events-none"
-            title={`${labeled} chromosome${labeled === 1 ? '' : 's'} annotated`}
-          >
-            {labeled}
-          </div>
+          {labeled !== null && (
+            <div
+              className="absolute top-1.5 right-1.5 z-10 h-4 min-w-4 px-1 rounded-full bg-black/70 text-white text-[8px] leading-none font-mono font-bold flex items-center justify-center tabular-nums pointer-events-none"
+              title={`${labeled} chromosome${labeled === 1 ? '' : 's'} annotated`}
+            >
+              {labeled}
+            </div>
+          )}
 
           <div className="absolute inset-0 pointer-events-none bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
             <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 w-9 h-9 flex items-center justify-center bg-white/95 backdrop-blur-sm rounded-full shadow-xl">
@@ -1348,6 +1733,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
           <p className="text-[10px] font-mono font-bold text-slate-600 text-center w-full leading-tight break-words">
             {img.karyotype || 'No karyotype set'}
           </p>
+          <DifficultyBadge difficulty={img.difficulty} unsetLabel="Unrated" />
           <div className="flex items-center justify-center gap-0.5">
             <button
               type="button"
@@ -1368,11 +1754,15 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
                 type="button"
                 data-no-dnd
                 onPointerDown={stopCardDrag}
-                onClick={(e) => {
+                onClick={async (e) => {
                   e.preventDefault();
                   e.stopPropagation();
                   setDeleteError(null);
-                  setPendingDelete(img);
+                  const sample = await sampleWithXml(img);
+                  if (sample.xml !== img.xml) {
+                    setImages(prev => prev.map(item => item.id === sample.id ? sample : item));
+                  }
+                  setPendingDelete(sample);
                 }}
                 title="Delete this metaphase spread"
                 className="p-1 rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors"
@@ -1451,7 +1841,8 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
         uploaderEmail: session.user.email,
         bucketId: selectedBucketId,
         karyotype,
-        annotationComplete: false
+        annotationComplete: false,
+        pairNoteOverrides: {},
       };
       
       setImages(prev => [newImage, ...prev]);
@@ -1872,7 +2263,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
           </div>
 
           <div className="relative bg-slate-50 rounded-3xl p-8 border border-slate-100 flex flex-col h-full max-h-[800px] overflow-hidden">
-            {!firstSpreadLoaded && (
+            {!imagesLoaded && (
               <div className="absolute inset-0 z-20 bg-slate-50 flex flex-col items-center justify-center">
                 <Loader className="w-12 h-12 text-sky-500 animate-spin" />
                 <p className="mt-4 text-sm font-bold text-slate-600">Loading metaphase spreads...</p>
@@ -1935,6 +2326,15 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
                         editable={canCreateBuckets}
                         onUpdate={(name, description) => handleUpdateBucket(bucket.id, name, description)}
                       >
+                        {canManagePairNotes && (
+                          <BucketPairCsvControls
+                            key={bucket.id}
+                            bucket={bucket}
+                            samples={bucketImages}
+                            notes={bucketPairDescriptions[bucket.id] ?? {}}
+                            onChange={(notes) => onBucketPairDescriptionsChange(bucket.id, notes)}
+                          />
+                        )}
                         {bucketImages.length === 0 ? (
                           <div className="flex flex-col items-center justify-center py-12 text-slate-300 text-center">
                             <p className="text-xs font-medium">No samples in this bucket yet</p>
@@ -1983,10 +2383,19 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
           initialXml={images.find(img => img.id === annotateImageId)?.xml}
           karyotype={images.find(img => img.id === annotateImageId)?.karyotype}
           annotationComplete={images.find(img => img.id === annotateImageId)?.annotationComplete}
-          onSave={async (xml) => {
+          difficulty={images.find(img => img.id === annotateImageId)?.difficulty}
+          bucketPairNotes={(() => {
+            const bucketId = images.find(img => img.id === annotateImageId)?.bucketId;
+            return bucketId ? bucketPairDescriptions[bucketId] : undefined;
+          })()}
+          initialPairNoteOverrides={images.find(img => img.id === annotateImageId)?.pairNoteOverrides}
+          onSave={async (xml, pairNoteOverrides) => {
             try {
               const labeled = countLabeledChromosomes(xml);
-              const payload: { xml: string; annotation_complete?: boolean } = { xml };
+              const payload: { xml: string; pair_note_overrides: PairNoteMap; annotation_complete?: boolean } = {
+                xml,
+                pair_note_overrides: pairNoteOverrides,
+              };
               if (labeled === 0) payload.annotation_complete = false;
 
               const { error } = await supabase
@@ -1996,7 +2405,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
               
               if (error) throw error;
               setImages(prev => prev.map(img => img.id === annotateImageId
-                ? { ...img, xml, ...(labeled === 0 ? { annotationComplete: false } : {}) }
+                ? { ...img, xml, pairNoteOverrides, ...(labeled === 0 ? { annotationComplete: false } : {}) }
                 : img));
             } catch (err) {
               console.error('Failed to save annotations to DB:', err);
@@ -2010,6 +2419,15 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
             } catch (err) {
               console.error('Failed to update annotation status:', err);
               alert('Failed to update annotation status.');
+              throw err;
+            }
+          }}
+          onSetDifficulty={async (difficulty) => {
+            try {
+              await persistSpreadDifficulty(annotateImageId, difficulty);
+            } catch (err) {
+              console.error('Failed to update spread difficulty:', err);
+              alert('Failed to update difficulty.');
               throw err;
             }
           }}
@@ -2042,21 +2460,36 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
 interface SpreadSelectionScreenProps {
   images: AdminImage[];
   imagesLoaded: boolean;
-  progressBySample: Record<string, KaryotypeProgressSummary>;
+  loadError: string | null;
+  progressBySample: Record<string, SampleLevelProgress>;
   onSelect: (img: AdminImage, extracted: ChromosomeData[]) => Promise<void>;
   onBack: () => void;
 }
 
-const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, imagesLoaded, progressBySample, onSelect, onBack }) => {
-  const firstSpreadLoaded = useFirstSpreadLoaded(images, imagesLoaded);
+const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, imagesLoaded, loadError, progressBySample, onSelect, onBack }) => {
   const [extractingId, setExtractingId] = useState<string | null>(null);
+  const [difficultyFilter, setDifficultyFilter] = useState<'all' | SpreadDifficulty>('all');
+  const difficultyCounts = useMemo(() => {
+    const counts: Record<SpreadDifficulty, number> = { easy: 0, moderate: 0, hard: 0 };
+    for (const img of images) {
+      if (img.difficulty) counts[img.difficulty] += 1;
+    }
+    return counts;
+  }, [images]);
+  const visibleImages = difficultyFilter === 'all'
+    ? images
+    : images.filter(img => img.difficulty === difficultyFilter);
 
   const handleSelect = async (img: AdminImage) => {
     if (extractingId) return;
     setExtractingId(img.id);
-    const extracted = await extractChromosomes(img);
-    await onSelect(img, extracted);
-    setExtractingId(null);
+    try {
+      const sample = await sampleWithXml(img);
+      const extracted = await extractChromosomes(sample);
+      await onSelect(sample, extracted);
+    } finally {
+      setExtractingId(null);
+    }
   };
 
   return (
@@ -2070,7 +2503,7 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
         <header className="flex items-center justify-between mb-12">
           <div>
             <h2 className="text-4xl font-black text-slate-900 tracking-tighter">Select Sample</h2>
-            <p className="text-slate-500 font-medium mt-2">Choose a metaphase spread for karyotyping</p>
+            <p className="text-slate-500 font-medium mt-2">Choose a metaphase spread to start a level</p>
           </div>
           <button onClick={onBack} className="p-3 hover:bg-slate-200 rounded-full transition-colors text-slate-500">
             <X className="w-6 h-6" />
@@ -2078,28 +2511,67 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
         </header>
 
         <div className="relative min-h-64 rounded-3xl overflow-hidden">
-          {!firstSpreadLoaded && (
+          {!imagesLoaded && !loadError ? (
             <div className="absolute inset-0 z-20 bg-slate-50 flex flex-col items-center justify-center">
               <Loader className="w-12 h-12 text-sky-500 animate-spin" />
               <p className="mt-4 text-sm font-bold text-slate-600">Loading metaphase spreads...</p>
             </div>
-          )}
-          {images.length === 0 ? (
+          ) : loadError ? (
+            <div className="flex flex-col items-center justify-center h-64 text-slate-400 bg-white rounded-3xl border border-red-200 shadow-sm p-8 text-center">
+              <p className="text-lg font-bold text-slate-700">Could not load metaphase spreads</p>
+              <p className="text-sm mt-1 text-red-600">{loadError}</p>
+            </div>
+          ) : images.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-64 text-slate-400 bg-white rounded-3xl border border-slate-200 shadow-sm p-8 text-center">
               <ImageIcon className="w-12 h-12 mb-4 opacity-50 mx-auto" />
               <p className="text-lg font-bold text-slate-700">No metaphase spreads available</p>
               <p className="text-sm mt-1">Please ask the administrator to upload and annotate samples.</p>
             </div>
           ) : (
+            <>
+            <div className="flex flex-wrap items-center gap-2 mb-6">
+              {(['all', ...DIFFICULTIES] as const).map(id => {
+                const count = id === 'all' ? images.length : difficultyCounts[id];
+                const selected = difficultyFilter === id;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => setDifficultyFilter(id)}
+                    className={cn(
+                      'px-3 py-1.5 rounded-full text-xs font-bold transition-colors',
+                      selected
+                        ? id === 'easy'
+                          ? 'bg-emerald-500 text-white'
+                          : id === 'moderate'
+                            ? 'bg-amber-500 text-white'
+                            : id === 'hard'
+                              ? 'bg-rose-500 text-white'
+                              : 'bg-slate-900 text-white'
+                        : 'bg-white border border-slate-200 text-slate-500 hover:bg-slate-100'
+                    )}
+                  >
+                    {id === 'all' ? 'All' : DIFFICULTY_LABELS[id]} {count}
+                  </button>
+                );
+              })}
+            </div>
+            {visibleImages.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-64 text-slate-400 bg-white rounded-3xl border border-slate-200 shadow-sm p-8 text-center">
+                <p className="text-lg font-bold text-slate-700">
+                  No {difficultyFilter === 'all' ? '' : `${DIFFICULTY_LABELS[difficultyFilter].toLowerCase()} `}spreads
+                </p>
+              </div>
+            ) : (
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
-              {images.map(img => {
+              {visibleImages.map(img => {
                 const savedProgress = progressBySample[img.id];
                 return (
                 <div
                   key={img.id}
                   onClick={() => handleSelect(img)}
                   className={cn(
-                    "bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden cursor-pointer group hover:shadow-xl hover:border-sky-300 hover:-translate-y-1 transition-all flex flex-col aspect-square relative",
+                    "bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden cursor-pointer group hover:shadow-xl hover:border-sky-300 hover:-translate-y-1 transition-all flex flex-col relative",
                     extractingId === img.id && "pointer-events-none opacity-80"
                   )}
                 >
@@ -2109,7 +2581,7 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
                       <span className="text-xs font-bold text-slate-700 bg-white px-2 py-1 rounded shadow-sm">Extracting...</span>
                     </div>
                   )}
-                  <div className="relative flex-1 bg-slate-100 overflow-hidden">
+                  <div className="relative h-40 bg-slate-100 overflow-hidden">
                     <LazyThumb
                       src={img.originalUrl}
                       alt="Spread"
@@ -2123,16 +2595,34 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
                     <div>
                       <p className="text-[10px] font-mono text-slate-400 font-bold">SAMPLE ID</p>
                       <p className="font-bold text-sm text-slate-700 truncate w-32">{img.id.slice(0, 12)}</p>
-                      {savedProgress && (
-                        <p className={cn(
-                          "mt-1 text-[10px] font-bold",
-                          savedProgress.status === 'complete' ? "text-emerald-600" : "text-sky-600"
-                        )}>
-                          {savedProgress.status === 'complete'
-                            ? 'Completed'
-                            : `Resume ${savedProgress.correctCount}/${savedProgress.totalCount}`}
-                        </p>
+                      {img.difficulty && (
+                        <div className="mt-1">
+                          <DifficultyBadge difficulty={img.difficulty} />
+                        </div>
                       )}
+                      <div className="mt-1 space-y-0.5">
+                        {LEVELS.map(level => {
+                          if (level.id === LEARN_LEVEL) {
+                            return (
+                              <p key={level.id} className="text-[10px] font-bold text-slate-400">
+                                {level.title}
+                              </p>
+                            );
+                          }
+                          const summary = savedProgress?.[level.id];
+                          return (
+                            <p
+                              key={level.id}
+                              className={cn(
+                                "text-[10px] font-bold",
+                                summary?.status === 'complete' ? "text-emerald-600" : summary ? "text-sky-600" : "text-slate-400"
+                              )}
+                            >
+                              {level.label} {level.title} · {levelProgressLabel(summary)}
+                            </p>
+                          );
+                        })}
+                      </div>
                     </div>
                     <div className="w-8 h-8 rounded-full bg-slate-50 flex items-center justify-center group-hover:bg-sky-50 transition-colors">
                       <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-sky-500" />
@@ -2142,12 +2632,62 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
                 );
               })}
             </div>
+            )}
+            </>
           )}
         </div>
       </div>
     </motion.div>
   );
 };
+
+function LevelSidebarButton({
+  level,
+  summary,
+  current,
+  busy,
+  disabled,
+  onStart,
+}: {
+  level: (typeof LEVELS)[number];
+  summary?: KaryotypeProgressSummary;
+  current: boolean;
+  busy: boolean;
+  disabled: boolean;
+  onStart: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={level.description}
+      disabled={disabled}
+      onClick={onStart}
+      className={cn(
+        "shrink-0 text-left rounded-xl border px-3 py-2 min-w-36 lg:min-w-0 transition-colors",
+        current
+          ? "border-sky-400 bg-sky-50 disabled:opacity-100 cursor-default"
+          : "border-slate-200 bg-white hover:border-sky-300 hover:bg-sky-50/40",
+        disabled && !current && "opacity-70"
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[10px] font-mono font-bold tracking-widest text-slate-400">
+          LEVEL {level.label}
+        </p>
+        {busy && <Loader className="w-3.5 h-3.5 text-sky-500 animate-spin shrink-0" />}
+      </div>
+      <p className="text-sm font-black text-slate-900">{level.title}</p>
+      {level.id !== LEARN_LEVEL && (
+        <p className={cn(
+          "text-[10px] font-bold mt-0.5",
+          summary?.status === 'complete' ? "text-emerald-600" : summary ? "text-sky-600" : "text-slate-400"
+        )}>
+          {levelProgressLabel(summary)}
+        </p>
+      )}
+    </button>
+  );
+}
 
 // --- Main App ---
 
@@ -2341,27 +2881,386 @@ const AuthForm = () => {
   );
 };
 
+type AppScreen = 'welcome' | 'select' | 'levels' | 'learning' | 'playing' | 'admin';
+
+interface ScreenHistoryEntry {
+  screen: AppScreen;
+  depth: number;
+}
+
+/** Steps above Welcome. Back jumps use this so they stop at the first in-app screen. */
+const SCREEN_DEPTH: Record<AppScreen, number> = {
+  welcome: 0,
+  select: 1,
+  admin: 1,
+  levels: 2,
+  learning: 2,
+  playing: 2,
+};
+
+function isAppScreen(value: unknown): value is AppScreen {
+  return value === 'welcome' || value === 'select' || value === 'levels'
+    || value === 'learning' || value === 'playing' || value === 'admin';
+}
+
+function readScreenHistory(state: unknown): ScreenHistoryEntry | null {
+  if (!state || typeof state !== 'object') return null;
+  const entry = state as Partial<ScreenHistoryEntry>;
+  if (!isAppScreen(entry.screen) || typeof entry.depth !== 'number') return null;
+  return { screen: entry.screen, depth: entry.depth };
+}
+
+function LevelBriefModal({
+  level,
+  onClose,
+}: {
+  level: (typeof LEVELS)[number];
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      event.stopPropagation();
+      if (event.key !== 'Escape' && event.key !== 'Enter') return;
+      event.preventDefault();
+      onClose();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[460] flex items-center justify-center bg-slate-900/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="level-brief-title"
+        className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <p className="font-mono text-[10px] font-bold tracking-widest text-slate-400">LEVEL {level.label}</p>
+        <h2 id="level-brief-title" className="mt-1 text-xl font-black text-slate-900">{level.title}</h2>
+        <ul className="mt-4 space-y-2.5">
+          {level.pointers.map((point) => (
+            <li key={point} className="flex gap-2.5 text-sm leading-snug text-slate-600">
+              <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-sky-500" />
+              <span>{point}</span>
+            </li>
+          ))}
+        </ul>
+        <button
+          type="button"
+          onClick={onClose}
+          className="mt-6 w-full rounded-xl bg-slate-900 py-3 text-sm font-bold text-white transition-colors hover:bg-slate-800"
+        >
+          Start
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SourceSpreadModal({ imageUrl, onClose }: { imageUrl: string; onClose: () => void }) {
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [panning, setPanning] = useState(false);
+  const zoomRef = useRef(1);
+  const panRef = useRef(pan);
+  const panDrag = useRef<{ pointerId: number; x: number; y: number; panX: number; panY: number } | null>(null);
+  zoomRef.current = zoom;
+  panRef.current = pan;
+
+  const applyZoom = (next: number) => {
+    const clamped = Math.min(6, Math.max(1, next));
+    zoomRef.current = clamped;
+    setZoom(clamped);
+    if (clamped <= 1) {
+      panRef.current = { x: 0, y: 0 };
+      setPan({ x: 0, y: 0 });
+    }
+  };
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onClose]);
+
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      applyZoom(zoomRef.current * Math.exp(-event.deltaY * 0.0015));
+    };
+    frame.addEventListener('wheel', onWheel, { passive: false });
+    return () => frame.removeEventListener('wheel', onWheel);
+  }, []);
+
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || zoomRef.current <= 1) return;
+    if ((event.target as HTMLElement).closest('button')) return;
+    panDrag.current = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      panX: panRef.current.x,
+      panY: panRef.current.y,
+    };
+    setPanning(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = panDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const next = {
+      x: drag.panX + event.clientX - drag.x,
+      y: drag.panY + event.clientY - drag.y,
+    };
+    panRef.current = next;
+    setPan(next);
+  };
+
+  const endPan = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (panDrag.current?.pointerId !== event.pointerId) return;
+    panDrag.current = null;
+    setPanning(false);
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center p-4"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Metaphase spread"
+    >
+      <div
+        className="relative w-full h-full max-w-6xl"
+        onClick={event => event.stopPropagation()}
+      >
+        <div
+          ref={frameRef}
+          className={cn(
+            'absolute inset-0 overflow-hidden rounded-2xl bg-slate-950 touch-none',
+            zoom > 1 && (panning ? 'cursor-grabbing' : 'cursor-grab')
+          )}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={endPan}
+          onPointerCancel={endPan}
+        >
+          <div className="absolute inset-0 flex items-center justify-center">
+            <img
+              src={imageUrl}
+              alt="Metaphase spread"
+              draggable={false}
+              className="max-h-full max-w-full object-contain select-none"
+              style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+            />
+          </div>
+          <p className="absolute bottom-3 left-4 text-[10px] font-bold tracking-wide text-white/70 pointer-events-none">
+            Scroll to zoom{zoom > 1 ? ' · drag to pan' : ''}
+          </p>
+        </div>
+        <div className="absolute top-3 right-3 flex items-center gap-1 rounded-xl bg-white/95 p-1 shadow-lg">
+          <button
+            type="button"
+            onClick={() => applyZoom(zoom / 1.25)}
+            disabled={zoom <= 1}
+            className="p-2 rounded-lg text-slate-600 hover:bg-slate-100 disabled:opacity-40"
+            title="Zoom out"
+            aria-label="Zoom out"
+          >
+            <ZoomOut className="w-4 h-4" />
+          </button>
+          <span className="w-12 text-center text-[10px] font-mono font-bold text-slate-500">
+            {Math.round(zoom * 100)}%
+          </span>
+          <button
+            type="button"
+            onClick={() => applyZoom(zoom * 1.25)}
+            disabled={zoom >= 6}
+            className="p-2 rounded-lg text-slate-600 hover:bg-slate-100 disabled:opacity-40"
+            title="Zoom in"
+            aria-label="Zoom in"
+          >
+            <ZoomIn className="w-4 h-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => applyZoom(1)}
+            className="p-2 rounded-lg text-slate-600 hover:bg-slate-100"
+            title="Reset view"
+            aria-label="Reset view"
+          >
+            <Maximize className="w-4 h-4" />
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="p-2 rounded-lg text-slate-600 hover:bg-slate-100"
+            title="Close"
+            aria-label="Close"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Chromy() {
   const [session, setSession] = useState<Session | null>(null);
   const [userRole, setUserRole] = useState<'SUPER ADMIN' | 'ADMIN' | 'USER' | null>(null);
   const [images, setImages] = useState<AdminImage[]>([]);
+  const imagesRef = useRef(images);
+  imagesRef.current = images;
+  const annotationSignatureCacheRef = useRef(new Map<string, { xml: string; signature: string }>());
+  const [bucketPairDescriptions, setBucketPairDescriptions] = useState<Record<string, PairNoteMap>>({});
   const [imagesLoaded, setImagesLoaded] = useState(false);
-  const [gameState, setGameState] = useState<'welcome' | 'select' | 'playing' | 'admin'>('welcome');
+  const [samplesLoadError, setSamplesLoadError] = useState<string | null>(null);
+  const [gameState, setGameState] = useState<AppScreen>('welcome');
   const [selectedImage, setSelectedImage] = useState<AdminImage | null>(null);
+  const [levelChromosomes, setLevelChromosomes] = useState<ChromosomeData[]>([]);
+  const [startingLevel, setStartingLevel] = useState<number | null>(null);
+  const [activeLevel, setActiveLevel] = useState<number>(ARRANGE_LEVEL);
+  const [spreadBusy, setSpreadBusy] = useState(false);
   const [sourceImageLoaded, setSourceImageLoaded] = useState(false);
+  const [sourcePreviewOpen, setSourcePreviewOpen] = useState(false);
+  const [levelBriefOpen, setLevelBriefOpen] = useState(false);
   const [originalExtracted, setOriginalExtracted] = useState<ChromosomeData[]>([]);
   const [jumbled, setJumbled] = useState<ChromosomeData[]>([]);
   const [placed, setPlaced] = useState<Record<string, ChromosomeData>>({});
   const [history, setHistory] = useState<{ jumbled: ChromosomeData[], placed: Record<string, ChromosomeData> }[]>([]);
+  const [placements, setPlacements] = useState<NumberPlacement[]>([]);
+  const [placementHistory, setPlacementHistory] = useState<NumberPlacement[][]>([]);
   const [isReviewingCertificate, setIsReviewingCertificate] = useState(false);
   const [certificateName, setCertificateName] = useState('');
+  const [levelCompleteDismissed, setLevelCompleteDismissed] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [score, setScore] = useState({ correct: 0, total: 0 });
-  const [progressBySample, setProgressBySample] = useState<Record<string, KaryotypeProgressSummary>>({});
+  const [progressBySample, setProgressBySample] = useState<Record<string, SampleLevelProgress>>({});
   const [progressReady, setProgressReady] = useState(false);
   const [progressError, setProgressError] = useState<string | null>(null);
   const [showHints, setShowHints] = useState(false);
+  const [highlightedRowId, setHighlightedRowId] = useState<string | null>(null);
+  const [hasUsedRowHighlight, setHasUsedRowHighlight] = useState(false);
   const progressSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const spreadBusyRef = useRef(false);
+  const libraryLoadedForUserRef = useRef<string | null>(null);
+  const previousUserIdRef = useRef<string | null>(null);
+  const progressSignatureRef = useRef<Record<string, string>>({});
+  const selectedImageRef = useRef<AdminImage | null>(null);
+  const screenDepthRef = useRef(0);
+  const historySeededRef = useRef(false);
+  const fromHistoryRef = useRef(false);
+  const showScreenFromHistoryRef = useRef<(screen: AppScreen) => void>(() => {});
+  selectedImageRef.current = selectedImage;
+
+  const showScreenFromHistory = (screen: AppScreen) => {
+    const needsSample = screen === 'levels' || screen === 'learning' || screen === 'playing';
+    if (needsSample && !selectedImageRef.current) {
+      setGameState('select');
+      return;
+    }
+    if (screen === 'learning' || screen === 'levels') {
+      setActiveLevel(LEARN_LEVEL);
+      setGameState('playing');
+      if (screen === 'levels') {
+        const depth = SCREEN_DEPTH.playing;
+        window.history.replaceState({ screen: 'playing', depth }, '', window.location.href);
+        screenDepthRef.current = depth;
+      }
+      return;
+    }
+    setGameState(screen);
+  };
+  showScreenFromHistoryRef.current = showScreenFromHistory;
+
+  useLayoutEffect(() => {
+    if (gameState !== 'levels') return;
+    if (!selectedImageRef.current) {
+      setGameState('select');
+      return;
+    }
+    setActiveLevel(LEARN_LEVEL);
+    setIsReviewingCertificate(false);
+    setProgressReady(false);
+    const depth = SCREEN_DEPTH.playing;
+    window.history.replaceState({ screen: 'playing', depth }, '', window.location.href);
+    screenDepthRef.current = depth;
+    setGameState('playing');
+  }, [gameState]);
+
+  const pushScreen = (screen: AppScreen) => {
+    const current = readScreenHistory(window.history.state);
+    if (current?.screen === screen) {
+      screenDepthRef.current = current.depth;
+      setGameState(screen);
+      return;
+    }
+    const depth = SCREEN_DEPTH[screen];
+    window.history.pushState({ screen, depth }, '', window.location.href);
+    screenDepthRef.current = depth;
+    fromHistoryRef.current = false;
+    setGameState(screen);
+  };
+
+  const backScreen = () => {
+    fromHistoryRef.current = true;
+    window.history.back();
+  };
+
+  const jumpToScreen = (screen: 'welcome' | 'select') => {
+    const delta = SCREEN_DEPTH[screen] - screenDepthRef.current;
+    if (delta >= 0) return;
+    fromHistoryRef.current = true;
+    window.history.go(delta);
+  };
+
+  useLayoutEffect(() => {
+    if (!session || historySeededRef.current) return;
+    historySeededRef.current = true;
+    const current = readScreenHistory(window.history.state);
+    if (current?.screen === 'welcome' && current.depth === 0) {
+      screenDepthRef.current = 0;
+      return;
+    }
+    window.history.replaceState({ screen: 'welcome', depth: 0 }, '', window.location.href);
+    screenDepthRef.current = 0;
+  }, [session]);
+
+  useEffect(() => {
+    const onPopState = (event: PopStateEvent) => {
+      fromHistoryRef.current = true;
+      const entry = readScreenHistory(event.state);
+      const screen = entry?.screen ?? 'welcome';
+      screenDepthRef.current = entry?.depth ?? SCREEN_DEPTH[screen];
+      // Apply after the browser finishes this history event so the update
+      // reaches the screen that is actually showing.
+      window.setTimeout(() => {
+        showScreenFromHistoryRef.current(screen);
+      }, 0);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  useEffect(() => {
+    if (!fromHistoryRef.current) return;
+    fromHistoryRef.current = false;
+  }, [gameState]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -2394,86 +3293,219 @@ export default function Chromy() {
   }, []);
 
   useEffect(() => {
-    if (!session) return;
-    
-    const loadFromDb = async () => {
-      try {
-        const { data, error } = await supabase
-          .from('samples')
-          .select('*')
-          .order('created_at', { ascending: false });
+    const userId = session?.user?.id ?? null;
+    if (previousUserIdRef.current && previousUserIdRef.current !== userId) {
+      libraryLoadedForUserRef.current = null;
+      progressSignatureRef.current = {};
+      setImages([]);
+      setBucketPairDescriptions({});
+      setImagesLoaded(false);
+      setSamplesLoadError(null);
+      setProgressBySample({});
+    }
+    previousUserIdRef.current = userId;
 
-        if (error) throw error;
-        
-        if (data) {
-          setImages(data.map(row => ({
-            id: row.id,
-            originalUrl: row.original_url,
-            xml: row.xml,
-            userId: row.user_id,
-            uploaderEmail: row.uploader_email,
-            bucketId: row.bucket_id ?? null,
-            karyotype: row.karyotype ?? undefined,
-            annotationComplete: row.annotation_complete === true
-          })));
+    if (!userId) return;
+    if (gameState !== 'select' && gameState !== 'admin') return;
+    if (libraryLoadedForUserRef.current === userId) return;
+
+    let cancelled = false;
+    setImagesLoaded(false);
+    setSamplesLoadError(null);
+
+    const loadLibrary = async () => {
+      try {
+        const [samplesResult, progressResult, descriptionsResult] = await Promise.all([
+          supabase
+            .from('samples')
+            .select(SAMPLE_LIST_COLUMNS)
+            .order('created_at', { ascending: false }),
+          supabase
+            .from('karyotype_progress')
+            .select('sample_id, level, annotation_signature, status, correct_count, total_count')
+            .eq('user_id', userId),
+          supabase
+            .from('bucket_pair_descriptions')
+            .select('bucket_id, pair_id, description'),
+        ]);
+
+        if (cancelled) return;
+        if (samplesResult.error) throw samplesResult.error;
+
+        const loadedImages: AdminImage[] = (samplesResult.data ?? []).map(row => ({
+          id: row.id,
+          originalUrl: row.original_url,
+          userId: row.user_id,
+          uploaderEmail: row.uploader_email,
+          bucketId: row.bucket_id ?? null,
+          karyotype: row.karyotype ?? undefined,
+          annotationComplete: row.annotation_complete === true,
+          pairNoteOverrides: parsePairNoteOverrides(row.pair_note_overrides),
+          difficulty: parseSpreadDifficulty(row.difficulty),
+        }));
+
+        const signatures: Record<string, string> = {};
+        const summaries: Record<string, SampleLevelProgress> = {};
+        if (progressResult.error) {
+          console.error('Failed to load karyotyping progress summaries', progressResult.error);
+        } else {
+          const imageIds = new Set(loadedImages.map(image => image.id));
+          for (const row of progressResult.data ?? []) {
+            if (!imageIds.has(row.sample_id)) continue;
+            const level = Number(row.level);
+            if (!isGameplayLevel(level)) continue;
+            signatures[`${row.sample_id}:${level}`] = row.annotation_signature ?? '';
+            const sample = summaries[row.sample_id] ?? {};
+            sample[level] = {
+              status: row.status === 'complete' ? 'complete' : 'in_progress',
+              correctCount: row.correct_count ?? 0,
+              totalCount: row.total_count ?? 0,
+            };
+            summaries[row.sample_id] = sample;
+          }
         }
+
+        if (cancelled) return;
+        progressSignatureRef.current = signatures;
+        setImages(loadedImages);
+        setProgressBySample(summaries);
+        if (descriptionsResult.error) {
+          console.error('Failed to load bucket pair descriptions', descriptionsResult.error);
+          setBucketPairDescriptions({});
+        } else {
+          const byBucket: Record<string, PairNoteMap> = {};
+          for (const row of descriptionsResult.data ?? []) {
+            const pairId = normalizeCsvPairId(String(row.pair_id ?? ''));
+            const description = String(row.description ?? '').trim();
+            if (!pairId || !description || !row.bucket_id) continue;
+            const notes = byBucket[row.bucket_id] ?? {};
+            notes[pairId] = description;
+            byBucket[row.bucket_id] = notes;
+          }
+          setBucketPairDescriptions(byBucket);
+        }
+        setSamplesLoadError(null);
+        setImagesLoaded(true);
+        libraryLoadedForUserRef.current = userId;
       } catch (e: any) {
+        if (cancelled) return;
         console.error('Failed to load images from Supabase', e);
-        // setUploadError is not defined here, so we just log or alert if needed
-      } finally {
+        setSamplesLoadError(e?.message || 'The sample library could not be loaded.');
         setImagesLoaded(true);
       }
     };
-    loadFromDb();
-  }, [session]);
 
-  useEffect(() => {
-    if (!session?.user || !imagesLoaded) return;
-    let cancelled = false;
-
-    const loadProgressSummaries = async () => {
-      const { data, error } = await supabase
-        .from('karyotype_progress')
-        .select('sample_id, annotation_signature, status, correct_count, total_count')
-        .eq('user_id', session.user.id);
-
-      if (cancelled) return;
-      if (error) {
-        console.error('Failed to load karyotyping progress summaries', error);
-        return;
-      }
-
-      const imageById = new Map<string, AdminImage>(
-        images.map(image => [image.id, image] as const)
-      );
-      const summaries: Record<string, KaryotypeProgressSummary> = {};
-      for (const row of data ?? []) {
-        const image = imageById.get(row.sample_id);
-        if (!image || row.annotation_signature !== annotationSignature(image.xml)) continue;
-        summaries[row.sample_id] = {
-          status: row.status === 'complete' ? 'complete' : 'in_progress',
-          correctCount: row.correct_count ?? 0,
-          totalCount: row.total_count ?? 0,
-        };
-      }
-      setProgressBySample(summaries);
-    };
-
-    loadProgressSummaries();
+    void loadLibrary();
     return () => {
       cancelled = true;
     };
-  }, [images, imagesLoaded, session?.user?.id]);
+  }, [gameState, session?.user?.id]);
+
+  // The sample list omits annotation XML. Load each spread's XML on its own
+  // so completion outlines and chromosome counts appear without opening a spread.
+  // This must not restart when `images` updates, or the first result cancels the rest.
+  useEffect(() => {
+    if (!imagesLoaded) return;
+    if (gameState !== 'admin' && gameState !== 'select') return;
+
+    let cancelled = false;
+    const claimed = new Set<string>();
+    const pending = new Map<string, string>();
+    let flushTimer = 0;
+    const flush = () => {
+      if (flushTimer) {
+        window.clearTimeout(flushTimer);
+        flushTimer = 0;
+      }
+      if (cancelled || pending.size === 0) return;
+      const batch = new Map(pending);
+      pending.clear();
+      setImages(prev => {
+        let changed = false;
+        const next = prev.map(img => {
+          const xml = batch.get(img.id);
+          if (xml === undefined || img.xml !== undefined) return img;
+          changed = true;
+          return { ...img, xml };
+        });
+        return changed ? next : prev;
+      });
+    };
+    const queueXml = (id: string, xml: string) => {
+      pending.set(id, xml);
+      if (pending.size >= 12) flush();
+      else if (!flushTimer) flushTimer = window.setTimeout(flush, 120);
+    };
+    const claimNext = () => {
+      const image = imagesRef.current.find(item => item.xml === undefined && !claimed.has(item.id));
+      if (!image) return null;
+      claimed.add(image.id);
+      return image.id;
+    };
+    const worker = async () => {
+      while (!cancelled) {
+        const id = claimNext();
+        if (!id) return;
+        try {
+          const xml = (await fetchSampleXml(id)) ?? '';
+          if (cancelled) return;
+          queueXml(id, xml);
+        } catch (error) {
+          console.error('Failed to load annotation status', error);
+        }
+      }
+    };
+
+    const pendingCount = imagesRef.current.filter(img => img.xml === undefined).length;
+    const workerCount = Math.min(4, pendingCount);
+    if (workerCount > 0) {
+      void Promise.all(Array.from({ length: workerCount }, () => worker())).then(() => {
+        if (!cancelled) flush();
+      });
+    }
+
+    return () => {
+      cancelled = true;
+      if (flushTimer) window.clearTimeout(flushTimer);
+    };
+  }, [gameState, imagesLoaded]);
 
   useEffect(() => {
-    const initial = createInitialChromosomes();
-    setOriginalExtracted(initial);
-    setJumbled(shuffleChromosomes(initial, 'default'));
-    setScore({ correct: 0, total: initial.length });
-  }, []);
+    const stale = images.flatMap(image => {
+      if (image.xml === undefined) return [];
+      const cached = annotationSignatureCacheRef.current.get(image.id);
+      const current = cached && cached.xml === image.xml
+        ? cached.signature
+        : annotationSignature(image.xml);
+      if (!cached || cached.xml !== image.xml) {
+        annotationSignatureCacheRef.current.set(image.id, { xml: image.xml, signature: current });
+      }
+      return GAMEPLAY_LEVELS.flatMap(levelId => {
+        const signature = progressSignatureRef.current[`${image.id}:${levelId}`];
+        if (signature === undefined || signature === current) return [];
+        return [{ id: image.id, levelId }];
+      });
+    });
+    if (stale.length === 0) return;
+    for (const entry of stale) delete progressSignatureRef.current[`${entry.id}:${entry.levelId}`];
+    setProgressBySample(prev => {
+      let changed = false;
+      const next: Record<string, SampleLevelProgress> = { ...prev };
+      for (const entry of stale) {
+        const sample = next[entry.id];
+        if (!sample?.[entry.levelId]) continue;
+        changed = true;
+        const rest = { ...sample };
+        delete rest[entry.levelId];
+        next[entry.id] = rest;
+      }
+      return changed ? next : prev;
+    });
+  }, [images]);
 
   useEffect(() => {
     setSourceImageLoaded(false);
+    setSourcePreviewOpen(false);
   }, [selectedImage?.id]);
 
   const handleDragStart = (event: DragStartEvent) => {
@@ -2483,12 +3515,20 @@ export default function Chromy() {
   const handleDragEnd = (event: DragEndEvent) => {
     const { over, active } = event;
     setActiveId(null);
-    setProgressReady(true);
 
     const chromosome = active.data.current as ChromosomeData;
+    if (!chromosome || lockedChromosomeIds.has(chromosome.id)) return;
+
+    const slotId = over && over.id !== 'raw-sample-panel' ? String(over.id) : null;
+    if (slotId) {
+      const occupant = placed[slotId];
+      if (occupant && lockedChromosomeIds.has(occupant.id)) return;
+    }
+
+    setProgressReady(true);
 
     // Handle dropping back to "Raw Sample" panel
-    if (!over || over.id === 'raw-sample-panel') {
+    if (!slotId) {
       setHistory(prev => [...prev.slice(-19), { jumbled: [...jumbled], placed: { ...placed } }]);
       
       // If it was in a slot, remove it from the slot
@@ -2515,8 +3555,6 @@ export default function Chromy() {
       });
       return;
     }
-
-    const slotId = over.id as string;
 
     // Save history before change
     setHistory(prev => [...prev.slice(-19), { jumbled: [...jumbled], placed: { ...placed } }]);
@@ -2553,7 +3591,20 @@ export default function Chromy() {
     });
   };
 
+  const commitPlacements = (next: NumberPlacement[]) => {
+    setProgressReady(true);
+    setPlacementHistory(prev => [...prev.slice(-19), placements]);
+    setPlacements(next);
+  };
+
   const undo = () => {
+    if (isLabelLevel(activeLevel)) {
+      if (placementHistory.length === 0) return;
+      setProgressReady(true);
+      setPlacements(placementHistory[placementHistory.length - 1]);
+      setPlacementHistory(prev => prev.slice(0, -1));
+      return;
+    }
     if (history.length === 0) return;
     setProgressReady(true);
     const lastState = history[history.length - 1];
@@ -2564,24 +3615,31 @@ export default function Chromy() {
 
   const resetGame = () => {
     setProgressReady(false);
-    if (originalExtracted.length > 0) {
-      setJumbled(shuffleChromosomes(originalExtracted, selectedImage?.id ?? 'default'));
+    const source = originalExtracted.length > 0 ? originalExtracted : createInitialChromosomes();
+    if (originalExtracted.length === 0) setOriginalExtracted(source);
+    if (isLabelLevel(activeLevel)) {
+      setPlacements([]);
+      setPlacementHistory([]);
     } else {
-      const initial = createInitialChromosomes();
-      setOriginalExtracted(initial);
-      setJumbled(shuffleChromosomes(initial, selectedImage?.id ?? 'default'));
+      const seed = selectedImage?.id ?? 'default';
+      const board = buildFreshBoard(activeLevel, source, seed);
+      setJumbled(board.jumbled);
+      setPlaced(board.placed);
     }
-    setPlaced({});
     setHistory([]);
     setGameState('playing');
 
     if (session?.user && selectedImage) {
       const sampleId = selectedImage.id;
       const userId = session.user.id;
+      const levelId = activeLevel;
+      delete progressSignatureRef.current[`${sampleId}:${levelId}`];
       setProgressBySample(prev => {
-        const next = { ...prev };
-        delete next[sampleId];
-        return next;
+        const sample = prev[sampleId];
+        if (!sample) return prev;
+        const nextSample = { ...sample };
+        delete nextSample[levelId];
+        return { ...prev, [sampleId]: nextSample };
       });
       progressSaveQueueRef.current = progressSaveQueueRef.current
         .catch(() => undefined)
@@ -2590,7 +3648,8 @@ export default function Chromy() {
             .from('karyotype_progress')
             .delete()
             .eq('user_id', userId)
-            .eq('sample_id', sampleId);
+            .eq('sample_id', sampleId)
+            .eq('level', levelId);
           if (error) {
             console.error('Failed to clear karyotyping progress', error);
             setProgressError('Your saved progress could not be cleared. Please try resetting again.');
@@ -2602,7 +3661,10 @@ export default function Chromy() {
   };
 
   const confirmResetGame = () => {
-    if (window.confirm('Reset this karyotype? Your current progress will be cleared.')) {
+    const message = isLabelLevel(activeLevel)
+      ? 'Reset this level? Your current progress will be cleared.'
+      : 'Reset this karyotype? Your current progress will be cleared.';
+    if (window.confirm(message)) {
       resetGame();
     }
   };
@@ -2626,27 +3688,35 @@ export default function Chromy() {
   // so a pair ID containing arbitrary characters (custom names) can never
   // corrupt lookup logic - the pair ID is looked up via slotPairMap instead
   // of being parsed back out of the slot ID string.
-  const pairGroups = useMemo(() => {
-    const membersByPair = new Map<string, ChromosomeData[]>();
-    const firstAppearanceOrder: string[] = [];
-    originalExtracted.forEach(chrom => {
-      if (!membersByPair.has(chrom.type)) {
-        membersByPair.set(chrom.type, []);
-        firstAppearanceOrder.push(chrom.type);
-      }
-      membersByPair.get(chrom.type)!.push(chrom);
-    });
+  const pairGroups = useMemo(
+    () => pairSlotGroups(originalExtracted).map(({ pairId, slotIds }) => ({ pairId, slotIds })),
+    [originalExtracted]
+  );
 
-    const orderedPairIds = [...firstAppearanceOrder].sort((a, b) => comparePairIds(a, b, firstAppearanceOrder));
+  const lockedChromosomeIds = useMemo(
+    () => activeLevel === MATCH_LEVEL ? scaffoldChromosomeIds(originalExtracted) : new Set<string>(),
+    [activeLevel, originalExtracted]
+  );
 
-    return orderedPairIds.map((pairId, pairIndex) => {
-      const members = membersByPair.get(pairId)!;
-      return {
-        pairId,
-        slotIds: members.map((_, slotIndex) => `slot-${pairIndex}-${slotIndex}`),
-      };
-    });
-  }, [originalExtracted]);
+  const labelScaffoldIds = useMemo(
+    () => activeLevel === LABEL_MATE_LEVEL ? scaffoldChromosomeIds(originalExtracted) : new Set<string>(),
+    [activeLevel, originalExtracted]
+  );
+
+  const orientationPreset = isPresetOrientationLevel(activeLevel);
+  const rowHighlightEnabled = orientationPreset || activeLevel === ARRANGE_LEVEL;
+
+  const highlightedPairIds = useMemo(() => {
+    if (!rowHighlightEnabled || !highlightedRowId) return null;
+    return new Set(pairIdsForMatchRow(highlightedRowId));
+  }, [rowHighlightEnabled, highlightedRowId]);
+
+  useLayoutEffect(() => {
+    if (!highlightedRowId) return;
+    const timer = window.setTimeout(() => setHighlightedRowId(null), 3000);
+    document.querySelector('[data-row-match="true"]')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    return () => window.clearTimeout(timer);
+  }, [highlightedRowId]);
 
   const pairGroupsById = useMemo(
     () => new Map(pairGroups.map(group => [group.pairId, group] as const)),
@@ -2734,7 +3804,14 @@ export default function Chromy() {
   // belonging to its own pair (position within the pair no longer matters)
   // and, for real annotated images, its orientation matches the orientation
   // recorded for that specific chromosome during annotation.
+  // Mate and Label count every numbered chromosome, including ones given at the start.
   useEffect(() => {
+    if (isLabelLevel(activeLevel)) {
+      const given = activeLevel === LABEL_MATE_LEVEL ? scaffoldChromosomeIds(originalExtracted) : new Set<string>();
+      const correctCount = countCorrectLabels(originalExtracted, placements, given);
+      setScore(prev => prev.correct === correctCount ? prev : { ...prev, correct: correctCount });
+      return;
+    }
     let correctCount = 0;
     Object.entries(placed).forEach(([slotId, chrom]: [string, ChromosomeData]) => {
       const expectedPairId = slotPairMap.get(slotId);
@@ -2751,10 +3828,20 @@ export default function Chromy() {
       }
     });
     setScore(prev => ({ ...prev, correct: correctCount }));
-  }, [placed, slotPairMap]);
+  }, [placed, slotPairMap, activeLevel, placements, originalExtracted]);
 
   const progress = (score.correct / score.total) * 100;
   const isComplete = progress === 100 && score.total > 0;
+  const spreadComplete = !!selectedImage && GAMEPLAY_LEVELS.every(levelId => (
+    levelId === activeLevel
+      ? isComplete
+      : progressBySample[selectedImage.id]?.[levelId]?.status === 'complete'
+  ));
+  const finishedLevel = LEVELS.find(level => level.id === activeLevel);
+
+  useEffect(() => {
+    if (!isComplete) setLevelCompleteDismissed(false);
+  }, [isComplete, activeLevel, selectedImage?.id]);
 
   useEffect(() => {
     if (
@@ -2766,17 +3853,23 @@ export default function Chromy() {
     ) return;
 
     const status: KaryotypeProgressSummary['status'] = isComplete ? 'complete' : 'in_progress';
-    const savedState = serializeKaryotypeState(jumbled, placed);
+    const savedState = isLabelLevel(activeLevel)
+      ? { placements }
+      : serializeKaryotypeState(jumbled, placed);
     const now = new Date().toISOString();
     const userId = session.user.id;
     const sampleId = selectedImage.id;
+    progressSignatureRef.current[`${sampleId}:${activeLevel}`] = annotationSignature(selectedImage.xml);
 
     setProgressBySample(prev => ({
       ...prev,
       [sampleId]: {
-        status,
-        correctCount: score.correct,
-        totalCount: score.total,
+        ...prev[sampleId],
+        [activeLevel]: {
+          status,
+          correctCount: score.correct,
+          totalCount: score.total,
+        },
       },
     }));
 
@@ -2788,6 +3881,7 @@ export default function Chromy() {
           .upsert({
             user_id: userId,
             sample_id: sampleId,
+            level: activeLevel,
             state: savedState,
             annotation_signature: annotationSignature(selectedImage.xml),
             status,
@@ -2795,7 +3889,7 @@ export default function Chromy() {
             total_count: score.total,
             completed_at: isComplete ? now : null,
             updated_at: now,
-          }, { onConflict: 'user_id,sample_id' });
+          }, { onConflict: 'user_id,sample_id,level' });
 
         if (error) {
           console.error('Failed to save karyotyping progress', error);
@@ -2808,13 +3902,186 @@ export default function Chromy() {
     gameState,
     isComplete,
     jumbled,
+    placements,
     placed,
     progressReady,
     score.correct,
     score.total,
     selectedImage,
     session?.user,
+    activeLevel,
   ]);
+
+  const annotatedSpreads = useMemo(
+    () => images.filter(img => hasAnnotations(img.xml)),
+    [images]
+  );
+  const learnSpreadIndex = selectedImage
+    ? annotatedSpreads.findIndex(img => img.id === selectedImage.id)
+    : -1;
+  const learnChromosomes = useMemo(() => {
+    if (!selectedImage) return levelChromosomes;
+    const latest = images.find(image => image.id === selectedImage.id) ?? selectedImage;
+    const bucketNotes = latest.bucketId ? bucketPairDescriptions[latest.bucketId] : undefined;
+    return withResolvedPairSentences(levelChromosomes, latest.pairNoteOverrides, bucketNotes);
+  }, [bucketPairDescriptions, images, levelChromosomes, selectedImage]);
+
+  const openPlayLevel = async (levelId: number) => {
+    if (!selectedImage) return;
+    setProgressReady(false);
+    const playableChromosomes = levelChromosomes.length > 0
+      ? levelChromosomes
+      : createInitialChromosomes();
+    const labeling = isLabelLevel(levelId);
+    const labelScaffold = levelId === LABEL_MATE_LEVEL
+      ? scaffoldChromosomeIds(playableChromosomes)
+      : new Set<string>();
+    let restored: { jumbled: ChromosomeData[]; placed: Record<string, ChromosomeData> } | null = null;
+    let restoredPlacements: NumberPlacement[] | null = null;
+    let restoredCorrectCount = 0;
+
+    if (session?.user) {
+      await progressSaveQueueRef.current.catch(() => undefined);
+      const { data, error } = await supabase
+        .from('karyotype_progress')
+        .select('state, annotation_signature, correct_count')
+        .eq('user_id', session.user.id)
+        .eq('sample_id', selectedImage.id)
+        .eq('level', levelId)
+        .maybeSingle();
+
+      if (error) {
+        console.error('Failed to load karyotyping progress', error);
+        setProgressError('Saved progress could not be loaded. A new board was started instead.');
+      } else if (data?.annotation_signature === annotationSignature(selectedImage.xml)) {
+        progressSignatureRef.current[`${selectedImage.id}:${levelId}`] = data.annotation_signature ?? '';
+        if (labeling) {
+          restoredPlacements = hydrateLabelState(playableChromosomes, data.state, labelScaffold);
+          if (restoredPlacements) {
+            restoredCorrectCount = Math.min(
+              playableChromosomes.length,
+              countCorrectLabels(playableChromosomes, restoredPlacements, labelScaffold)
+            );
+          }
+        } else {
+          restored = hydrateKaryotypeState(playableChromosomes, data.state);
+          if (restored) {
+            restoredCorrectCount = Math.max(
+              0,
+              Math.min(Number(data.correct_count) || 0, playableChromosomes.length)
+            );
+          }
+        }
+      } else if (data) {
+        const sampleId = selectedImage.id;
+        delete progressSignatureRef.current[`${sampleId}:${levelId}`];
+        setProgressBySample(prev => {
+          const sample = prev[sampleId];
+          if (!sample?.[levelId]) return prev;
+          const nextSample = { ...sample };
+          delete nextSample[levelId];
+          return { ...prev, [sampleId]: nextSample };
+        });
+      }
+    }
+
+    const fresh = buildFreshBoard(levelId, playableChromosomes, selectedImage.id);
+
+    setActiveLevel(levelId);
+    setLevelBriefOpen(true);
+    setHighlightedRowId(null);
+    setOriginalExtracted(playableChromosomes);
+    setJumbled(restored?.jumbled ?? fresh.jumbled);
+    setPlaced(restored?.placed ?? fresh.placed);
+    setPlacements(restoredPlacements ?? []);
+    setPlacementHistory([]);
+    setScore({
+      correct: labeling
+        ? (restoredPlacements ? restoredCorrectCount : labelScaffold.size)
+        : (restored ? restoredCorrectCount : Object.keys(fresh.placed).length),
+      total: playableChromosomes.length,
+    });
+    setHistory([]);
+    setCertificateName('');
+    setIsReviewingCertificate(false);
+    setProgressReady(false);
+    pushScreen('playing');
+  };
+
+  const openLearnLevel = async () => {
+    if (!selectedImageRef.current) return;
+    await progressSaveQueueRef.current.catch(() => undefined);
+    setProgressReady(false);
+    setIsReviewingCertificate(false);
+    setActiveLevel(LEARN_LEVEL);
+    setLevelBriefOpen(true);
+    pushScreen('playing');
+  };
+
+  const switchLearnSpread = async (image: AdminImage) => {
+    if (spreadBusyRef.current || image.id === selectedImage?.id) return;
+    spreadBusyRef.current = true;
+    setSpreadBusy(true);
+    setProgressError(null);
+    try {
+      const sample = await sampleWithXml(image);
+      const extracted = await extractChromosomes(sample);
+      if (extracted.length === 0) {
+        setProgressError('That metaphase spread could not be opened.');
+        return;
+      }
+      setSelectedImage(sample);
+      setImages(prev => {
+        if (sample.xml === undefined) return prev;
+        const index = prev.findIndex(item => item.id === sample.id);
+        if (index < 0 || prev[index].xml === sample.xml) return prev;
+        const next = prev.slice();
+        next[index] = { ...prev[index], xml: sample.xml };
+        return next;
+      });
+      setLevelChromosomes(extracted);
+      setActiveLevel(LEARN_LEVEL);
+      setGameState('playing');
+    } catch (error) {
+      console.error('Failed to open spread', error);
+      setProgressError('That metaphase spread could not be opened.');
+    } finally {
+      spreadBusyRef.current = false;
+      setSpreadBusy(false);
+    }
+  };
+
+  const openLevel = async (levelId: number) => {
+    if (startingLevel !== null) return;
+    if (levelId === activeLevel && gameState === 'playing') return;
+    setShowHints(false);
+    setStartingLevel(levelId);
+    setProgressError(null);
+    try {
+      if (levelId === LEARN_LEVEL) await openLearnLevel();
+      else await openPlayLevel(levelId);
+    } finally {
+      setStartingLevel(null);
+    }
+  };
+
+  const finishLearn = () => {
+    backScreen();
+  };
+
+  const finishLearnAndOpenNext = () => {
+    const next = annotatedSpreads[learnSpreadIndex + 1];
+    if (!next) {
+      finishLearn();
+      return;
+    }
+    void switchLearnSpread(next);
+  };
+
+  const toggleRowHighlight = (rowId: string) => {
+    setHasUsedRowHighlight(true);
+    setHighlightedRowId(current => current === rowId ? null : rowId);
+  };
 
   const successPhrase = useMemo(() => {
     if (isComplete) {
@@ -2833,8 +4100,8 @@ export default function Chromy() {
         {gameState === 'welcome' && (
           <WelcomeScreen 
             key="welcome" 
-            onStart={() => setGameState('select')} 
-            onAdmin={() => setGameState('admin')} 
+            onStart={() => pushScreen('select')} 
+            onAdmin={() => pushScreen('admin')} 
             onSignOut={async () => {
               await supabase.auth.signOut();
             }}
@@ -2844,56 +4111,29 @@ export default function Chromy() {
         {gameState === 'select' && (
           <SpreadSelectionScreen
             key="select"
-            images={images.filter(img => hasAnnotations(img.xml))}
+            images={images}
             imagesLoaded={imagesLoaded}
+            loadError={samplesLoadError}
             progressBySample={progressBySample}
-            onBack={() => setGameState('welcome')}
+            onBack={() => backScreen()}
             onSelect={async (img, extracted) => {
-              setProgressReady(false);
-              setProgressError(null);
-
               const playableChromosomes = extracted.length > 0
                 ? extracted
                 : createInitialChromosomes();
-              let restored: { jumbled: ChromosomeData[]; placed: Record<string, ChromosomeData> } | null = null;
-              let restoredCorrectCount = 0;
-
-              if (session?.user) {
-                const { data, error } = await supabase
-                  .from('karyotype_progress')
-                  .select('state, annotation_signature, correct_count')
-                  .eq('user_id', session.user.id)
-                  .eq('sample_id', img.id)
-                  .maybeSingle();
-
-                if (error) {
-                  console.error('Failed to load karyotyping progress', error);
-                  setProgressError('Saved progress could not be loaded. A new board was started instead.');
-                } else if (data?.annotation_signature === annotationSignature(img.xml)) {
-                  restored = hydrateKaryotypeState(playableChromosomes, data.state);
-                  if (restored) {
-                    restoredCorrectCount = Math.max(
-                      0,
-                      Math.min(Number(data.correct_count) || 0, playableChromosomes.length)
-                    );
-                  }
-                }
-              }
-
+              setProgressError(null);
               setSelectedImage(img);
-              setOriginalExtracted(playableChromosomes);
-              setJumbled(restored?.jumbled ?? shuffleChromosomes(playableChromosomes, img.id));
-              setPlaced(restored?.placed ?? {});
-              setScore({
-                correct: restored ? restoredCorrectCount : 0,
-                total: playableChromosomes.length,
-              });
-              setHistory([]);
-              setCertificateName('');
-              setIsReviewingCertificate(false);
-              // A fresh or restored board is not written until the user changes it.
-              setProgressReady(false);
-              setGameState('playing');
+              if (img.xml !== undefined) {
+                setImages(prev => {
+                  const index = prev.findIndex(item => item.id === img.id);
+                  if (index < 0 || prev[index].xml === img.xml) return prev;
+                  const next = prev.slice();
+                  next[index] = { ...prev[index], xml: img.xml };
+                  return next;
+                });
+              }
+              setLevelChromosomes(playableChromosomes);
+              selectedImageRef.current = img;
+              void openLearnLevel();
             }}
           />
         )}
@@ -2905,32 +4145,35 @@ export default function Chromy() {
             setImages={setImages}
             session={session}
             userRole={userRole}
-            onClose={() => setGameState('welcome')} 
+            bucketPairDescriptions={bucketPairDescriptions}
+            onBucketPairDescriptionsChange={(bucketId, notes) => {
+              setBucketPairDescriptions(prev => ({ ...prev, [bucketId]: notes }));
+            }}
+            onClose={() => backScreen()} 
           />
         )}
       </AnimatePresence>
 
-      <div className={cn(
-        "transition-opacity duration-300",
-        gameState === 'playing' ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none absolute inset-0 -z-10"
-      )}>
-        <DndContext 
-          sensors={sensors} 
-          onDragStart={handleDragStart} 
+      {gameState === 'playing' && (
+      <div>
+        <DndContext
+          sensors={sensors}
+          autoScroll={false}
+          onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
         >
           {/* Header */}
         <header className={cn("fixed top-0 left-0 right-0 h-16 bg-white border-b border-slate-200 z-50 px-6 flex items-center justify-between print:hidden", isReviewingCertificate && "hidden")}>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setGameState('select')}
+              onClick={() => backScreen()}
               className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500 hover:text-slate-900"
-              title="Back to sample selection"
-              aria-label="Back to sample selection"
+              title="Back to samples"
+              aria-label="Back to samples"
             >
               <ArrowLeft className="w-5 h-5" />
             </button>
-            <div className="flex items-center gap-3 cursor-pointer" onClick={() => setGameState('welcome')}>
+            <div className="flex items-center gap-3 cursor-pointer" onClick={() => jumpToScreen('welcome')}>
               <div className="w-10 h-10 bg-slate-900 rounded-xl flex items-center justify-center text-white">
                 <Dna className="w-6 h-6" />
               </div>
@@ -2943,6 +4186,7 @@ export default function Chromy() {
             </div>
           </div>
 
+          {activeLevel !== LEARN_LEVEL && (
           <div className="flex items-center gap-6">
              <div className="flex flex-col items-end">
                 <div className="flex items-center gap-2">
@@ -2964,6 +4208,7 @@ export default function Chromy() {
              </div>
 
              <div className="flex items-center gap-2">
+               {!isLabelLevel(activeLevel) && (
                <button
                   onClick={() => setShowHints(true)}
                   className="px-3 py-2 hover:bg-amber-50 rounded-lg transition-colors text-xs font-bold text-amber-600 hover:text-amber-700 flex items-center gap-1.5"
@@ -2972,10 +4217,11 @@ export default function Chromy() {
                   <Lightbulb className="w-4 h-4" />
                   HINT
                </button>
+               )}
 
                <button 
                   onClick={undo}
-                  disabled={history.length === 0}
+                  disabled={isLabelLevel(activeLevel) ? placementHistory.length === 0 : history.length === 0}
                   className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-400 hover:text-slate-900 disabled:opacity-30 disabled:hover:bg-transparent"
                   title="Undo last placement"
                 >
@@ -2991,6 +4237,7 @@ export default function Chromy() {
                </button>
              </div>
           </div>
+          )}
         </header>
 
         {gameState === 'playing' && progressError && (
@@ -2999,7 +4246,7 @@ export default function Chromy() {
           </div>
         )}
 
-        {!isReviewingCertificate && selectedImage?.karyotype && (
+        {!isReviewingCertificate && activeLevel !== LEARN_LEVEL && selectedImage?.karyotype && (
           <footer className="fixed bottom-0 left-0 right-0 h-10 bg-white border-t border-slate-200 z-50 px-6 flex items-center justify-center gap-2 print:hidden">
             <span className="text-[10px] font-mono tracking-widest uppercase text-slate-400">
               ISCN Karyotype Designation
@@ -3011,112 +4258,175 @@ export default function Chromy() {
         )}
 
         <main className={cn(
-          "px-6 pb-6 grid gap-6 overflow-y-auto overflow-x-hidden lg:overflow-hidden print:h-auto print:overflow-visible print:block",
+          "px-6 grid gap-4 overflow-hidden print:h-auto print:overflow-visible print:block",
           isReviewingCertificate
             ? "pt-6 h-screen grid-cols-1"
             : cn(
-                "pt-20 grid-cols-1 lg:grid-cols-[1fr_3fr]",
-                selectedImage?.karyotype ? "h-[calc(100vh-120px)]" : "h-[calc(100vh-80px)]"
+                "pt-16 pb-4 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] lg:grid-cols-[16rem_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]",
+                selectedImage?.karyotype && activeLevel !== LEARN_LEVEL ? "h-[calc(100vh-2.5rem)]" : "h-screen"
               )
         )}>
-          
-          {/* Left Panel: Jumbled Source */}
-          {!isReviewingCertificate && (
-            <RawSampleDroppable id="raw-sample-panel">
-              <div className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col shadow-sm overflow-hidden bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] h-full min-h-0">
-                <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
-                    <Info className="w-4 h-4" />
-                    Raw Sample
-                  </h2>
-                  <span className="text-xs font-mono text-slate-400">
-                    {jumbled.length} REMAINING
-                  </span>
-                </div>
 
-              {selectedImage && (
-                <div className="w-full h-48 mb-6 rounded-xl overflow-hidden border border-slate-200 relative shrink-0 shadow-sm bg-black group/source">
-                  {!sourceImageLoaded && (
-                    <div className="absolute inset-0 z-10 bg-slate-100 flex flex-col items-center justify-center">
-                      <Loader className="w-8 h-8 text-sky-500 animate-spin" />
-                      <span className="mt-2 text-xs font-bold text-slate-600">Loading spread...</span>
-                    </div>
-                  )}
-                  <img 
-                    src={selectedImage.originalUrl} 
-                    alt="Selected Metaphase Spread"
-                    onLoad={() => setSourceImageLoaded(true)}
-                    onError={() => setSourceImageLoaded(true)}
-                    className={cn(
-                      "w-full h-full object-cover transition-all duration-500 group-hover/source:scale-105",
-                      sourceImageLoaded ? "opacity-100" : "opacity-0"
-                    )}
-                  />
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-transparent opacity-0 group-hover/source:opacity-100 transition-opacity" />
-                  
-                  <div className="absolute top-2 left-2 bg-slate-900/80 backdrop-blur text-white text-[10px] font-bold px-2 py-1 rounded shadow-sm">
-                    SOURCE IMAGE
+          {!isReviewingCertificate && selectedImage && (
+            <aside className="min-h-0 h-full flex flex-row lg:flex-col gap-3 overflow-x-auto lg:overflow-x-hidden lg:overflow-y-auto print:hidden lg:col-start-1 lg:row-start-1">
+              <div className="w-28 lg:w-full h-20 lg:h-28 shrink-0 rounded-xl overflow-hidden border border-slate-200 relative shadow-sm bg-black group/source">
+                {!sourceImageLoaded && (
+                  <div className="absolute inset-0 z-10 bg-slate-100 flex items-center justify-center">
+                    <Loader className="w-6 h-6 text-sky-500 animate-spin" />
                   </div>
-
-                  <div className="absolute bottom-2 right-2 flex gap-2 opacity-0 group-hover/source:opacity-100 transition-all translate-y-2 group-hover/source:translate-y-0">
-                    <a
-                      href={selectedImage.originalUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 backdrop-blur border border-white/20 flex items-center justify-center text-white transition-colors"
-                      title="Open Full Size"
-                    >
-                      <Expand className="w-4 h-4" />
-                    </a>
+                )}
+                <img
+                  src={selectedImage.originalUrl}
+                  alt="Selected metaphase spread"
+                  onLoad={() => setSourceImageLoaded(true)}
+                  onError={() => setSourceImageLoaded(true)}
+                  className={cn(
+                    "w-full h-full object-cover",
+                    sourceImageLoaded ? "opacity-100" : "opacity-0"
+                  )}
+                />
+                <div className="absolute top-1.5 left-1.5 bg-slate-900/80 backdrop-blur text-white text-[10px] font-bold px-1.5 py-0.5 rounded">
+                  SOURCE
+                </div>
+                <div className="absolute bottom-1.5 right-1.5 flex gap-1 opacity-0 group-hover/source:opacity-100 transition-opacity">
+                  <button
+                    type="button"
+                    onClick={() => setSourcePreviewOpen(true)}
+                    className="w-7 h-7 rounded-lg bg-white text-slate-900 hover:bg-sky-50 flex items-center justify-center"
+                    title="Expand metaphase spread"
+                    aria-label="Expand metaphase spread"
+                  >
+                    <Expand className="w-3.5 h-3.5" />
+                  </button>
+                  {(userRole === 'ADMIN' || userRole === 'SUPER ADMIN') && (
                     <a
                       href={selectedImage.originalUrl}
                       download={`chromy-sample-${selectedImage.id}.png`}
-                      className="w-8 h-8 rounded-lg bg-white text-slate-900 hover:bg-sky-50 flex items-center justify-center transition-colors shadow-lg"
-                      title="Download Source Image"
+                      className="w-7 h-7 rounded-lg bg-white text-slate-900 hover:bg-sky-50 flex items-center justify-center"
+                      title="Download source image"
                     >
-                      <Download className="w-4 h-4" />
+                      <Download className="w-3.5 h-3.5" />
                     </a>
-                  </div>
-                </div>
-              )}
-                
-                <div className="flex-1 overflow-y-auto scrollbar-hide">
-                  <div className="flex flex-wrap gap-4 items-end justify-center">
-                    <AnimatePresence>
-                      {jumbled.length > 0 ? (
-                        jumbled.map((chrom) => (
-                          <motion.div
-                            key={chrom.id}
-                            layoutId={chrom.id}
-                            initial={{ opacity: 0, scale: 0.8 }}
-                            animate={{ opacity: 1, scale: 1 }}
-                            exit={{ opacity: 0, scale: 0.8 }}
-                          >
-                            <DraggableChromosome id={chrom.id} chromosome={chrom} displayScale={chromosomeDisplayScale} />
-                          </motion.div>
-                        ))
-                      ) : (
-                        <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-300">
-                          <CheckCircle2 className="w-12 h-12 mb-4 opacity-20" />
-                          <p className="text-sm font-medium">Sample fully processed</p>
-                        </div>
-                      )}
-                    </AnimatePresence>
-                  </div>
-                </div>
-
-                <div className="mt-4 p-4 bg-slate-50 rounded-xl border border-dashed border-slate-200">
-                   <p className="text-[11px] text-slate-500 leading-relaxed italic">
-                     "Drag chromosomes to the diagnostic board. Use the banding patterns and size ratio to identify correct pairings."
-                   </p>
+                  )}
                 </div>
               </div>
-            </RawSampleDroppable>
+
+              <div className="flex flex-row lg:flex-col gap-2 min-w-0">
+                <h2 className="hidden lg:block text-sm font-bold uppercase tracking-wider text-slate-400">
+                  Levels
+                </h2>
+                <LevelSidebarButton
+                  level={LEVELS.find(level => level.id === LEARN_LEVEL)!}
+                  summary={progressBySample[selectedImage.id]?.[LEARN_LEVEL]}
+                  current={activeLevel === LEARN_LEVEL}
+                  busy={startingLevel === LEARN_LEVEL}
+                  disabled={startingLevel !== null || activeLevel === LEARN_LEVEL}
+                  onStart={() => { void openLevel(LEARN_LEVEL); }}
+                />
+                <div className="flex flex-row lg:flex-col gap-2 min-w-0">
+                  <p className={cn(
+                    "shrink-0 self-center lg:self-start px-1 text-[10px] font-mono font-bold tracking-widest",
+                    activeLevel === MATCH_LEVEL || activeLevel === PAIR_LEVEL || activeLevel === ARRANGE_LEVEL ? "text-sky-600" : "text-slate-400"
+                  )}>
+                    LEVEL 2
+                  </p>
+                  <div className="flex flex-row lg:flex-col gap-2 min-w-0 lg:ml-2 lg:pl-3 lg:border-l lg:border-slate-200">
+                    {LEVELS.filter(level => level.id === MATCH_LEVEL || level.id === PAIR_LEVEL || level.id === ARRANGE_LEVEL).map(level => (
+                      <LevelSidebarButton
+                        key={level.id}
+                        level={level}
+                        summary={progressBySample[selectedImage.id]?.[level.id]}
+                        current={activeLevel === level.id}
+                        busy={startingLevel === level.id}
+                        disabled={startingLevel !== null || activeLevel === level.id}
+                        onStart={() => { void openLevel(level.id); }}
+                      />
+                    ))}
+                  </div>
+                </div>
+                <div className="flex flex-row lg:flex-col gap-2 min-w-0">
+                  <p className={cn(
+                    "shrink-0 self-center lg:self-start px-1 text-[10px] font-mono font-bold tracking-widest",
+                    activeLevel === LABEL_MATE_LEVEL || activeLevel === LABEL_ALL_LEVEL ? "text-sky-600" : "text-slate-400"
+                  )}>
+                    LEVEL 3
+                  </p>
+                  <div className="flex flex-row lg:flex-col gap-2 min-w-0 lg:ml-2 lg:pl-3 lg:border-l lg:border-slate-200">
+                    {LEVELS.filter(level => level.id === LABEL_MATE_LEVEL || level.id === LABEL_ALL_LEVEL).map(level => (
+                      <LevelSidebarButton
+                        key={level.id}
+                        level={level}
+                        summary={progressBySample[selectedImage.id]?.[level.id]}
+                        current={activeLevel === level.id}
+                        busy={startingLevel === level.id}
+                        disabled={startingLevel !== null || activeLevel === level.id}
+                        onStart={() => { void openLevel(level.id); }}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </aside>
           )}
 
-          {/* Right Panel: Diagnostic Board */}
           <div className={cn(
-            "bg-white rounded-2xl border border-slate-200 p-4 lg:p-6 shadow-sm overflow-y-auto print:border-none print:shadow-none print:p-0 flex flex-col print:overflow-visible print:h-auto min-h-0",
+            "min-h-0 min-w-0 h-full flex flex-col gap-4",
+            !isReviewingCertificate && "lg:col-start-2 lg:row-start-1"
+          )}>
+          {activeLevel === LEARN_LEVEL && selectedImage ? (
+            <LearnLevel
+              key={selectedImage.id}
+              embedded
+              chromosomes={learnChromosomes}
+              karyotype={selectedImage.karyotype}
+              spreadIndex={learnSpreadIndex}
+              spreadCount={annotatedSpreads.length}
+              spreadBusy={spreadBusy}
+              onPreviousSpread={() => {
+                const previous = annotatedSpreads[learnSpreadIndex - 1];
+                if (previous) void switchLearnSpread(previous);
+              }}
+              onNextSpread={() => {
+                const next = annotatedSpreads[learnSpreadIndex + 1];
+                if (next) void switchLearnSpread(next);
+              }}
+              onFinishSpread={
+                learnSpreadIndex >= 0 && learnSpreadIndex < annotatedSpreads.length - 1
+                  ? finishLearnAndOpenNext
+                  : undefined
+              }
+              onBack={() => backScreen()}
+              onFinish={finishLearn}
+            />
+          ) : isLabelLevel(activeLevel) && selectedImage ? (
+            <>
+            {isReviewingCertificate && (
+              <div className="text-center mb-4 shrink-0">
+                <h1 className="text-4xl font-black text-slate-900 tracking-tighter mb-2">KARYOTYPE DIAGNOSTIC CERTIFICATE</h1>
+                <p className="text-lg text-slate-500 font-medium">Assembled and verified by <span className="font-black text-slate-800">{certificateName}</span></p>
+                {selectedImage.karyotype && (
+                  <p className="text-sm font-mono font-bold text-slate-700 mt-2">
+                    ISCN: {selectedImage.karyotype}
+                  </p>
+                )}
+                <div className="w-24 h-1 bg-slate-200 mx-auto mt-4 rounded-full" />
+              </div>
+            )}
+            <LabelSpreadLevel
+              key={`${selectedImage.id}:${activeLevel}`}
+              imageUrl={selectedImage.originalUrl}
+              chromosomes={originalExtracted}
+              placements={placements}
+              scaffoldIds={labelScaffoldIds}
+              assisted={activeLevel === LABEL_MATE_LEVEL}
+              onPlacementsChange={commitPlacements}
+            />
+            </>
+          ) : (
+          <>
+          {/* Diagnostic Board */}
+          <div className={cn(
+            "bg-white rounded-2xl border border-slate-200 p-4 lg:p-6 shadow-sm overflow-y-auto print:border-none print:shadow-none print:p-0 flex flex-col print:overflow-visible print:h-auto min-h-0 flex-1",
             isReviewingCertificate && "col-span-full border-none shadow-none h-full pb-20"
           )}>
              {isReviewingCertificate && (
@@ -3132,6 +4442,12 @@ export default function Chromy() {
                </div>
              )}
 
+             {rowHighlightEnabled && !isReviewingCertificate && (
+               <p className="shrink-0 text-center text-xs font-medium text-slate-500 mb-2 print:hidden">
+                 Click a row to highlight its chromosomes in the tray.
+               </p>
+             )}
+
              <div className="flex flex-1 w-full max-w-6xl mx-auto h-full min-h-0 overflow-auto">
                <div className="flex flex-col gap-2 items-center justify-evenly min-w-min h-full py-2 mx-auto">
                  {CLINICAL_KARYOTYPE_ROWS.map((row, rowIndex) => (
@@ -3141,11 +4457,40 @@ export default function Chromy() {
                          .map(pairId => pairGroupsById.get(pairId))
                          .filter((entry): entry is NonNullable<typeof entry> => !!entry);
                        if (visibleGroups.length === 0) return null;
+                       const rowHighlight = rowHighlightEnabled && !isReviewingCertificate
+                         ? matchRowHighlightForGroup(group.id)
+                         : null;
+                       const firstVisibleGroupId = rowHighlight
+                         ? row.find(candidate =>
+                             rowHighlight.groupIds.includes(candidate.id) &&
+                             candidate.pairIds.some(pairId => pairGroupsById.has(pairId))
+                           )?.id
+                         : null;
+                       const showRowButton = rowHighlight != null && firstVisibleGroupId === group.id;
+                       const rowActive = rowHighlight != null && highlightedRowId === rowHighlight.id;
                        return (
                          <div key={group.id} className="flex items-end gap-2">
-                           <span className="text-[10px] font-black text-slate-300 w-4 mb-5 select-none">
-                             {group.id}
-                           </span>
+                           {showRowButton && rowHighlight ? (
+                             <button
+                               type="button"
+                               onClick={() => toggleRowHighlight(rowHighlight.id)}
+                               aria-pressed={rowActive}
+                               title={`Show chromosomes still in the tray for ${rowHighlight.label}`}
+                               className={cn(
+                                 'mb-4 px-1.5 py-1 rounded-md border text-[10px] font-black tracking-wide whitespace-nowrap transition-colors print:hidden',
+                                 rowActive
+                                   ? 'bg-sky-500 border-sky-500 text-white'
+                                   : 'bg-white border-slate-200 text-slate-600 shadow-sm hover:border-sky-300 hover:bg-sky-50 hover:text-sky-700',
+                                 !rowActive && !hasUsedRowHighlight && 'row-hint-pulse border-sky-300 text-sky-700'
+                               )}
+                             >
+                               {rowHighlight.label}
+                             </button>
+                           ) : rowHighlight ? null : (
+                             <span className="text-[10px] font-black text-slate-300 w-4 mb-5 select-none">
+                               {group.id}
+                             </span>
+                           )}
                            {visibleGroups.map(pairGroup => (
                              <div key={pairGroup.pairId} className="flex-shrink-0">
                                <KaryotypePair
@@ -3155,6 +4500,8 @@ export default function Chromy() {
                                  onUpdateChromosome={updatePlaced}
                                  isReviewing={isReviewingCertificate}
                                  displayScale={chromosomeDisplayScale}
+                                 lockedIds={lockedChromosomeIds}
+                                 allowOrientation={!orientationPreset}
                                />
                              </div>
                            ))}
@@ -3175,6 +4522,8 @@ export default function Chromy() {
                            onUpdateChromosome={updatePlaced}
                            isReviewing={isReviewingCertificate}
                            displayScale={chromosomeDisplayScale}
+                           lockedIds={lockedChromosomeIds}
+                           allowOrientation={!orientationPreset}
                          />
                        </div>
                      ))}
@@ -3183,6 +4532,60 @@ export default function Chromy() {
                </div>
              </div>
 
+          </div>
+
+          {!isReviewingCertificate && (
+            <RawSampleDroppable id="raw-sample-panel" className="shrink-0 h-auto print:hidden">
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm flex flex-col bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px]">
+                <div className="flex items-center justify-between px-4 pt-3 pb-1 shrink-0">
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
+                    <Info className="w-4 h-4" />
+                    Chromosomes
+                  </h2>
+                  <span className="text-xs font-mono text-slate-400">
+                    {jumbled.length} REMAINING
+                  </span>
+                </div>
+                <div className="px-4 pb-4">
+                  <div className="flex flex-wrap gap-x-3 gap-y-4 items-end justify-center">
+                    {jumbled.length > 0 ? (
+                      jumbled.map((chrom) => {
+                        const lit = highlightedPairIds?.has(chrom.type) ?? false;
+                        const dimmed = highlightedPairIds != null && !lit;
+                        return (
+                          <div
+                            key={chrom.id}
+                            data-row-match={lit ? 'true' : undefined}
+                            className={cn(
+                              'rounded-xl transition-opacity duration-300',
+                              lit && 'bg-sky-100/90',
+                              dimmed && 'opacity-25'
+                            )}
+                          >
+                            <DraggableChromosome
+                              id={chrom.id}
+                              chromosome={chrom}
+                              displayScale={chromosomeDisplayScale}
+                              locked={lockedChromosomeIds.has(chrom.id)}
+                              allowOrientation={!orientationPreset}
+                              highlighted={lit}
+                            />
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div className="w-full flex items-center justify-center gap-2 py-4 text-slate-300">
+                        <CheckCircle2 className="w-5 h-5 opacity-40" />
+                        <p className="text-sm font-medium">Sample fully processed</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </RawSampleDroppable>
+          )}
+          </>
+          )}
           </div>
         </main>
 
@@ -3219,12 +4622,12 @@ export default function Chromy() {
         </AnimatePresence>
 
         <AnimatePresence>
-          {isComplete && !isReviewingCertificate && (
+          {isComplete && !isReviewingCertificate && activeLevel !== LEARN_LEVEL && (spreadComplete || !levelCompleteDismissed) && (
             <motion.div 
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="fixed inset-0 z-[400] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 print:hidden"
+              className="fixed top-16 bottom-0 right-0 left-0 lg:left-[18.5rem] z-[400] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 print:hidden"
             >
               <motion.div 
                 initial={{ scale: 0.9, y: 20 }}
@@ -3236,11 +4639,16 @@ export default function Chromy() {
                   <CheckCircle2 className="w-12 h-12" />
                 </div>
                 
-                <h3 className="text-3xl font-black text-emerald-900 mt-10 mb-3">{successPhrase}</h3>
+                <h3 className="text-3xl font-black text-emerald-900 mt-10 mb-3">
+                  {spreadComplete ? successPhrase : 'Level complete'}
+                </h3>
                 <p className="text-slate-500 text-lg mb-6 leading-relaxed font-medium">
-                  The karyotype has been successfully assembled. All chromosomal pairs are correctly aligned.
+                  {spreadComplete
+                    ? 'Every level on this metaphase spread is complete.'
+                    : `${finishedLevel ? `${finishedLevel.label} ${finishedLevel.title}` : 'This level'} is finished. The certificate is ready after every level on this spread.`}
                 </p>
 
+                {spreadComplete && (
                 <div className="w-full mb-8 flex flex-col items-center">
                   <label htmlFor="cert-name" className="text-sm font-bold text-slate-700 mb-2">Print Karyogram Certificate</label>
                   <input
@@ -3252,10 +4660,11 @@ export default function Chromy() {
                     className="w-full max-w-xs px-4 py-3 rounded-xl border border-slate-200 bg-slate-50 text-center font-bold focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent transition-all"
                   />
                 </div>
+                )}
                 
                 <div className="flex gap-4 w-full">
                   <button 
-                    onClick={() => setGameState('select')}
+                    onClick={() => jumpToScreen('select')}
                     className="flex-1 flex items-center justify-center gap-2 bg-slate-100 text-slate-600 px-4 py-4 rounded-xl font-bold hover:bg-slate-200 transition-colors text-sm"
                   >
                     NEW SAMPLE
@@ -3266,6 +4675,7 @@ export default function Chromy() {
                   >
                     RESTART
                   </button>
+                  {spreadComplete ? (
                   <button 
                     onClick={() => setIsReviewingCertificate(true)}
                     disabled={!certificateName.trim()}
@@ -3273,6 +4683,14 @@ export default function Chromy() {
                   >
                     REVIEW & PRINT
                   </button>
+                  ) : (
+                  <button
+                    onClick={() => setLevelCompleteDismissed(true)}
+                    className="flex-[1.5] flex items-center justify-center gap-2 bg-emerald-500 text-white px-4 py-4 rounded-xl font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/30 text-sm"
+                  >
+                    CONTINUE
+                  </button>
+                  )}
                 </div>
               </motion.div>
             </motion.div>
@@ -3282,12 +4700,28 @@ export default function Chromy() {
           <DragOverlay dropAnimation={null}>
             {activeId && currentActiveChromosome ? (
               <div className="z-50 pointer-events-none drop-shadow-2xl">
-                <ChromosomeVisual chromosome={currentActiveChromosome} displayScale={chromosomeDisplayScale} />
+                <ChromosomeVisual
+                  chromosome={currentActiveChromosome}
+                  displayScale={chromosomeDisplayScale}
+                  highlighted={highlightedPairIds?.has(currentActiveChromosome.type) ?? false}
+                />
               </div>
             ) : null}
           </DragOverlay>
         </DndContext>
+        {levelBriefOpen && finishedLevel && createPortal(
+          <LevelBriefModal level={finishedLevel} onClose={() => setLevelBriefOpen(false)} />,
+          document.body
+        )}
+        {sourcePreviewOpen && selectedImage && createPortal(
+          <SourceSpreadModal
+            imageUrl={selectedImage.originalUrl}
+            onClose={() => setSourcePreviewOpen(false)}
+          />,
+          document.body
+        )}
       </div>
+      )}
 
       <style>{`
         .scrollbar-hide::-webkit-scrollbar {
@@ -3296,6 +4730,13 @@ export default function Chromy() {
         .scrollbar-hide {
           -ms-overflow-style: none;
           scrollbar-width: none;
+        }
+        @keyframes row-hint-pulse {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(14, 165, 233, 0.45); }
+          70% { box-shadow: 0 0 0 5px rgba(14, 165, 233, 0); }
+        }
+        .row-hint-pulse {
+          animation: row-hint-pulse 1.8s ease-out infinite;
         }
       `}</style>
     </div>

@@ -28,6 +28,31 @@ export const CLINICAL_KARYOTYPE_ROWS: { id: string; pairIds: string[] }[][] = [
   ],
 ];
 
+/** Match-level row buttons. Clicking one highlights pending chromosomes from these groups. */
+export const MATCH_ROW_HIGHLIGHTS: { id: string; label: string; groupIds: string[] }[] = [
+  { id: 'AB', label: 'A–B', groupIds: ['A', 'B'] },
+  { id: 'C', label: 'C', groupIds: ['C'] },
+  { id: 'DE', label: 'D–E', groupIds: ['D', 'E'] },
+  { id: 'FG', label: 'F–G', groupIds: ['F', 'G'] },
+  { id: 'XY', label: 'X–Y', groupIds: ['SEX'] },
+];
+
+export function matchRowHighlightForGroup(groupId: string) {
+  return MATCH_ROW_HIGHLIGHTS.find(row => row.groupIds.includes(groupId)) ?? null;
+}
+
+export function pairIdsForMatchRow(rowId: string): string[] {
+  const row = MATCH_ROW_HIGHLIGHTS.find(item => item.id === rowId);
+  if (!row) return [];
+  const ids: string[] = [];
+  for (const clinicalRow of CLINICAL_KARYOTYPE_ROWS) {
+    for (const group of clinicalRow) {
+      if (row.groupIds.includes(group.id)) ids.push(...group.pairIds);
+    }
+  }
+  return ids;
+}
+
 export const MAX_CHROMOSOMES_PER_PAIR = 4;
 
 const STANDARD_PAIR_ID_SET = new Set(STANDARD_PAIR_IDS);
