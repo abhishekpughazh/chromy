@@ -316,14 +316,41 @@ function viewOrigin(
   pan: { x: number; y: number },
   zoom: number,
   spread: SpreadView,
+  natural: { w: number; h: number },
   frame: { w: number; h: number },
 ) {
   const scale = spread.fit * zoom;
+  const displayW = natural.w * scale;
+  const displayH = natural.h * scale;
+  // A short frame (Level 3.2's full number tray) often fits the whole photo
+  // on one axis. Center that photo. Only a photo larger than the frame is
+  // cropped around the chromosome cluster.
+  const fitsX = natural.w > 0 && displayW <= frame.w + 0.5;
+  const fitsY = natural.h > 0 && displayH <= frame.h + 0.5;
   return {
     scale,
     fit: spread.fit,
-    x: frame.w / 2 + pan.x - spread.centerX * scale,
-    y: frame.h / 2 + pan.y - spread.centerY * scale,
+    x: fitsX ? (frame.w - displayW) / 2 + pan.x : frame.w / 2 + pan.x - spread.centerX * scale,
+    y: fitsY ? (frame.h - displayH) / 2 + pan.y : frame.h / 2 + pan.y - spread.centerY * scale,
+  };
+}
+
+function panForOrigin(
+  originX: number,
+  originY: number,
+  zoom: number,
+  spread: SpreadView,
+  natural: { w: number; h: number },
+  frame: { w: number; h: number },
+) {
+  const scale = spread.fit * zoom;
+  const displayW = natural.w * scale;
+  const displayH = natural.h * scale;
+  const fitsX = natural.w > 0 && displayW <= frame.w + 0.5;
+  const fitsY = natural.h > 0 && displayH <= frame.h + 0.5;
+  return {
+    x: fitsX ? originX - (frame.w - displayW) / 2 : originX - frame.w / 2 + spread.centerX * scale,
+    y: fitsY ? originY - (frame.h - displayH) / 2 : originY - frame.h / 2 + spread.centerY * scale,
   };
 }
 
@@ -337,7 +364,7 @@ function clampPan(
   if (zoom <= MIN_ZOOM) return { x: 0, y: 0 };
   const scale = spread.fit * zoom;
   const clampAxis = (value: number, frameSize: number, naturalSize: number, center: number) => {
-    if (naturalSize * scale <= frameSize) return 0;
+    if (naturalSize <= 0 || naturalSize * scale <= frameSize) return 0;
     const min = frameSize / 2 - (naturalSize - center) * scale;
     const max = center * scale - frameSize / 2;
     return clamp(value, Math.min(min, max), Math.max(min, max));
@@ -429,7 +456,7 @@ export default function LabelSpreadLevel({
     [chromosomes, natural, frame]
   );
   spreadRef.current = spread;
-  const view = viewOrigin(pan, zoom, spread, frame);
+  const view = viewOrigin(pan, zoom, spread, natural, frame);
   const scale = view.scale;
   const displayW = natural.w * scale;
   const displayH = natural.h * scale;
@@ -491,7 +518,7 @@ export default function LabelSpreadLevel({
       if (nextZoom === currentZoom) return;
       const rect = element.getBoundingClientRect();
       const frameSize = { w: rect.width, h: rect.height };
-      const current = viewOrigin(panRef.current, currentZoom, spreadRef.current, frameSize);
+      const current = viewOrigin(panRef.current, currentZoom, spreadRef.current, naturalRef.current, frameSize);
       if (current.scale <= 0) return;
       const imageX = (event.clientX - rect.left - current.x) / current.scale;
       const imageY = (event.clientY - rect.top - current.y) / current.scale;
@@ -499,10 +526,7 @@ export default function LabelSpreadLevel({
       const nextOriginX = event.clientX - rect.left - imageX * nextScale;
       const nextOriginY = event.clientY - rect.top - imageY * nextScale;
       const nextPan = clampPan(
-        {
-          x: nextOriginX - frameSize.w / 2 + spreadRef.current.centerX * nextScale,
-          y: nextOriginY - frameSize.h / 2 + spreadRef.current.centerY * nextScale,
-        },
+        panForOrigin(nextOriginX, nextOriginY, nextZoom, spreadRef.current, naturalRef.current, frameSize),
         nextZoom,
         spreadRef.current,
         naturalRef.current,
@@ -798,7 +822,7 @@ export default function LabelSpreadLevel({
   };
 
   return (
-    <div className="h-full min-h-0 min-w-0 w-full flex flex-col gap-2 select-none">
+    <div className="h-full min-h-0 min-w-0 w-full max-w-full overflow-x-hidden flex flex-col gap-2 select-none">
       <div
         className={cn(
           'relative min-h-0 flex-1 rounded-2xl border bg-slate-950 shadow-sm overflow-hidden',

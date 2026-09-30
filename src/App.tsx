@@ -4370,7 +4370,7 @@ export default function Chromy() {
           )}
 
           <div className={cn(
-            "min-h-0 min-w-0 h-full flex flex-col gap-4",
+            "min-h-0 min-w-0 max-w-full h-full overflow-x-hidden flex flex-col gap-4",
             !isReviewingCertificate && "lg:col-start-2 lg:row-start-1"
           )}>
           {activeLevel === LEARN_LEVEL && selectedImage ? (
