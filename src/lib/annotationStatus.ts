@@ -1,12 +1,14 @@
+import { isPairLabel } from './chromosomePairs';
+
 export type AnnotationStatus = 'never_started' | 'in_progress' | 'complete';
 
 function isLabeledStroke(label: string | null | undefined, pointCount: number): boolean {
-  return !!label && label !== 'Unassigned' && pointCount >= 3;
+  return isPairLabel(label) && pointCount >= 3;
 }
 
 const labeledCountCache = new Map<string, number>();
 
-/** Labeled (non-Unassigned) chromosomes in saved annotation XML. */
+/** Pair-labeled chromosomes in saved annotation XML. Unassigned and Invalid strokes are excluded. */
 export function countLabeledChromosomes(xml?: string): number {
   if (!xml) return 0;
   const cached = labeledCountCache.get(xml);

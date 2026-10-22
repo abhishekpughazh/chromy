@@ -81,19 +81,15 @@ drop policy if exists "Users can insert their own buckets" on public.buckets;
 drop policy if exists "Users can update their own buckets" on public.buckets;
 drop policy if exists "Users can delete their own buckets" on public.buckets;
 drop policy if exists "Admins can view all buckets" on public.buckets;
+drop policy if exists "Authenticated users can view buckets" on public.buckets;
 drop policy if exists "Only Super Admins can create buckets" on public.buckets;
 drop policy if exists "Only Super Admins can update buckets" on public.buckets;
 drop policy if exists "Only Super Admins can delete buckets" on public.buckets;
 
-create policy "Admins can view all buckets"
+create policy "Authenticated users can view buckets"
   on public.buckets for select
-  using (
-    exists (
-      select 1 from public.user_roles
-      where user_roles.user_id = auth.uid()
-      and user_roles.role in ('SUPER ADMIN', 'ADMIN')
-    )
-  );
+  to authenticated
+  using ( true );
 
 create policy "Only Super Admins can create buckets"
   on public.buckets for insert
@@ -208,6 +204,13 @@ alter table public.samples add column if not exists difficulty text;
 alter table public.samples drop constraint if exists samples_difficulty_check;
 alter table public.samples add constraint samples_difficulty_check
   check (difficulty is null or difficulty in ('easy', 'moderate', 'hard'));
+
+-- Annotator-assigned level (1-10) for this metaphase spread. Defaults to 1 for all existing and new spreads.
+alter table public.samples add column if not exists spread_level integer not null default 1;
+update public.samples set spread_level = 1 where spread_level is null;
+alter table public.samples drop constraint if exists samples_spread_level_check;
+alter table public.samples add constraint samples_spread_level_check
+  check (spread_level >= 1 and spread_level <= 10);
 
 -- 3. Enable Row Level Security (RLS) on the samples table
 alter table public.samples enable row level security;

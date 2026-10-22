@@ -1,9 +1,9 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { X, Save, PenLine, Trash2, Undo2, Hand, ZoomIn, ZoomOut, Maximize, MousePointer2, Eye, EyeOff, RotateCw, FlipHorizontal, FlipVertical, Plus, Pencil, LayoutGrid, Loader } from 'lucide-react';
-import { STANDARD_PAIR_IDS, MAX_CHROMOSOMES_PER_PAIR, normalizePairId, isStandardPairId } from '../lib/chromosomePairs';
+import { STANDARD_PAIR_IDS, MAX_CHROMOSOMES_PER_PAIR, normalizePairId, isStandardPairId, isPairLabel, isInvalidLabel, isReservedPairName, INVALID_LABEL } from '../lib/chromosomePairs';
 import { normalizeRotation, pointerAngleDeg, chromosomeTransform, toggleDisplayedFlipX, toggleDisplayedFlipY } from '../lib/orientation';
 import { countLabeledStrokes, parseExpectedChromosomeCount, markCompleteMismatchMessage } from '../lib/annotationStatus';
-import { DIFFICULTIES, DIFFICULTY_LABELS, type SpreadDifficulty } from '../lib/difficulty';
+import { DIFFICULTIES, DIFFICULTY_LABELS, SPREAD_LEVELS, type SpreadDifficulty, type SpreadLevel } from '../lib/difficulty';
 import { cropBoundsFromPoints, cropPolygonFromImage } from '../lib/chromosomeCrop';
 import { cn } from '../lib/utils';
 import KaryotypePreview, { type KaryotypePreviewChromosome } from './KaryotypePreview';
@@ -29,8 +29,19 @@ function escapeXml(value: string): string {
     .replace(/>/g, '&gt;');
 }
 
+/** Amber ink for overlap decoys, so they stay distinct from pair outlines. */
+const INVALID_STROKE_COLOR = '#d97706';
+const PAIR_HIGHLIGHT_MS = 2000;
+
+/** One flash that eases away over the highlight window. Full strength at the start, gone at the end. */
+function pairHighlightAlpha(elapsedMs: number): number {
+  const t = elapsedMs / PAIR_HIGHLIGHT_MS;
+  if (t < 0 || t >= 1) return 0;
+  return Math.cos(t * Math.PI / 2);
+}
+
 function labeledPairId(stroke: { label?: string }): string | null {
-  if (!stroke.label || stroke.label === 'Unassigned') return null;
+  if (!isPairLabel(stroke.label)) return null;
   return normalizePairId(stroke.label);
 }
 
@@ -55,12 +66,13 @@ function sharedPairNote(strokes: { label?: string; info?: string }[], pairId: st
  */
 function nextAvailablePair(strokes: Stroke[], allPairIds: string[], preferId?: string): string | null {
   const counts = new Map<string, number>();
+  if (isInvalidLabel(preferId)) return INVALID_LABEL;
   strokes.forEach(s => {
-    if (!s.label || s.label === 'Unassigned') return;
+    if (!isPairLabel(s.label)) return;
     const pid = normalizePairId(s.label);
     counts.set(pid, (counts.get(pid) || 0) + 1);
   });
-  if (preferId && preferId !== 'Unassigned') {
+  if (isPairLabel(preferId)) {
     const preferred = normalizePairId(preferId);
     if ((counts.get(preferred) || 0) < MAX_CHROMOSOMES_PER_PAIR) return preferred;
   }
@@ -77,12 +89,14 @@ interface ImageAnnotationModalProps {
   karyotype?: string;
   annotationComplete?: boolean;
   difficulty?: SpreadDifficulty | null;
+  spreadLevel?: SpreadLevel;
   /** Bucket sentences for this spread. A local override replaces one pair on this spread only. */
   bucketPairNotes?: Record<string, string>;
   initialPairNoteOverrides?: Record<string, string>;
   onSave: (xml: string, pairNoteOverrides: Record<string, string>) => Promise<void>;
   onSetComplete: (complete: boolean) => Promise<void>;
   onSetDifficulty: (difficulty: SpreadDifficulty | null) => Promise<void>;
+  onSetSpreadLevel: (level: SpreadLevel) => Promise<void>;
   onClose: () => void;
 }
 
@@ -90,7 +104,8 @@ function strokesToXml(strokes: Stroke[], imageId: string, imgWidth: number, imgH
   let xml = `<?xml version="1.0" encoding="UTF-8"?>\n`;
   xml += `<annotations imageId="${imageId}" width="${imgWidth}" height="${imgHeight}">\n`;
   for (const s of strokes) {
-    xml += `  <stroke color="${s.color}" width="${s.width}" label="${s.label || 'Unassigned'}" rotation="${normalizeRotation(s.rotation)}" flipX="${s.flipX || false}" flipY="${s.flipY || false}">\n`;
+    const invalid = isInvalidLabel(s.label);
+    xml += `  <stroke color="${s.color}" width="${s.width}" label="${s.label || 'Unassigned'}" rotation="${invalid ? 0 : normalizeRotation(s.rotation)}" flipX="${invalid ? false : (s.flipX || false)}" flipY="${invalid ? false : (s.flipY || false)}">\n`;
     // Keep the sentence that was already stored on this stroke. New sentences
     // live in pair_note_overrides so a note edit does not change the annotation hash.
     const note = s.info?.trim();
@@ -114,9 +129,10 @@ function xmlToStrokes(xmlText: string): Stroke[] | null {
       const color = el.getAttribute('color') || '#ff0000';
       const width = parseFloat(el.getAttribute('width') || '2');
       const label = el.getAttribute('label') || 'Unassigned';
-      const rotation = normalizeRotation(parseFloat(el.getAttribute('rotation') || '0'));
-      const flipX = el.getAttribute('flipX') === 'true';
-      const flipY = el.getAttribute('flipY') === 'true';
+      const invalid = isInvalidLabel(label);
+      const rotation = invalid ? 0 : normalizeRotation(parseFloat(el.getAttribute('rotation') || '0'));
+      const flipX = !invalid && el.getAttribute('flipX') === 'true';
+      const flipY = !invalid && el.getAttribute('flipY') === 'true';
       const info = el.querySelector('info')?.textContent?.trim() || undefined;
       const pointEls = el.querySelectorAll('point');
       const points: Point[] = [];
@@ -412,9 +428,18 @@ function distToSegment(p: Point, v: Point, w: Point) {
   return Math.hypot(p.x - (v.x + t * (w.x - v.x)), p.y - (v.y + t * (w.y - v.y)));
 }
 
+function strokeEdgeHit(p: Point, polygon: Point[], radius: number) {
+  for (let j = 0; j < polygon.length; j++) {
+    const p1 = polygon[j];
+    const p2 = polygon[(j + 1) % polygon.length];
+    if (distToSegment(p, p1, p2) <= radius) return true;
+  }
+  return false;
+}
+
 type Mode = 'draw' | 'pan' | 'edit';
 
-export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, karyotype, annotationComplete, difficulty: initialDifficulty = null, bucketPairNotes = {}, initialPairNoteOverrides = {}, onSave, onSetComplete, onSetDifficulty, onClose }: ImageAnnotationModalProps) {
+export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, karyotype, annotationComplete, difficulty: initialDifficulty = null, spreadLevel: initialSpreadLevel = 1, bucketPairNotes = {}, initialPairNoteOverrides = {}, onSave, onSetComplete, onSetDifficulty, onSetSpreadLevel, onClose }: ImageAnnotationModalProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
@@ -440,22 +465,32 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
   const [complete, setComplete] = useState(!!annotationComplete);
   const [difficulty, setDifficulty] = useState<SpreadDifficulty | null>(initialDifficulty);
   const [difficultyBusy, setDifficultyBusy] = useState(false);
+  const [spreadLevel, setSpreadLevel] = useState<SpreadLevel>(initialSpreadLevel);
+  const [levelBusy, setLevelBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [previewPoint, setPreviewPoint] = useState<Point | null>(null);
 
   const [showLabels, setShowLabels] = useState(true);
+  const [highlightedPairId, setHighlightedPairId] = useState<string | null>(null);
+  const highlightFlashRef = useRef<{ pairId: string; startedAt: number } | null>(null);
   const [showKaryotypePreview, setShowKaryotypePreview] = useState(false);
   const [cropUrls, setCropUrls] = useState<Record<string, string>>({});
   const cropCacheRef = useRef<Map<string, { sig: string; dataUrl: string }>>(new Map());
   const [mode, setMode] = useState<Mode>('draw');
   const [drawStyle, setDrawStyle] = useState<'polygon' | 'freehand'>('freehand');
   const [activeLabel, setActiveLabel] = useState<string>(STANDARD_PAIR_IDS[0]);
+  // Pair (or Unassigned) that was armed before Invalid, so unclicking Invalid can restore it.
+  const labelBeforeInvalidRef = useRef<string>(STANDARD_PAIR_IDS[0]);
   // The 24 standard pair slots, renameable in place (renaming replaces the
   // entry at that position rather than spawning a separate custom pair).
   const [pairOrder, setPairOrder] = useState<string[]>([...STANDARD_PAIR_IDS]);
   const [customPairs, setCustomPairs] = useState<string[]>([]);
   const [selectedStrokeId, setSelectedStrokeId] = useState<string | null>(null);
   const [orientingStrokeId, setOrientingStrokeId] = useState<string | null>(null);
+  const openOrientation = (strokeId: string | null | undefined, label?: string | null) => {
+    if (!strokeId || isInvalidLabel(label)) return;
+    setOrientingStrokeId(strokeId);
+  };
   const [draggedPoint, setDraggedPoint] = useState<{ strokeId: string, index: number } | null>(null);
   const [scale, setScale] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -485,18 +520,17 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
     };
   };
 
-  const redrawAll = useCallback((allStrokes: Stroke[], activeStroke: Stroke | null, preview: Point | null, selectedId: string | null, displayLabels: boolean) => {
+  const redrawAll = useCallback((allStrokes: Stroke[], activeStroke: Stroke | null, preview: Point | null, selectedId: string | null, displayLabels: boolean, highlightedPair: string | null, highlightAlpha: number, ghostPairs: boolean) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const drawStroke = (stroke: Stroke, isComplete: boolean, tempPoint: Point | null = null) => {
+    const drawStroke = (stroke: Stroke, isComplete: boolean, tempPoint: Point | null = null, ghost = false) => {
       if (stroke.points.length === 0) return;
+      const ink = isInvalidLabel(stroke.label) ? INVALID_STROKE_COLOR : stroke.color;
       ctx.beginPath();
-      ctx.strokeStyle = stroke.color;
-      ctx.lineWidth = stroke.width;
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
       ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
@@ -506,9 +540,23 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       if (tempPoint) {
         ctx.lineTo(tempPoint.x, tempPoint.y);
       }
+
+      if (ghost) {
+        ctx.save();
+        ctx.globalAlpha = 0.4;
+        ctx.setLineDash([8, 6]);
+        ctx.strokeStyle = ink;
+        ctx.lineWidth = Math.max(1.5, stroke.width);
+        ctx.stroke();
+        ctx.restore();
+        return;
+      }
+
+      ctx.strokeStyle = ink;
+      ctx.lineWidth = stroke.width;
       if (isComplete) {
         ctx.closePath();
-        ctx.fillStyle = stroke.color + '40';
+        ctx.fillStyle = ink + '40';
         ctx.fill();
       }
       ctx.stroke();
@@ -517,7 +565,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       const showDots = !isComplete || isSelected;
 
       if (showDots) {
-        ctx.fillStyle = stroke.color;
+        ctx.fillStyle = ink;
         for (const pt of stroke.points) {
           ctx.beginPath();
           ctx.arc(pt.x, pt.y, stroke.width * 1.5, 0, Math.PI * 2);
@@ -525,7 +573,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
         }
       }
 
-      if (displayLabels && stroke.label && stroke.label !== 'Unassigned' && stroke.points.length > 0 && isComplete && !isSelected) {
+      if (displayLabels && isPairLabel(stroke.label) && stroke.points.length > 0 && isComplete && !isSelected) {
         let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
         for (const p of stroke.points) {
            if (p.x < minX) minX = p.x;
@@ -545,7 +593,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
         const padding = fontSize * 0.3;
         const th = fontSize;
 
-        ctx.fillStyle = stroke.color;
+        ctx.fillStyle = ink;
         ctx.beginPath();
         if (typeof ctx.roundRect === 'function') {
           ctx.roundRect(cx - tw/2 - padding, cy - th/2 - padding, tw + padding*2, th + padding*2, padding);
@@ -561,8 +609,17 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       }
     };
 
-    for (const stroke of allStrokes) {
-      drawStroke(stroke, true);
+    if (ghostPairs) {
+      for (const stroke of allStrokes) {
+        if (isPairLabel(stroke.label)) drawStroke(stroke, true, null, true);
+      }
+      for (const stroke of allStrokes) {
+        if (!isPairLabel(stroke.label)) drawStroke(stroke, true);
+      }
+    } else {
+      for (const stroke of allStrokes) {
+        drawStroke(stroke, true);
+      }
     }
 
     if (activeStroke) {
@@ -574,6 +631,20 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
         ctx.lineWidth = 2;
         ctx.arc(first.x, first.y, activeStroke.width * 3, 0, Math.PI * 2);
         ctx.stroke();
+      }
+    }
+
+    if (highlightedPair && highlightAlpha > 0.02) {
+      for (const stroke of allStrokes) {
+        if (!isPairLabel(stroke.label) || normalizePairId(stroke.label) !== highlightedPair || stroke.points.length < 3) continue;
+        ctx.beginPath();
+        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+        for (let i = 1; i < stroke.points.length; i++) {
+          ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = `rgba(14, 165, 233, ${0.5 * highlightAlpha})`;
+        ctx.fill();
       }
     }
   }, []);
@@ -589,7 +660,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       const discoveredCustom = Array.from(new Set(
         loaded
           .map(s => normalizePairId(s.label || 'Unassigned'))
-          .filter(id => id !== 'Unassigned' && !isStandardPairId(id))
+          .filter(id => isPairLabel(id) && !isStandardPairId(id))
       ));
       setCustomPairs(discoveredCustom);
       const next = nextAvailablePair(loaded, [...STANDARD_PAIR_IDS, ...discoveredCustom]);
@@ -636,7 +707,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       const next: Record<string, string> = {};
       const liveIds = new Set<string>();
       for (const s of strokes) {
-        if (!s.label || s.label === 'Unassigned' || s.points.length < 3) continue;
+        if (!isPairLabel(s.label) || s.points.length < 3) continue;
         liveIds.add(s.id);
         const sig = s.points.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join('|');
         const cached = cropCacheRef.current.get(s.id);
@@ -729,21 +800,41 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
           if (next) setActiveLabel(next);
           return newStrokes;
         });
-        setOrientingStrokeId(newStroke.id);
+        openOrientation(newStroke.id, newStroke.label);
         setCurrentStroke(null);
         setPreviewPoint(null);
       } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedStrokeId) {
         setStrokes(prev => prev.filter(s => s.id !== selectedStrokeId));
         setSelectedStrokeId(null);
+        if (isInvalidLabel(activeLabel)) setMode('draw');
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [currentStroke, selectedStrokeId, orientingStrokeId, pairOrder, customPairs, showKaryotypePreview]);
+  }, [currentStroke, selectedStrokeId, orientingStrokeId, pairOrder, customPairs, showKaryotypePreview, activeLabel]);
 
   useEffect(() => {
-    redrawAll(strokes, currentStroke, previewPoint, selectedStrokeId, showLabels);
-  }, [strokes, currentStroke, previewPoint, selectedStrokeId, showLabels, redrawAll]);
+    let raf = 0;
+    const draw = () => {
+      const flash = highlightFlashRef.current;
+      let pair: string | null = null;
+      let alpha = 0;
+      if (flash && flash.pairId === highlightedPairId) {
+        const elapsed = performance.now() - flash.startedAt;
+        if (elapsed < PAIR_HIGHLIGHT_MS) {
+          pair = flash.pairId;
+          alpha = pairHighlightAlpha(elapsed);
+        } else {
+          highlightFlashRef.current = null;
+          setHighlightedPairId(null);
+        }
+      }
+      redrawAll(strokes, currentStroke, previewPoint, selectedStrokeId, showLabels, pair, alpha, isInvalidLabel(activeLabel));
+      if (pair) raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [strokes, currentStroke, previewPoint, selectedStrokeId, showLabels, highlightedPairId, redrawAll, mode, activeLabel]);
 
   const handlePointerDown = (e: React.PointerEvent) => {
     const target = e.target as HTMLElement;
@@ -830,26 +921,16 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
         setSelectedStrokeId(null); // Deselect if drawing
         
         if (!currentStroke) {
+          // An armed Invalid label draws a decoy over chromosomes that are already outlined.
+          const drawingInvalid = isInvalidLabel(activeLabel);
           for (let i = strokes.length - 1; i >= 0; i--) {
             const s = strokes[i];
-            if (isPointInPolygon(p, s.points)) {
-              setMode('edit');
+            if (drawingInvalid && isPairLabel(s.label)) continue;
+            if (isPointInPolygon(p, s.points) || strokeEdgeHit(p, s.points, 5 / scale)) {
+              // Stay armed for Invalid. Selecting a decoy to delete must not
+              // drop back to Edit, or the valid chromosomes undim.
               setSelectedStrokeId(s.id);
-              return;
-            }
-            const edgeRadius = 5 / scale;
-            let onEdge = false;
-            for (let j = 0; j < s.points.length; j++) {
-              const p1 = s.points[j];
-              const p2 = s.points[(j + 1) % s.points.length];
-              if (distToSegment(p, p1, p2) <= edgeRadius) {
-                onEdge = true;
-                break;
-              }
-            }
-            if (onEdge) {
-              setMode('edit');
-              setSelectedStrokeId(s.id);
+              if (!drawingInvalid) setMode('edit');
               return;
             }
           }
@@ -865,7 +946,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
               setPreviewPoint(null);
               const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs], newStroke.label);
               if (next) setActiveLabel(next);
-              setOrientingStrokeId(newStroke.id);
+              openOrientation(newStroke.id, newStroke.label);
             } else {
               setCurrentStroke(null);
               setPreviewPoint(null);
@@ -888,7 +969,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
               setPreviewPoint(null);
               const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs], newStroke.label);
               if (next) setActiveLabel(next);
-              setOrientingStrokeId(newStroke.id);
+              openOrientation(newStroke.id, newStroke.label);
             } else {
               setCurrentStroke({ ...currentStroke, points: [...currentStroke.points, p] });
             }
@@ -927,7 +1008,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
             gestureRef.current.type = null;
             const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs], newStroke.label);
             if (next) setActiveLabel(next);
-            setOrientingStrokeId(newStroke.id);
+            openOrientation(newStroke.id, newStroke.label);
           } else {
             setCurrentStroke({ ...currentStroke, points: newPoints });
           }
@@ -1005,9 +1086,10 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       gestureRef.current.type = null;
       const next = nextAvailablePair(newStrokes, [...pairOrder, ...customPairs], newStroke.label);
       if (next) setActiveLabel(next);
-      setOrientingStrokeId(newStroke.id);
+      openOrientation(newStroke.id, newStroke.label);
     } else if (mode === 'edit' && selectedStrokeId) {
-      setOrientingStrokeId(selectedStrokeId);
+      const selected = strokes.find(s => s.id === selectedStrokeId);
+      openOrientation(selectedStrokeId, selected?.label);
     }
   };
 
@@ -1037,6 +1119,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
     if (selectedStrokeId) {
       setStrokes(prev => prev.filter(s => s.id !== selectedStrokeId));
       setSelectedStrokeId(null);
+      if (isInvalidLabel(activeLabel)) setMode('draw');
     }
   };
 
@@ -1078,6 +1161,21 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       setSaveMsg('Error updating difficulty');
     } finally {
       setDifficultyBusy(false);
+    }
+  };
+
+  const handleSetSpreadLevel = async (next: SpreadLevel) => {
+    if (saving || levelBusy || next === spreadLevel) return;
+    const previous = spreadLevel;
+    setSpreadLevel(next);
+    setLevelBusy(true);
+    try {
+      await onSetSpreadLevel(next);
+    } catch {
+      setSpreadLevel(previous);
+      setSaveMsg('Error updating level');
+    } finally {
+      setLevelBusy(false);
     }
   };
 
@@ -1233,7 +1331,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
 
   const previewChromosomes: KaryotypePreviewChromosome[] = useMemo(() => (
     strokes
-      .filter(s => s.label && s.label !== 'Unassigned' && s.points.length >= 3)
+      .filter(s => isPairLabel(s.label) && s.points.length >= 3)
       .map(s => {
         const bounds = cropBoundsFromPoints(s.points, imgSize.width, imgSize.height);
         return {
@@ -1265,10 +1363,10 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
     const hasGeometry = updates.rotation != null || updates.flipX != null || updates.flipY != null || updates.label != null;
     if (!hasGeometry) return;
     setStrokes(prev => {
-      if (updates.label && updates.label !== 'Unassigned') {
+      if (updates.label && isPairLabel(updates.label)) {
         const pid = normalizePairId(updates.label);
         const count = prev.filter(s =>
-          s.id !== strokeId && s.label && s.label !== 'Unassigned' && normalizePairId(s.label) === pid
+          s.id !== strokeId && isPairLabel(s.label) && normalizePairId(s.label) === pid
         ).length;
         if (count >= MAX_CHROMOSOMES_PER_PAIR) return prev;
       }
@@ -1291,11 +1389,58 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
     setSelectedStrokeId(id => id === strokeId ? null : id);
   }, []);
 
+  const flashPair = (pairId: string) => {
+    if (!isPairLabel(pairId)) return;
+    const id = normalizePairId(pairId);
+    highlightFlashRef.current = { pairId: id, startedAt: performance.now() };
+    setHighlightedPairId(id);
+  };
+
+  const leaveInvalidDraw = () => {
+    const prefer = labelBeforeInvalidRef.current;
+    const restored = prefer && !isInvalidLabel(prefer) ? prefer : (pairOrder[0] || STANDARD_PAIR_IDS[0]);
+    setActiveLabel(restored);
+    setMode('draw');
+    setSelectedStrokeId(null);
+    setCurrentStroke(null);
+    setPreviewPoint(null);
+    gestureRef.current.type = null;
+    gestureRef.current.drawStroke = null;
+  };
+
+  const enterInvalidDraw = () => {
+    if (!isInvalidLabel(activeLabel)) labelBeforeInvalidRef.current = activeLabel;
+    setActiveLabel(INVALID_LABEL);
+    setMode('draw');
+    setSelectedStrokeId(null);
+    setCurrentStroke(null);
+    setPreviewPoint(null);
+    gestureRef.current.type = null;
+    gestureRef.current.drawStroke = null;
+  };
+
   const handleLabelClick = (pairId: string) => {
+    if (isInvalidLabel(pairId)) {
+      const selected = mode === 'edit' && selectedStrokeId
+        ? strokes.find(s => s.id === selectedStrokeId)
+        : undefined;
+      // Edit mode can still retag one outlined chromosome as Invalid.
+      // A second click, with Invalid already armed and nothing else to retag, turns the mode off.
+      if (!(selected && !isInvalidLabel(selected.label))) {
+        if (isInvalidLabel(activeLabel)) {
+          leaveInvalidDraw();
+          return;
+        }
+        enterInvalidDraw();
+        return;
+      }
+    }
     if (mode === 'edit' && selectedStrokeId) {
       setStrokes(prev => prev.map(s => {
         if (s.id !== selectedStrokeId) return s;
-        return { ...s, label: pairId };
+        return isInvalidLabel(pairId)
+          ? { ...s, label: pairId, rotation: 0, flipX: false, flipY: false }
+          : { ...s, label: pairId };
       }));
     } else {
       setActiveLabel(pairId);
@@ -1310,6 +1455,10 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
     if (name === null) return;
     const trimmed = name.trim();
     if (!trimmed) return;
+    if (isReservedPairName(trimmed)) {
+      window.alert(`"${trimmed}" is reserved and cannot be a pair name.`);
+      return;
+    }
     const alreadyExists = [...pairOrder, ...customPairs].some(p => p.toLowerCase() === trimmed.toLowerCase());
     if (alreadyExists) {
       window.alert(`A pair named "${trimmed}" already exists.`);
@@ -1347,6 +1496,10 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
     if (newName === null) return;
     const trimmed = newName.trim();
     if (!trimmed || trimmed === pairId) return;
+    if (isReservedPairName(trimmed)) {
+      window.alert(`"${trimmed}" is reserved and cannot be a pair name.`);
+      return;
+    }
     const alreadyExists = [...pairOrder, ...customPairs]
       .filter(id => id !== pairId)
       .some(id => id.toLowerCase() === trimmed.toLowerCase());
@@ -1369,7 +1522,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
 
   const pairCounts = new Map<string, number>();
   strokes.forEach(s => {
-    if (!s.label || s.label === 'Unassigned' || s.id === selectedStrokeId) return;
+    if (!isPairLabel(s.label) || s.id === selectedStrokeId) return;
     const pid = normalizePairId(s.label);
     pairCounts.set(pid, (pairCounts.get(pid) || 0) + 1);
   });
@@ -1384,22 +1537,23 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
         className="bg-white rounded-2xl shadow-2xl flex flex-col w-[95vw] h-[95vh] overflow-hidden"
         onPointerDown={(e) => e.stopPropagation()}
       >
-        {/* Toolbar */}
-        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-slate-200 bg-slate-50">
-          <div className="flex items-center gap-4">
-            <span className="text-xs font-mono text-slate-400 uppercase">Annotation Mode</span>
-            <div className="flex items-center gap-2">
+        {/* Toolbar. Drawing tools stay on the first row. Spread status stays on the second, with the actions pinned to the right. */}
+        <div className="border-b border-slate-200 bg-slate-50">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-2 px-3 py-2">
+            <div className="flex items-center gap-1.5" role="group" aria-label="Stroke color">
               {['#ef4444', '#22c55e', '#3b82f6', '#f59e0b', '#8b5cf6', '#000000'].map((c) => (
                 <button
                   key={c}
+                  type="button"
                   onClick={() => setColor(c)}
-                  className={`w-5 h-5 rounded-full border-2 ${color === c ? 'border-slate-900 scale-110' : 'border-transparent'}`}
+                  aria-label={`Stroke color ${c}`}
+                  className={`h-5 w-5 rounded-full border-2 ${color === c ? 'border-slate-900 scale-110' : 'border-transparent'}`}
                   style={{ backgroundColor: c }}
                 />
               ))}
             </div>
-            <div className="flex items-center gap-2 ml-2">
-              <PenLine className="w-3 h-3 text-slate-400" />
+            <div className="flex items-center gap-1.5">
+              <PenLine className="h-3.5 w-3.5 text-slate-400" />
               <input
                 type="range"
                 min={1}
@@ -1407,95 +1561,117 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
                 step={0.5}
                 value={lineWidth}
                 onChange={(e) => setLineWidth(parseFloat(e.target.value))}
+                aria-label="Stroke width"
                 className="w-20"
               />
             </div>
 
-            <div className="h-6 w-px bg-slate-300 mx-1" />
+            <div className="mx-1 h-6 w-px bg-slate-200" />
+
+            <div className="flex items-center gap-1 rounded-lg bg-slate-200 p-0.5">
+              <button
+                type="button"
+                onClick={() => { setMode('draw'); setSelectedStrokeId(null); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
+                className={`flex h-7 items-center gap-1 rounded-md px-2 text-xs font-bold transition-colors ${mode === 'draw' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-300'}`}
+              >
+                <PenLine className="h-3.5 w-3.5" /> Draw
+              </button>
+              {mode === 'draw' && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => { setDrawStyle('polygon'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
+                    className={`h-7 rounded-md px-2 text-[10px] font-bold transition-colors ${drawStyle === 'polygon' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >
+                    Polygon
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setDrawStyle('freehand'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
+                    className={`h-7 rounded-md px-2 text-[10px] font-bold transition-colors ${drawStyle === 'freehand' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >
+                    Freehand
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => { setMode('edit'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
+                className={`flex h-7 items-center gap-1 rounded-md px-2 text-xs font-bold transition-colors ${mode === 'edit' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-300'}`}
+              >
+                <MousePointer2 className="h-3.5 w-3.5" /> Edit
+              </button>
+              <button
+                type="button"
+                onClick={() => { setMode('pan'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
+                className={`flex h-7 items-center gap-1 rounded-md px-2 text-xs font-bold transition-colors ${mode === 'pan' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-300'}`}
+              >
+                <Hand className="h-3.5 w-3.5" /> Pan
+              </button>
+            </div>
+
+            <div className="mx-1 h-6 w-px bg-slate-200" />
 
             <button
-              onClick={() => { setMode('draw'); setSelectedStrokeId(null); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold transition-colors ${mode === 'draw' ? 'bg-slate-900 text-white' : 'bg-slate-200 text-slate-600 hover:bg-slate-300'}`}
-            >
-              <PenLine className="w-3.5 h-3.5" /> Draw
-            </button>
-            {mode === 'draw' && (
-              <div className="flex bg-slate-200 p-0.5 rounded-lg ml-1">
-                <button
-                  onClick={() => { setDrawStyle('polygon'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
-                  className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${drawStyle === 'polygon' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
-                >
-                  Polygon
-                </button>
-                <button
-                  onClick={() => { setDrawStyle('freehand'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
-                  className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${drawStyle === 'freehand' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
-                >
-                  Freehand
-                </button>
-              </div>
-            )}
-            <button
-              onClick={() => { setMode('edit'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold transition-colors ${mode === 'edit' ? 'bg-slate-900 text-white' : 'bg-slate-200 text-slate-600 hover:bg-slate-300'}`}
-            >
-              <MousePointer2 className="w-3.5 h-3.5" /> Edit
-            </button>
-            <button
-              onClick={() => { setMode('pan'); setCurrentStroke(null); setPreviewPoint(null); gestureRef.current.type = null; }}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold transition-colors ${mode === 'pan' ? 'bg-slate-900 text-white' : 'bg-slate-200 text-slate-600 hover:bg-slate-300'}`}
-            >
-              <Hand className="w-3.5 h-3.5" /> Pan
-            </button>
-
-            <div className="h-6 w-px bg-slate-300 mx-1" />
-
-            <button
+              type="button"
               onClick={() => setShowLabels(!showLabels)}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold transition-colors ${showLabels ? 'bg-slate-200 text-slate-600 hover:bg-slate-300' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}
+              className={`flex h-7 items-center gap-1 rounded-lg px-2 text-xs font-bold transition-colors ${showLabels ? 'bg-slate-200 text-slate-700 hover:bg-slate-300' : 'text-slate-400 hover:bg-slate-200'}`}
               title="Toggle Labels"
             >
-              {showLabels ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />} Labels
+              {showLabels ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />} Labels
             </button>
             <button
+              type="button"
               onClick={() => setShowKaryotypePreview(true)}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold transition-colors bg-slate-200 text-slate-600 hover:bg-slate-300"
+              className="flex h-7 items-center gap-1 rounded-lg bg-slate-200 px-2 text-xs font-bold text-slate-700 transition-colors hover:bg-slate-300"
               title="Preview karyotype"
             >
-              <LayoutGrid className="w-3.5 h-3.5" /> Karyotype
+              <LayoutGrid className="h-3.5 w-3.5" /> Karyotype
             </button>
 
-            <div className="h-6 w-px bg-slate-300 mx-1" />
+            <div className="min-w-2 flex-1" />
 
-            <button onClick={() => zoomBy(1.2)} className="p-1.5 hover:bg-slate-200 rounded-lg transition-colors text-slate-600" title="Zoom in">
-              <ZoomIn className="w-4 h-4" />
-            </button>
-            <span className="text-[10px] font-mono text-slate-500 w-12 text-center">{Math.round(scale * 100)}%</span>
-            <button onClick={() => zoomBy(0.8)} className="p-1.5 hover:bg-slate-200 rounded-lg transition-colors text-slate-600" title="Zoom out">
-              <ZoomOut className="w-4 h-4" />
-            </button>
-            <button onClick={resetView} className="p-1.5 hover:bg-slate-200 rounded-lg transition-colors text-slate-600" title="Reset view">
-              <Maximize className="w-4 h-4" />
+            <div className="flex items-center gap-0.5">
+              <button type="button" onClick={() => zoomBy(1.2)} className="rounded-lg p-1.5 text-slate-600 transition-colors hover:bg-slate-200" title="Zoom in">
+                <ZoomIn className="h-4 w-4" />
+              </button>
+              <span className="w-10 text-center font-mono text-[10px] text-slate-500">{Math.round(scale * 100)}%</span>
+              <button type="button" onClick={() => zoomBy(0.8)} className="rounded-lg p-1.5 text-slate-600 transition-colors hover:bg-slate-200" title="Zoom out">
+                <ZoomOut className="h-4 w-4" />
+              </button>
+              <button type="button" onClick={resetView} className="rounded-lg p-1.5 text-slate-600 transition-colors hover:bg-slate-200" title="Reset view">
+                <Maximize className="h-4 w-4" />
+              </button>
+            </div>
+            <button type="button" onClick={handleClose} className="rounded-full p-2 text-slate-500 transition-colors hover:bg-slate-200" title="Close">
+              <X className="h-4 w-4" />
             </button>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {selectedStrokeId && (
-              <>
-                <button onClick={() => setOrientingStrokeId(selectedStrokeId)} className="p-2 hover:bg-sky-100 rounded-full transition-colors text-sky-500" title="Adjust Orientation">
-                  <RotateCw className="w-4 h-4" />
-                </button>
-                <button onClick={deleteSelected} className="p-2 hover:bg-red-100 rounded-full transition-colors text-red-500" title="Delete Selected">
-                  <Trash2 className="w-4 h-4" />
-                </button>
-              </>
-            )}
-            <button onClick={undoLast} className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500" title="Undo last stroke">
-              <Undo2 className="w-4 h-4" />
-            </button>
-            <button onClick={clearAll} className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-500" title="Clear all">
-              <Trash2 className="w-4 h-4" />
-            </button>
+          <div className="flex flex-wrap items-center gap-2 border-t border-slate-200 px-3 py-2">
+            <div className="flex items-center gap-0.5">
+              {selectedStrokeId && (
+                <>
+                  {!isInvalidLabel(selectedStroke?.label) && (
+                    <button type="button" onClick={() => openOrientation(selectedStrokeId, selectedStroke?.label)} className="rounded-lg p-2 text-sky-500 transition-colors hover:bg-sky-100" title="Adjust Orientation">
+                      <RotateCw className="h-4 w-4" />
+                    </button>
+                  )}
+                  <button type="button" onClick={deleteSelected} className="rounded-lg p-2 text-red-500 transition-colors hover:bg-red-50" title="Delete selected">
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </>
+              )}
+              <button type="button" onClick={undoLast} className="rounded-lg p-2 text-slate-500 transition-colors hover:bg-slate-200" title="Undo last stroke">
+                <Undo2 className="h-4 w-4" />
+              </button>
+              <button type="button" onClick={clearAll} className="rounded-lg p-2 text-slate-500 transition-colors hover:bg-slate-200" title="Clear all">
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mx-1 h-6 w-px bg-slate-200" />
+
             <div className="flex items-center rounded-lg border border-slate-200 bg-white p-0.5" role="group" aria-label="Difficulty">
               {DIFFICULTIES.map(id => (
                 <button
@@ -1505,7 +1681,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
                   disabled={saving || difficultyBusy}
                   onClick={() => handleSetDifficulty(difficulty === id ? null : id)}
                   className={cn(
-                    'px-2 py-1 rounded-md text-[10px] font-bold transition-colors disabled:opacity-50',
+                    'rounded-md px-2.5 py-1 text-[10px] font-bold transition-colors disabled:opacity-50',
                     difficulty === id
                       ? id === 'easy'
                         ? 'bg-emerald-500 text-white'
@@ -1519,31 +1695,56 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
                 </button>
               ))}
             </div>
-            <span className="text-[10px] font-mono font-bold text-slate-500 px-2 whitespace-nowrap">
+
+            <div className="flex items-center rounded-lg border border-slate-200 bg-white p-0.5" role="group" aria-label="Level">
+              <span className="px-2 text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                Level
+              </span>
+              {SPREAD_LEVELS.map(lvl => (
+                <button
+                  key={lvl}
+                  type="button"
+                  aria-pressed={spreadLevel === lvl}
+                  disabled={saving || levelBusy}
+                  onClick={() => handleSetSpreadLevel(lvl)}
+                  className={cn(
+                    'rounded-md px-2 py-1 text-[10px] font-bold transition-colors disabled:opacity-50 tabular-nums',
+                    spreadLevel === lvl
+                      ? 'bg-sky-500 text-white'
+                      : 'text-slate-500 hover:bg-slate-100'
+                  )}
+                >
+                  {lvl}
+                </button>
+              ))}
+            </div>
+
+            <div className="min-w-2 flex-1" />
+
+            <span className="whitespace-nowrap px-1 font-mono text-[10px] font-bold text-slate-500">
               {expectedCount != null ? `${labeledCount} / ${expectedCount} labeled` : `${labeledCount} labeled`}
             </span>
             <button
+              type="button"
               onClick={handleToggleComplete}
               disabled={saving || (!complete && labeledCount === 0)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors disabled:opacity-50 ${
+              className={`flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs font-bold transition-colors disabled:opacity-50 ${
                 complete
-                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'
+                  ? 'border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
                   : 'bg-emerald-500 text-white hover:bg-emerald-600'
               }`}
             >
               {complete ? 'Unmark complete' : 'Mark as complete'}
             </button>
             <button
+              type="button"
               onClick={saveAnnotations}
               disabled={saving}
-              className="flex items-center gap-1.5 bg-slate-900 text-white px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-slate-800 transition-colors disabled:opacity-50"
+              className="flex h-8 items-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-bold text-white transition-colors hover:bg-slate-800 disabled:opacity-50"
             >
-              <Save className="w-3 h-3" /> {saving ? 'Saving...' : 'Save'}
+              <Save className="h-3.5 w-3.5" /> {saving ? 'Saving...' : 'Save'}
             </button>
-            {saveMsg && <span className="text-[10px] font-bold text-emerald-600 ml-1">{saveMsg}</span>}
-            <button onClick={handleClose} className="p-2 hover:bg-slate-100 rounded-full transition-colors ml-2">
-              <X className="w-4 h-4 text-slate-500" />
-            </button>
+            {saveMsg && <span className="text-[10px] font-bold text-emerald-600">{saveMsg}</span>}
           </div>
         </div>
 
@@ -1625,6 +1826,23 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
             <div className="flex-1 overflow-y-auto p-4 scrollbar-hide">
               <div className="flex flex-col gap-5">
                 <div>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Overlap</p>
+                  <button
+                    type="button"
+                    onClick={() => handleLabelClick(INVALID_LABEL)}
+                    className={`w-full py-3 rounded-lg font-bold text-sm border-2 transition-all flex items-center justify-center gap-2 ${
+                      currentDisplayLabel === INVALID_LABEL ? "border-amber-500 bg-amber-50 text-amber-800" : "border-slate-200 bg-white text-slate-600 hover:border-amber-300"
+                    }`}
+                  >
+                    Invalid
+                    <span className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                      currentDisplayLabel === INVALID_LABEL ? "bg-amber-500 text-white" : "bg-slate-100 text-slate-500"
+                    }`}>
+                      {strokes.filter(s => isInvalidLabel(s.label)).length}
+                    </span>
+                  </button>
+                </div>
+                <div>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Standard Pairs</p>
                   <div className="grid grid-cols-4 gap-2">
                     {pairOrder.map(pairId => {
@@ -1634,7 +1852,10 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
                       return (
                         <button
                           key={pairId}
-                          onClick={() => !isFull && handleLabelClick(pairId)}
+                          onClick={() => {
+                            flashPair(pairId);
+                            if (!isFull) handleLabelClick(pairId);
+                          }}
                           disabled={isFull && !isSelected}
                           className={`group/cell relative aspect-square rounded-lg border-2 transition-all flex flex-col items-center justify-center px-1 ${
                             isSelected ? "bg-sky-50 border-sky-500 shadow-inner" :
@@ -1737,7 +1958,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
                 </div>
               </div>
             </div>
-            {currentDisplayLabel !== 'Unassigned' && (
+            {isPairLabel(currentDisplayLabel) && (
               <div className="p-4 border-t border-slate-200 bg-white flex flex-col gap-3">
                 <label className="block">
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
@@ -1772,7 +1993,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
                 )}
               </div>
             )}
-            {mode === 'edit' && selectedStroke && currentDisplayLabel === 'Unassigned' && (
+            {mode === 'edit' && selectedStroke && !isPairLabel(currentDisplayLabel) && !isInvalidLabel(selectedStroke.label) && (
               <div className="p-4 border-t border-slate-200 bg-white shadow-[0_-4px_10px_rgba(0,0,0,0.02)]">
                 <button
                   onClick={() => setOrientingStrokeId(selectedStrokeId)}
@@ -1817,7 +2038,7 @@ export default function ImageAnnotationModal({ imageUrl, imageId, initialXml, ka
       )}
       {orientingStrokeId && imgRef.current && (() => {
         const orientingStroke = strokes.find(s => s.id === orientingStrokeId);
-        if (!orientingStroke) return null;
+        if (!orientingStroke || isInvalidLabel(orientingStroke.label)) return null;
         return (
         <OrientationDialog
           stroke={orientingStroke}

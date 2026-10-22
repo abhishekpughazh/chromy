@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { CheckCircle2, Loader } from 'lucide-react';
+import { CheckCircle2, Loader, RotateCcw } from 'lucide-react';
 import { isStandardPairId, MATCH_ROW_HIGHLIGHTS, pairIdsForMatchRow } from '../lib/chromosomePairs';
 import { orderChromosomesForLesson } from '../lib/levels';
 import { cn } from '../lib/utils';
@@ -20,6 +20,10 @@ export interface LabelChromosome {
   type: string;
   ordinal: number;
   points?: Point[];
+  invalid?: boolean;
+  imageUrl?: string;
+  width?: number;
+  height?: number;
 }
 
 export interface NumberPlacement {
@@ -32,6 +36,9 @@ interface LabelSpreadLevelProps {
   chromosomes: LabelChromosome[];
   placements: NumberPlacement[];
   scaffoldIds: ReadonlySet<string>;
+  verifiedIds?: ReadonlySet<string>;
+  showFeedback?: boolean;
+  readOnly?: boolean;
   assisted: boolean;
   onPlacementsChange: (placements: NumberPlacement[]) => void;
 }
@@ -80,7 +87,7 @@ function polygonArea(polygon: Point[]) {
   return Math.abs(area) / 2;
 }
 
-function hitChromosome(point: Point, chromosomes: LabelChromosome[]): LabelChromosome | null {
+export function hitChromosome(point: Point, chromosomes: LabelChromosome[]): LabelChromosome | null {
   let inside: { chromosome: LabelChromosome; area: number } | null = null;
   let near: { chromosome: LabelChromosome; distance: number } | null = null;
   for (const chromosome of chromosomes) {
@@ -219,17 +226,22 @@ interface Callout {
   points: Point[];
   role: 'slot' | 'badge';
   locked: boolean;
+  verified: boolean;
+  correct: boolean;
   wrong: boolean;
   lit: boolean;
   dimmed: boolean;
-  hoverMatches: boolean | null;
+  hoverMatches: boolean | 'neutral' | null;
 }
 
 function calloutInk(callout: Callout): { core: string; halo: string } {
   if (callout.hoverMatches === false || (callout.wrong && callout.hoverMatches == null)) {
     return { core: 'rgb(244,63,94)', halo: 'rgba(255,255,255,0.92)' };
   }
-  if (callout.hoverMatches === true || callout.lit) {
+  if (callout.hoverMatches === true || ((callout.correct || callout.verified) && callout.hoverMatches == null)) {
+    return { core: 'rgb(22,163,74)', halo: 'rgba(255,255,255,0.92)' };
+  }
+  if (callout.hoverMatches === 'neutral' || callout.lit) {
     return { core: 'rgb(2,132,199)', halo: 'rgba(255,255,255,0.92)' };
   }
   return { core: 'rgb(15,23,42)', halo: 'rgba(255,255,255,0.92)' };
@@ -404,6 +416,9 @@ export default function LabelSpreadLevel({
   chromosomes,
   placements,
   scaffoldIds,
+  verifiedIds,
+  showFeedback = true,
+  readOnly = false,
   assisted,
   onPlacementsChange,
 }: LabelSpreadLevelProps) {
@@ -420,7 +435,7 @@ export default function LabelSpreadLevel({
   const [panning, setPanning] = useState(false);
   const [highlightedRowId, setHighlightedRowId] = useState<string | null>(null);
   const [hasUsedHighlight, setHasUsedHighlight] = useState(false);
-  const [hoverSlot, setHoverSlot] = useState<{ id: string; matches: boolean } | null>(null);
+  const [hoverSlot, setHoverSlot] = useState<{ id: string; matches: boolean | 'neutral' } | null>(null);
 
   const viewRef = useRef({ originX: 0, originY: 0, scale: 1, fit: 1 });
   const spreadRef = useRef<SpreadView>({ fit: 1, centerX: 0, centerY: 0 });
@@ -430,6 +445,8 @@ export default function LabelSpreadLevel({
   const frameSizeRef = useRef(frame);
   const placementsRef = useRef(placements);
   const scaffoldRef = useRef(scaffoldIds);
+  const verifiedRef = useRef(verifiedIds);
+  const showFeedbackRef = useRef(showFeedback);
   const chromosomesRef = useRef(chromosomes);
   const onChangeRef = useRef(onPlacementsChange);
   const rejectTimer = useRef<number | null>(null);
@@ -444,6 +461,8 @@ export default function LabelSpreadLevel({
 
   placementsRef.current = placements;
   scaffoldRef.current = scaffoldIds;
+  verifiedRef.current = verifiedIds;
+  showFeedbackRef.current = showFeedback;
   chromosomesRef.current = chromosomes;
   onChangeRef.current = onPlacementsChange;
   zoomRef.current = zoom;
@@ -621,24 +640,28 @@ export default function LabelSpreadLevel({
   };
 
   const badges = useMemo(() => {
-    const items: { id: string; label: string; locked: boolean; wrong: boolean }[] = [];
+    const items: { id: string; label: string; locked: boolean; verified: boolean; correct: boolean; wrong: boolean }[] = [];
     for (const id of scaffoldIds) {
       const chromosome = byId.get(id);
-      if (chromosome) items.push({ id, label: chromosome.type, locked: true, wrong: false });
+      if (chromosome) items.push({ id, label: chromosome.type, locked: true, verified: false, correct: false, wrong: false });
     }
     for (const placement of placements) {
       if (scaffoldIds.has(placement.chromosomeId)) continue;
       const chromosome = byId.get(placement.chromosomeId);
       if (!chromosome) continue;
+      const isMatch = placement.pairId === chromosome.type;
+      const verified = (verifiedIds?.has(placement.chromosomeId) ?? false) && isMatch;
       items.push({
         id: placement.chromosomeId,
         label: placement.pairId,
         locked: false,
-        wrong: placement.pairId !== chromosome.type,
+        verified,
+        correct: showFeedback && isMatch,
+        wrong: showFeedback && !isMatch,
       });
     }
     return items;
-  }, [byId, placements, scaffoldIds]);
+  }, [byId, placements, scaffoldIds, verifiedIds, showFeedback]);
 
   const openSlots = useMemo(() => {
     const occupied = new Set(placements.map(placement => placement.chromosomeId));
@@ -651,7 +674,7 @@ export default function LabelSpreadLevel({
   }, [chromosomes, drag, placements, scaffoldIds]);
 
   const beginDrag = (event: React.PointerEvent, next: DragState) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || readOnly) return;
     event.preventDefault();
     event.stopPropagation();
     releaseDragListeners();
@@ -663,7 +686,9 @@ export default function LabelSpreadLevel({
       if (pointerEvent.pointerId !== state.pointerId) return;
       setDragPoint({ x: pointerEvent.clientX, y: pointerEvent.clientY });
       const slot = slotUnderPointer(frameRef.current, pointerEvent.clientX, pointerEvent.clientY);
-      const next = slot ? { id: slot.id, matches: slot.pairId === state.pairId } : null;
+      const next = slot
+        ? { id: slot.id, matches: showFeedbackRef.current ? slot.pairId === state.pairId : 'neutral' as const }
+        : null;
       setHoverSlot(current => (
         current?.id === next?.id && current?.matches === next?.matches ? current : next
       ));
@@ -686,7 +711,7 @@ export default function LabelSpreadLevel({
       if (!contains(frameRect, pointerEvent.clientX, pointerEvent.clientY)) return;
 
       const placeOn = (chromosomeId: string) => {
-        if (scaffoldRef.current.has(chromosomeId)) {
+        if (scaffoldRef.current.has(chromosomeId) || verifiedRef.current?.has(chromosomeId)) {
           flashReject();
           return;
         }
@@ -780,6 +805,8 @@ export default function LabelSpreadLevel({
       points: Point[],
       role: Callout['role'],
       locked: boolean,
+      verified: boolean,
+      correct: boolean,
       wrong: boolean,
     ) => {
       const anchor = labelAnchor(points, neighbors(id), scale);
@@ -796,6 +823,8 @@ export default function LabelSpreadLevel({
         points,
         role,
         locked,
+        verified,
+        correct,
         wrong,
         lit,
         dimmed: highlightedPairIds != null && !lit && hoverMatches == null,
@@ -804,13 +833,13 @@ export default function LabelSpreadLevel({
     };
     for (const chromosome of openSlots) {
       if (!chromosome.points) continue;
-      push(chromosome.id, chromosome.type, chromosome.type, chromosome.points, 'slot', false, false);
+      push(chromosome.id, chromosome.type, chromosome.type, chromosome.points, 'slot', false, false, false, false);
     }
     for (const badge of badges) {
       if (drag?.kind === 'badge' && drag.chromosomeId === badge.id) continue;
       const chromosome = byId.get(badge.id);
       if (!chromosome?.points || chromosome.points.length < 3) continue;
-      push(chromosome.id, chromosome.type, badge.label, chromosome.points, 'badge', badge.locked, badge.wrong);
+      push(chromosome.id, chromosome.type, badge.label, chromosome.points, 'badge', badge.locked, badge.verified, badge.correct, badge.wrong);
     }
     return items;
   }, [badges, byId, chromosomes, drag, highlightedPairIds, hoverSlot, openSlots, scale]);
@@ -901,7 +930,13 @@ export default function LabelSpreadLevel({
                         {callout.hoverMatches != null && (
                           <polygon
                             points={polygon}
-                            fill={callout.hoverMatches === false ? 'rgba(244,63,94,0.28)' : 'rgba(14,165,233,0.28)'}
+                            fill={
+                              callout.hoverMatches === false
+                                ? 'rgba(244,63,94,0.28)'
+                                : callout.hoverMatches === true
+                                  ? 'rgba(34,197,94,0.35)'
+                                  : 'rgba(14,165,233,0.32)'
+                            }
                             stroke={ink.core}
                             strokeWidth={1.25 * unit}
                           />
@@ -941,15 +976,29 @@ export default function LabelSpreadLevel({
               )}
               {imageLoaded && natural.w > 0 && callouts.map(callout => {
                 const slot = callout.role === 'slot';
+                const badgeLocked = callout.locked || callout.verified || readOnly;
+                const badgeGreen = callout.correct || callout.verified;
                 return (
                   <div
                     key={callout.id}
                     data-number-slot={slot ? '' : undefined}
-                    data-number-badge={slot ? undefined : callout.locked ? 'locked' : 'player'}
+                    data-number-badge={slot ? undefined : badgeLocked ? 'locked' : 'player'}
                     data-chromosome-id={slot ? callout.id : undefined}
                     data-pair-id={slot ? callout.pairId : undefined}
-                    title={slot ? undefined : callout.locked ? 'Already numbered' : callout.wrong ? 'Wrong number. Drag it to another slot.' : 'Drag to move this number'}
-                    onPointerDown={slot || callout.locked ? undefined : (event) => beginDrag(event, {
+                    title={
+                      slot
+                        ? undefined
+                        : callout.locked
+                          ? 'Already numbered'
+                          : callout.verified
+                            ? 'Verified correct'
+                            : callout.wrong
+                              ? 'Wrong number. Drag it to another slot.'
+                              : callout.correct
+                                ? 'Correct number'
+                                : 'Drag to move this number'
+                    }
+                    onPointerDown={slot || badgeLocked ? undefined : (event) => beginDrag(event, {
                       kind: 'badge',
                       pairId: callout.label,
                       chromosomeId: callout.id,
@@ -968,8 +1017,9 @@ export default function LabelSpreadLevel({
                       <div
                         className={cn(
                           'h-7 w-7 rounded-[5px] border-[1.5px] border-dotted bg-white/55 shadow-sm transition-transform',
-                          callout.hoverMatches === true && 'scale-110 border-sky-600 bg-sky-50',
+                          callout.hoverMatches === true && 'scale-110 border-green-600 bg-green-50',
                           callout.hoverMatches === false && 'scale-110 border-rose-500 bg-rose-50',
+                          callout.hoverMatches === 'neutral' && 'scale-110 border-sky-500 bg-sky-50',
                           callout.hoverMatches == null && callout.lit && 'border-sky-600 bg-sky-50/80',
                           callout.hoverMatches == null && !callout.lit && 'border-slate-900',
                           callout.dimmed && 'opacity-30'
@@ -981,8 +1031,9 @@ export default function LabelSpreadLevel({
                         locked={callout.locked}
                         className={cn(
                           'h-6 min-w-6 px-1.5 text-[11px] shadow-md',
-                          callout.locked ? 'cursor-default' : 'cursor-grab',
-                          callout.wrong && 'border-rose-400 text-rose-700',
+                          badgeLocked ? 'cursor-default' : 'cursor-grab',
+                          badgeGreen && !callout.locked && 'border-emerald-500 bg-emerald-50 text-emerald-700',
+                          callout.wrong && 'border-rose-400 bg-rose-50 text-rose-700',
                           callout.lit && 'ring-2 ring-sky-400 ring-offset-1',
                           callout.dimmed && 'opacity-30'
                         )}
@@ -997,6 +1048,22 @@ export default function LabelSpreadLevel({
         <p className="absolute bottom-2 left-3 text-[10px] font-bold tracking-wide text-white/70 pointer-events-none">
           Scroll to zoom{zoom > 1 ? ' · drag the image to pan' : ''}
         </p>
+        {zoom > MIN_ZOOM && (
+          <button
+            type="button"
+            onPointerDown={e => e.stopPropagation()}
+            onClick={e => {
+              e.stopPropagation();
+              setZoom(MIN_ZOOM);
+              setPan({ x: 0, y: 0 });
+            }}
+            className="absolute top-3 right-3 z-20 inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900/85 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-white shadow-md backdrop-blur hover:border-sky-400 hover:bg-slate-900 transition-colors"
+            title="Reset zoom to starting view"
+          >
+            <RotateCcw className="h-3 w-3 text-sky-400" />
+            Reset Zoom
+          </button>
+        )}
       </div>
 
       <div

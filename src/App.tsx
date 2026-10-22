@@ -26,16 +26,18 @@ import {
   MouseSensor,
   pointerWithin,
   closestCenter,
+  rectIntersection,
   type CollisionDetection
 } from '@dnd-kit/core';
 import { cn } from './lib/utils';
 import { NonInteractivePointerSensor, NonInteractiveTouchSensor } from './lib/dndSensors';
 import { storageObjectPathFromPublicUrl } from './lib/imageUrl';
-import { CLINICAL_KARYOTYPE_ROWS, normalizePairId, comparePairIds, MAX_CHROMOSOMES_PER_PAIR, STANDARD_PAIR_IDS, matchRowHighlightForGroup, pairIdsForMatchRow } from './lib/chromosomePairs';
+import { CLINICAL_KARYOTYPE_ROWS, normalizePairId, comparePairIds, MAX_CHROMOSOMES_PER_PAIR, STANDARD_PAIR_IDS, matchRowHighlightForGroup, pairIdsForMatchRow, isPairLabel, isInvalidLabel, INVALID_LABEL } from './lib/chromosomePairs';
 import { normalizeRotation, rotationsMatch, chromosomeTransform } from './lib/orientation';
 import { cropBoundsFromPoints, uniformDisplayScale } from './lib/chromosomeCrop';
-import { ARRANGE_LEVEL, GAMEPLAY_LEVELS, isGameplayLevel, isLabelLevel, isPresetOrientationLevel, LABEL_ALL_LEVEL, LABEL_MATE_LEVEL, LEARN_LEVEL, LEVELS, MATCH_LEVEL, PAIR_LEVEL, levelProgressLabel } from './lib/levels';
+import { ARRANGE_LEVEL, GAMEPLAY_LEVELS, isGameplayLevel, isLabelLevel, isPresetOrientationLevel, LABEL_ALL_LEVEL, LABEL_MATE_LEVEL, LEARN_LEVEL, LEVELS, MATCH_LEVEL, PAIR_LEVEL, PLUCK_ARRANGE_LEVEL, PLUCK_OVERLAP_LEVEL, isPluckLevel, levelProgressLabel } from './lib/levels';
 import LabelSpreadLevel, { type NumberPlacement } from './components/LabelSpreadLevel';
+import PluckSpreadLevel, { PLUCK_SPREAD_DROP_ID } from './components/PluckSpreadLevel';
 import {
   buildPairDescriptionTemplate,
   customPairIdsFromXml,
@@ -54,12 +56,15 @@ import {
 import {
   DIFFICULTIES,
   DIFFICULTY_LABELS,
+  SPREAD_LEVELS,
   parseSpreadDifficulty,
+  parseSpreadLevel,
   type SpreadDifficulty,
+  type SpreadLevel,
 } from './lib/difficulty';
 import { motion, AnimatePresence } from 'motion/react';
 import {
-  Info, CheckCircle2, ChevronRight, Dna, Undo2, ArrowLeft, Lightbulb,
+  Info, CheckCircle2, ChevronRight, Dna, Undo2, RotateCcw, ArrowLeft, Lightbulb,
   ShieldCheck, Upload, Play, Beaker, X, Loader, ImageIcon, Zap, Pencil, Trash2, FlipHorizontal, FlipVertical, Expand, Download, FolderPlus, Folder, ZoomIn, ZoomOut, Maximize
 } from 'lucide-react';
 import KaryotypeHintModal, { type KaryotypeHintChromosome } from './components/KaryotypeHintModal';
@@ -94,6 +99,8 @@ interface ChromosomeData {
   info?: string;
   /** Annotation polygon in source-image pixels. Used to number the metaphase spread. */
   points?: { x: number; y: number }[];
+  /** Overlap decoy. Clippable on level 4.2, never a karyotype slot. */
+  invalid?: boolean;
 }
 
 interface SavedChromosomeState {
@@ -213,6 +220,38 @@ const pairSlotGroups = (chromosomes: ChromosomeData[]) => {
   });
 };
 
+/** Empty clinical slots, used before a metaphase image is chosen. */
+const standardSlotGroups = (): { pairId: string; slotIds: string[] }[] =>
+  STANDARD_PAIR_IDS.map((pairId, pairIndex) => ({
+    pairId,
+    slotIds: [0, 1].map(slotIndex => `slot-${pairIndex}-${slotIndex}`),
+  }));
+
+/** Pair slot layout from annotations only. Does not fetch the metaphase image. */
+const slotGroupsFromXml = (xml?: string): { pairId: string; slotIds: string[] }[] => {
+  if (!xml) return standardSlotGroups();
+  try {
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    const counts = new Map<string, number>();
+    const order: string[] = [];
+    doc.querySelectorAll('stroke').forEach(el => {
+      const label = el.getAttribute('label');
+      if (!isPairLabel(label)) return;
+      const pairId = normalizePairId(label);
+      if (!counts.has(pairId)) order.push(pairId);
+      counts.set(pairId, Math.min(MAX_CHROMOSOMES_PER_PAIR, (counts.get(pairId) ?? 0) + 1));
+    });
+    if (order.length === 0) return standardSlotGroups();
+    const ordered = [...order].sort((a, b) => comparePairIds(a, b, order));
+    return ordered.map((pairId, pairIndex) => ({
+      pairId,
+      slotIds: Array.from({ length: counts.get(pairId) ?? 0 }, (_, slotIndex) => `slot-${pairIndex}-${slotIndex}`),
+    }));
+  } catch {
+    return standardSlotGroups();
+  }
+};
+
 /** Lowest-ordinal chromosome of every pair that has a partner. Locked on Match. */
 const scaffoldChromosomeIds = (chromosomes: ChromosomeData[]) => {
   const ids = new Set<string>();
@@ -247,9 +286,27 @@ const buildPairBoard = (chromosomes: ChromosomeData[], seed: string) => ({
   placed: {} as Record<string, ChromosomeData>,
 });
 
+/** The fresh board has no player moves. A wrong slot still counts; an empty board does not. */
+const playerHasProgress = (
+  levelId: number,
+  placed: Record<string, ChromosomeData>,
+  jumbled: ChromosomeData[],
+  placements: NumberPlacement[],
+  scaffoldIds: ReadonlySet<string>,
+) => {
+  if (isLabelLevel(levelId)) return placements.length > 0;
+  if (isPluckLevel(levelId)) return jumbled.length > 0 || Object.keys(placed).length > 0;
+  if (levelId === MATCH_LEVEL) {
+    return Object.values(placed).some(chromosome => !scaffoldIds.has(chromosome.id));
+  }
+  return Object.keys(placed).length > 0;
+};
+
 const buildFreshBoard = (levelId: number, chromosomes: ChromosomeData[], seed: string) => {
   if (levelId === MATCH_LEVEL) return buildMatchBoard(chromosomes, seed);
   if (levelId === PAIR_LEVEL) return buildPairBoard(chromosomes, seed);
+  // Pluck starts with an empty tray; every chromosome is still on the spread.
+  if (isPluckLevel(levelId)) return { jumbled: [] as ChromosomeData[], placed: {} as Record<string, ChromosomeData> };
   return {
     jumbled: shuffleChromosomes(chromosomes, seed),
     placed: {} as Record<string, ChromosomeData>,
@@ -276,6 +333,8 @@ const serializeKaryotypeState = (
 const hydrateKaryotypeState = (
   extracted: ChromosomeData[],
   saved: unknown,
+  /** Pluck saves only the chromosomes already lifted off the spread. */
+  allowPartial = false,
 ): { jumbled: ChromosomeData[]; placed: Record<string, ChromosomeData> } | null => {
   if (!saved || typeof saved !== 'object') return null;
   const candidate = saved as Partial<SavedKaryotypeState>;
@@ -310,7 +369,7 @@ const hydrateKaryotypeState = (
     placed[slotId] = restored;
   }
 
-  return used.size === extracted.length ? { jumbled, placed } : null;
+  return allowPartial || used.size === extracted.length ? { jumbled, placed } : null;
 };
 
 /** Numbers the player has put on the spread, including ones on the wrong chromosome. */
@@ -369,10 +428,35 @@ const countCorrectLabels = (
   scaffoldIds: ReadonlySet<string>,
 ) => {
   const byId = new Map(chromosomes.map(chromosome => [chromosome.id, chromosome]));
-  let correct = scaffoldIds.size;
+  let correct = 0;
   for (const placement of placements) {
+    if (scaffoldIds.has(placement.chromosomeId)) continue;
     const chromosome = byId.get(placement.chromosomeId);
-    if (chromosome && chromosome.type === placement.pairId && !scaffoldIds.has(chromosome.id)) correct++;
+    if (chromosome && chromosome.type === placement.pairId) correct++;
+  }
+  return correct;
+};
+
+/** Correct placements the player still has to make. Pre-placed Match chromosomes are excluded. */
+const countArrangedCorrect = (
+  chromosomes: ChromosomeData[],
+  placed: Record<string, ChromosomeData>,
+  excludeIds: ReadonlySet<string>,
+) => {
+  const slotPair = new Map<string, string>();
+  for (const group of pairSlotGroups(chromosomes)) {
+    for (const slotId of group.slotIds) slotPair.set(slotId, group.pairId);
+  }
+  let correct = 0;
+  for (const [slotId, chrom] of Object.entries(placed)) {
+    if (excludeIds.has(chrom.id)) continue;
+    const expectedPairId = slotPair.get(slotId);
+    if (expectedPairId === undefined || chrom.type !== expectedPairId) continue;
+    if (!chrom.imageUrl || (
+      rotationsMatch(chrom.userRotation, chrom.expectedRotation) &&
+      chrom.userFlipX === chrom.expectedFlipX &&
+      chrom.userFlipY === chrom.expectedFlipY
+    )) correct++;
   }
   return correct;
 };
@@ -453,17 +537,92 @@ const ChromosomeVisual = ({ chromosome, className, isDragging = false, isReviewi
   );
 };
 
-const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, displayScale, locked = false, allowOrientation = true, highlighted = false }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void, isReviewing?: boolean, displayScale?: number, locked?: boolean, allowOrientation?: boolean, highlighted?: boolean }) => {
+type ChromosomeBox = { left: number; top: number; width: number; height: number };
+
+type TrayReturnFlightData = {
+  id: string;
+  chromosome: ChromosomeData;
+  from: ChromosomeBox;
+  to: ChromosomeBox | null;
+};
+
+function measureChromosomeAnchor(id: string): ChromosomeBox | null {
+  const node = document.querySelector(`[data-chromosome-anchor="${CSS.escape(id)}"]`);
+  if (!(node instanceof HTMLElement)) return null;
+  const rect = node.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return null;
+  return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+}
+
+const TRAY_RETURN_TRANSITION = {
+  duration: 0.5,
+  times: [0, 0.28, 1],
+  ease: [0.22, 1, 0.36, 1] as const,
+};
+
+/** Flies a chromosome that was bumped out of a slot back to its new tray position. */
+const TrayReturnFlight = ({
+  flight,
+  displayScale,
+  onDone,
+}: {
+  flight: TrayReturnFlightData & { to: ChromosomeBox };
+  displayScale: number;
+  onDone: (id: string) => void;
+}) => {
+  const onDoneRef = useRef(onDone);
+  onDoneRef.current = onDone;
+  const startedAt = useRef(performance.now());
+  const dx = flight.to.left - flight.from.left;
+  const dy = flight.to.top - flight.from.top;
+  const animate = useMemo(() => ({
+    x: [0, dx * 0.35, dx],
+    y: [0, -18, dy],
+    scale: [1.06, 1.04, 1],
+  }), [dx, dy]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => onDoneRef.current(flight.id), 1400);
+    return () => window.clearTimeout(timer);
+  }, [flight.id]);
+
+  return createPortal(
+    <motion.div
+      initial={{ x: 0, y: 0, scale: 1 }}
+      animate={animate}
+      transition={TRAY_RETURN_TRANSITION}
+      onAnimationComplete={() => {
+        if (performance.now() - startedAt.current < 420) return;
+        onDoneRef.current(flight.id);
+      }}
+      className="pointer-events-none drop-shadow-xl print:hidden"
+      style={{
+        position: 'fixed',
+        left: flight.from.left,
+        top: flight.from.top,
+        width: flight.from.width,
+        height: flight.from.height,
+        zIndex: 40,
+      }}
+      aria-hidden
+    >
+      <ChromosomeVisual chromosome={flight.chromosome} displayScale={displayScale} />
+    </motion.div>,
+    document.body
+  );
+};
+
+const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, displayScale, locked = false, dragDisabled = false, allowOrientation = true, highlighted = false }: { id: string, chromosome: ChromosomeData, onUpdate?: (id: string, updates: Partial<ChromosomeData>) => void, isReviewing?: boolean, displayScale?: number, locked?: boolean, dragDisabled?: boolean, allowOrientation?: boolean, highlighted?: boolean }) => {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id,
     data: chromosome,
-    disabled: locked,
+    disabled: locked || dragDisabled,
   });
 
   return (
     <div className="relative group/chrom">
-      <div ref={setNodeRef} {...listeners} {...attributes} className="z-10">
-        <ChromosomeVisual chromosome={chromosome} isDragging={isDragging} isReviewing={isReviewing} displayScale={displayScale} locked={locked} highlighted={highlighted} />
+      <div ref={setNodeRef} {...listeners} {...attributes} data-chromosome-anchor={id} className="z-10">
+        <ChromosomeVisual chromosome={chromosome} isDragging={isDragging} isReviewing={isReviewing} displayScale={displayScale} locked={locked || dragDisabled} highlighted={highlighted} />
       </div>
       {allowOrientation && onUpdate && chromosome.imageUrl && !isDragging && !isReviewing && !locked && (
         <div
@@ -514,7 +673,9 @@ const DraggableChromosome = ({ id, chromosome, onUpdate, isReviewing, displaySca
   );
 };
 
-const DroppableSlot = ({ id, acceptType, children, isOccupied, state, isReviewing }: { id: string, acceptType: ChromosomeType, children?: React.ReactNode, isOccupied?: boolean, state: 'empty' | 'wrong' | 'type-correct' | 'fully-correct', isReviewing?: boolean }) => {
+type SlotVisualState = 'empty' | 'neutral' | 'wrong' | 'type-correct' | 'fully-correct';
+
+const DroppableSlot = ({ id, acceptType, children, isOccupied, state, isReviewing }: { id: string, acceptType: ChromosomeType, children?: React.ReactNode, isOccupied?: boolean, state: SlotVisualState, isReviewing?: boolean }) => {
   const { setNodeRef, isOver } = useDroppable({
     id,
     data: { acceptType }
@@ -529,9 +690,10 @@ const DroppableSlot = ({ id, acceptType, children, isOccupied, state, isReviewin
         "min-w-8 lg:min-w-10 min-h-16 flex items-end justify-center transition-all duration-200 relative group/slot print:!border-none print:!bg-transparent print:!shadow-none",
         isReviewing ? "bg-transparent" : "border-2 border-dashed rounded-lg",
         !isReviewing && (isOver ? "border-sky-500 bg-sky-50 scale-105" : "border-slate-200 bg-slate-50/50"),
-        !isReviewing && isOccupied && state === 'wrong' ? "border-solid border-slate-300 bg-white" : "",
-        !isReviewing && isOccupied && state === 'type-correct' ? "border-amber-400 bg-amber-50/30 shadow-[0_0_15px_rgba(251,191,36,0.1)] border-solid" : "",
-        !isReviewing && isOccupied && state === 'fully-correct' ? "border-emerald-500 bg-emerald-50/30 shadow-[0_0_15px_rgba(16,185,129,0.1)] border-solid" : ""
+        !isReviewing && isOccupied && state === 'neutral' ? "border-solid border-slate-300 bg-white" : "",
+        !isReviewing && isOccupied && state === 'wrong' ? "border-solid border-rose-500 bg-rose-50/40 shadow-[0_0_15px_rgba(244,63,94,0.12)]" : "",
+        !isReviewing && isOccupied && state === 'type-correct' ? "border-amber-400 bg-amber-50/40 shadow-[0_0_15px_rgba(251,191,36,0.12)] border-solid" : "",
+        !isReviewing && isOccupied && state === 'fully-correct' ? "border-emerald-500 bg-emerald-50/40 shadow-[0_0_15px_rgba(16,185,129,0.12)] border-solid" : ""
       )}
     >
       {!isReviewing && isOccupied && state === 'fully-correct' && (
@@ -561,6 +723,10 @@ interface KaryotypePairProps {
   isReviewing?: boolean;
   displayScale?: number;
   lockedIds?: ReadonlySet<string>;
+  retryLockedIds?: ReadonlySet<string>;
+  orientationLockSlotIds?: ReadonlySet<string>;
+  showFeedback?: boolean;
+  readOnly?: boolean;
   allowOrientation?: boolean;
 }
 
@@ -570,10 +736,23 @@ interface KaryotypePairProps {
  * no meaning - any chromosome belonging to this pair is valid in any of its
  * slots, as long as its own recorded orientation matches.
  */
-const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedChromosomes, onUpdateChromosome, isReviewing, displayScale, lockedIds, allowOrientation = true }) => {
-  const getSlotState = (chrom: ChromosomeData | undefined): 'empty' | 'wrong' | 'type-correct' | 'fully-correct' => {
+const KaryotypePair: React.FC<KaryotypePairProps> = ({
+  pairId,
+  slotIds,
+  placedChromosomes,
+  onUpdateChromosome,
+  isReviewing,
+  displayScale,
+  lockedIds,
+  retryLockedIds,
+  orientationLockSlotIds,
+  showFeedback = true,
+  readOnly = false,
+  allowOrientation = true,
+}) => {
+  const getActualState = (chrom: ChromosomeData | undefined): 'empty' | 'wrong' | 'type-correct' | 'fully-correct' => {
     if (!chrom) return 'empty';
-    if (chrom.type !== pairId) return 'wrong';
+    if (chrom.invalid || chrom.type !== pairId) return 'wrong';
 
     if (chrom.imageUrl) {
       if (rotationsMatch(chrom.userRotation, chrom.expectedRotation) && 
@@ -587,33 +766,47 @@ const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedCh
     return 'fully-correct';
   };
 
-  const slots: { slotId: string; chrom: ChromosomeData | undefined; state: 'empty' | 'wrong' | 'type-correct' | 'fully-correct' }[] = slotIds.map(slotId => {
+  const getDisplayedSlotState = (slotId: string, chrom: ChromosomeData | undefined): SlotVisualState => {
+    const actual = getActualState(chrom);
+    if (!chrom || actual === 'empty') return 'empty';
+    if (showFeedback) return actual;
+    if (lockedIds?.has(chrom.id) || retryLockedIds?.has(chrom.id)) return 'fully-correct';
+    if (orientationLockSlotIds?.has(slotId)) return 'type-correct';
+    return 'neutral';
+  };
+
+  const slots: { slotId: string; chrom: ChromosomeData | undefined; state: SlotVisualState }[] = slotIds.map(slotId => {
     const chrom = placedChromosomes[slotId];
-    return { slotId, chrom, state: getSlotState(chrom) };
+    return { slotId, chrom, state: getDisplayedSlotState(slotId, chrom) };
   });
 
-  const allCorrect = slots.length > 0 && slots.every(s => !!s.chrom && s.state === 'fully-correct');
+  const allCorrect = showFeedback && slots.length > 0 && slots.every(s => !!s.chrom && s.state === 'fully-correct');
 
   return (
     <div className={cn("flex flex-col items-center gap-1 p-1 lg:p-2 rounded-xl transition-colors group", !isReviewing && "hover:bg-slate-100/50")}>
       <div className="flex items-end gap-1">
-        {slots.map(({ slotId, chrom, state }) => (
-          <div key={slotId}>
-            <DroppableSlot id={slotId} acceptType={pairId} isOccupied={!!chrom} state={state} isReviewing={isReviewing}>
-              {chrom && (
-                <DraggableChromosome
-                  id={chrom.id}
-                  chromosome={chrom}
-                  onUpdate={(id, updates) => onUpdateChromosome(slotId, updates)}
-                  isReviewing={isReviewing}
-                  displayScale={displayScale}
-                  locked={lockedIds?.has(chrom.id)}
-                  allowOrientation={allowOrientation}
-                />
-              )}
-            </DroppableSlot>
-          </div>
-        ))}
+        {slots.map(({ slotId, chrom, state }) => {
+          const isScaffoldOrRetryLocked = !!chrom && ((lockedIds?.has(chrom.id) ?? false) || (retryLockedIds?.has(chrom.id) ?? false));
+          const isOrientationLockedSlot = !!chrom && (orientationLockSlotIds?.has(slotId) ?? false);
+          return (
+            <div key={slotId}>
+              <DroppableSlot id={slotId} acceptType={pairId} isOccupied={!!chrom} state={state} isReviewing={isReviewing}>
+                {chrom && (
+                  <DraggableChromosome
+                    id={chrom.id}
+                    chromosome={chrom}
+                    onUpdate={(id, updates) => onUpdateChromosome(slotId, updates)}
+                    isReviewing={isReviewing}
+                    displayScale={displayScale}
+                    locked={isScaffoldOrRetryLocked || readOnly}
+                    dragDisabled={isOrientationLockedSlot}
+                    allowOrientation={allowOrientation}
+                  />
+                )}
+              </DroppableSlot>
+            </div>
+          );
+        })}
       </div>
       <span className={cn(
         "text-xs font-bold font-mono transition-colors print:!text-slate-900",
@@ -627,26 +820,49 @@ const KaryotypePair: React.FC<KaryotypePairProps> = ({ pairId, slotIds, placedCh
 
 interface WelcomeScreenProps {
   onStart: () => void;
+  onSelectSample: () => void;
   onAdmin: () => void;
+  onToggleTestAsUser: () => void;
   onSignOut?: () => void;
-  userRole: 'SUPER ADMIN' | 'ADMIN' | 'USER' | null;
+  effectiveRole: 'SUPER ADMIN' | 'ADMIN' | 'USER' | null;
+  isActualAdmin: boolean;
+  testAsUser: boolean;
 }
 
-const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin, onSignOut, userRole }) => (
+const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
+  onStart,
+  onSelectSample,
+  onAdmin,
+  onToggleTestAsUser,
+  onSignOut,
+  effectiveRole,
+  isActualAdmin,
+  testAsUser,
+}) => (
   <motion.div 
     initial={{ opacity: 0 }}
     animate={{ opacity: 1 }}
     exit={{ opacity: 0 }}
     className="fixed inset-0 z-[100] bg-white flex items-center justify-center p-6 overflow-hidden"
   >
-    {onSignOut && (
-      <button 
-        onClick={onSignOut}
-        className="absolute top-6 right-6 z-50 text-slate-400 hover:text-slate-900 transition-colors text-xs font-bold tracking-widest uppercase flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-lg"
-      >
-        Sign Out
-      </button>
-    )}
+    <div className="absolute top-6 right-6 z-50 flex items-center gap-3">
+      {isActualAdmin && !testAsUser && (
+        <button
+          onClick={onToggleTestAsUser}
+          className="text-sky-600 hover:text-sky-800 transition-colors text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 bg-sky-50 hover:bg-sky-100 px-3 py-1.5 rounded-lg border border-sky-200"
+        >
+          <Beaker className="w-3.5 h-3.5" /> TEST AS USER
+        </button>
+      )}
+      {onSignOut && (
+        <button
+          onClick={onSignOut}
+          className="text-slate-400 hover:text-slate-900 transition-colors text-xs font-bold tracking-widest uppercase flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-lg"
+        >
+          Sign Out
+        </button>
+      )}
+    </div>
     <div className="absolute inset-0 opacity-[0.03] pointer-events-none bg-[radial-gradient(#000_1px,transparent_1px)] [background-size:24px_24px]" />
     
     <div className="max-w-2xl w-full text-center relative z-10">
@@ -692,26 +908,39 @@ const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ onStart, onAdmin, onSignO
         ))}
       </div>
 
-      <button 
-        onClick={onStart}
-        className="group flex items-center gap-3 bg-slate-900 text-white px-8 py-4 rounded-xl font-black text-base hover:scale-105 transition-all shadow-xl shadow-slate-900/20 active:scale-95 mx-auto"
-      >
-        Start Karyotyping <Play className="w-4 h-4 fill-current" />
-      </button>
-
-      {(userRole === 'ADMIN' || userRole === 'SUPER ADMIN') && (
+      <div className="flex flex-wrap items-center justify-center gap-4">
         <button 
-          onClick={onAdmin}
-          className="mt-8 text-slate-300 hover:text-slate-900 transition-colors text-xs font-mono tracking-widest uppercase flex items-center gap-2 mx-auto"
+          onClick={onStart}
+          className="group flex items-center gap-3 bg-slate-900 text-white px-8 py-4 rounded-xl font-black text-base hover:scale-105 transition-all shadow-xl shadow-slate-900/20 active:scale-95"
         >
-          <ShieldCheck className="w-3.5 h-3.5" /> ADMIN ACCESS
+          Start Karyotyping <Play className="w-4 h-4 fill-current" />
         </button>
+
+        {(effectiveRole === 'ADMIN' || effectiveRole === 'SUPER ADMIN') && (
+          <button
+            onClick={onSelectSample}
+            className="flex items-center gap-2.5 bg-white border-2 border-slate-200 text-slate-700 hover:border-slate-900 hover:text-slate-900 px-6 py-4 rounded-xl font-black text-base transition-all active:scale-95"
+          >
+            <ImageIcon className="w-4 h-4" /> Select Sample
+          </button>
+        )}
+      </div>
+
+      {(effectiveRole === 'ADMIN' || effectiveRole === 'SUPER ADMIN') && (
+        <div className="mt-8 flex items-center justify-center gap-6">
+          <button 
+            onClick={onAdmin}
+            className="text-slate-400 hover:text-slate-900 transition-colors text-xs font-mono tracking-widest uppercase flex items-center gap-2"
+          >
+            <ShieldCheck className="w-3.5 h-3.5" /> ADMIN ACCESS
+          </button>
+        </div>
       )}
     </div>
   </motion.div>
 );
 
-/** Cheap, synchronous check for whether a sample has at least one annotated (non-"Unassigned") stroke, without loading its image. */
+/** Cheap, synchronous check for whether a sample has at least one pair-labeled stroke, without loading its image. */
 export const hasAnnotations = (xml?: string): boolean => {
   if (!xml) return false;
   try {
@@ -720,7 +949,7 @@ export const hasAnnotations = (xml?: string): boolean => {
     const strokeEls = doc.querySelectorAll('stroke');
     for (const el of Array.from(strokeEls)) {
       const label = el.getAttribute('label');
-      if (label && label !== 'Unassigned') return true;
+      if (isPairLabel(label)) return true;
     }
     return false;
   } catch {
@@ -728,7 +957,7 @@ export const hasAnnotations = (xml?: string): boolean => {
   }
 };
 
-const SAMPLE_LIST_COLUMNS = 'id, original_url, user_id, uploader_email, bucket_id, karyotype, annotation_complete, pair_note_overrides, difficulty';
+const SAMPLE_LIST_COLUMNS = 'id, original_url, user_id, uploader_email, bucket_id, karyotype, annotation_complete, pair_note_overrides, difficulty, spread_level';
 
 async function fetchSampleXml(id: string): Promise<string | undefined> {
   const { data, error } = await supabase
@@ -746,7 +975,10 @@ async function sampleWithXml(image: AdminImage): Promise<AdminImage> {
   return { ...image, xml: xml ?? '' };
 }
 
-export const extractChromosomes = async (imgObj: AdminImage): Promise<ChromosomeData[]> => {
+export const extractChromosomes = async (
+  imgObj: AdminImage,
+  options?: { includeInvalid?: boolean },
+): Promise<ChromosomeData[]> => {
   try {
     if (!imgObj.xml) return [];
     const xmlText = imgObj.xml;
@@ -778,11 +1010,12 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
     
     strokeEls.forEach((el, idx) => {
       const label = el.getAttribute('label') || 'Unassigned';
-      if (label === 'Unassigned') return;
+      const invalid = isInvalidLabel(label);
+      if (!isPairLabel(label) && !(options?.includeInvalid && invalid)) return;
       // Normalizes both new-style labels (the pair ID itself, e.g. "1", "X",
       // "Marker A") and legacy labels saved before this change (e.g. "1L",
       // "1R") to a single pair ID used for interchangeable matching.
-      const pairId = normalizePairId(label);
+      const pairId = invalid ? INVALID_LABEL : normalizePairId(label);
       const ordinal = ordinalByPair.get(pairId) || 0;
       ordinalByPair.set(pairId, ordinal + 1);
 
@@ -836,7 +1069,8 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
         points,
         userRotation: 0,
         userFlipX: false,
-        userFlipY: false
+        userFlipY: false,
+        invalid: invalid || undefined,
       });
     });
 
@@ -845,6 +1079,10 @@ export const extractChromosomes = async (imgObj: AdminImage): Promise<Chromosome
     const seenCounts = new Map<string, number>();
     const capped: ChromosomeData[] = [];
     for (const chrom of extracted) {
+      if (chrom.invalid) {
+        capped.push(chrom);
+        continue;
+      }
       const count = seenCounts.get(chrom.type) || 0;
       if (count >= MAX_CHROMOSOMES_PER_PAIR) continue;
       seenCounts.set(chrom.type, count + 1);
@@ -876,6 +1114,20 @@ interface AdminImage {
   annotationComplete?: boolean;
   pairNoteOverrides?: PairNoteMap;
   difficulty?: SpreadDifficulty | null;
+  spreadLevel?: SpreadLevel;
+}
+
+function SpreadLevelBadge({
+  level = 1,
+}: {
+  level?: SpreadLevel | null;
+}) {
+  const resolved = level ?? 1;
+  return (
+    <span className="inline-flex items-center rounded-full bg-sky-100 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-sky-700">
+      Level {resolved}
+    </span>
+  );
 }
 
 function DifficultyBadge({
@@ -1634,6 +1886,15 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
     setImages(prev => prev.map(img => img.id === imageId ? { ...img, difficulty } : img));
   };
 
+  const persistSpreadLevel = async (imageId: string, spreadLevel: SpreadLevel) => {
+    const { error } = await supabase
+      .from('samples')
+      .update({ spread_level: spreadLevel })
+      .eq('id', imageId);
+    if (error) throw error;
+    setImages(prev => prev.map(img => img.id === imageId ? { ...img, spreadLevel } : img));
+  };
+
   const filterByStatus = (list: AdminImage[]) => {
     if (statusFilter === 'all') return list;
     if (statusFilter === 'unrated') return list.filter(img => !img.difficulty);
@@ -1684,11 +1945,21 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
     const labeled = xmlKnown ? countLabeledChromosomes(img.xml) : null;
     const showDelete = canDeleteSample(img);
 
+    const resolvedLevel = img.spreadLevel ?? 1;
+    const difficultyShort = img.difficulty === 'easy'
+      ? 'E'
+      : img.difficulty === 'moderate'
+        ? 'M'
+        : img.difficulty === 'hard'
+          ? 'H'
+          : '—';
+    const difficultyTitle = img.difficulty ? DIFFICULTY_LABELS[img.difficulty] : 'Unrated';
+
     return (
     <DraggableDatasetImage key={img.id} img={img}>
       <div
         className={cn(
-          "bg-white rounded-xl shadow-sm overflow-hidden group relative aspect-square flex flex-col border-2",
+          "bg-white rounded-xl shadow-sm overflow-hidden group relative flex flex-col border-2",
           status === 'complete' ? "border-emerald-500" : status === 'in_progress' ? "border-amber-400" : "border-slate-200"
         )}
         onClick={async (e) => {
@@ -1703,7 +1974,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
           setAnnotateImageId(sample.id);
         }}
       >
-        <div className="relative flex-1 bg-slate-100 overflow-hidden">
+        <div className="relative aspect-square w-full bg-slate-100 overflow-hidden">
           <LazyThumb
             src={img.originalUrl}
             alt="Sample"
@@ -1712,6 +1983,24 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
             height={400}
             className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
           />
+
+          <div
+            className="absolute top-1.5 left-1.5 z-10 inline-flex items-center gap-1 rounded-full bg-black/70 backdrop-blur-sm pl-1.5 pr-1.5 py-0.5 text-[8px] leading-none font-mono font-bold text-white pointer-events-none"
+            title={`Level ${resolvedLevel} · ${difficultyTitle}`}
+          >
+            <span className="text-sky-300">L{resolvedLevel}</span>
+            <span className="text-white/30">·</span>
+            <span
+              className={cn(
+                img.difficulty === 'easy' && 'text-emerald-300',
+                img.difficulty === 'moderate' && 'text-amber-300',
+                img.difficulty === 'hard' && 'text-rose-300',
+                !img.difficulty && 'text-slate-400'
+              )}
+            >
+              {difficultyShort}
+            </span>
+          </div>
 
           {labeled !== null && (
             <div
@@ -1723,18 +2012,20 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
           )}
 
           <div className="absolute inset-0 pointer-events-none bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
-            <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 w-9 h-9 flex items-center justify-center bg-white/95 backdrop-blur-sm rounded-full shadow-xl">
-              <Pencil className="w-4 h-4 text-slate-900" />
+            <div className="opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0 w-8 h-8 flex items-center justify-center bg-white/95 backdrop-blur-sm rounded-full shadow-xl">
+              <Pencil className="w-3.5 h-3.5 text-slate-900" />
             </div>
           </div>
         </div>
 
-        <div className="shrink-0 border-t border-slate-200 bg-slate-50 px-2 py-1.5 flex flex-col items-center gap-1">
-          <p className="text-[10px] font-mono font-bold text-slate-600 text-center w-full leading-tight break-words">
-            {img.karyotype || 'No karyotype set'}
+        <div className="shrink-0 border-t border-slate-200 bg-slate-50 px-1.5 py-1 flex items-center justify-between gap-1">
+          <p
+            className="text-[9px] font-mono font-bold text-slate-600 truncate min-w-0"
+            title={img.karyotype || 'No karyotype set'}
+          >
+            {img.karyotype || 'No karyotype'}
           </p>
-          <DifficultyBadge difficulty={img.difficulty} unsetLabel="Unrated" />
-          <div className="flex items-center justify-center gap-0.5">
+          <div className="flex items-center shrink-0">
             <button
               type="button"
               data-no-dnd
@@ -1745,9 +2036,9 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
                 handleEditKaryotype(img, e);
               }}
               title="Edit ISCN karyotype designation"
-              className="p-1 rounded-md text-slate-400 hover:text-sky-600 hover:bg-sky-50 transition-colors"
+              className="p-0.5 rounded text-slate-400 hover:text-sky-600 hover:bg-sky-50 transition-colors"
             >
-              <Pencil className="w-3.5 h-3.5" />
+              <Pencil className="w-3 h-3" />
             </button>
             {showDelete && (
               <button
@@ -1765,9 +2056,9 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
                   setPendingDelete(sample);
                 }}
                 title="Delete this metaphase spread"
-                className="p-1 rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors"
+                className="p-0.5 rounded text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors"
               >
-                <Trash2 className="w-3.5 h-3.5" />
+                <Trash2 className="w-3 h-3" />
               </button>
             )}
           </div>
@@ -1823,7 +2114,8 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
           original_url: publicUrl,
           xml: '',
           bucket_id: selectedBucketId,
-          karyotype
+          karyotype,
+          spread_level: 1,
         })
         .select()
         .single();
@@ -1843,6 +2135,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
         karyotype,
         annotationComplete: false,
         pairNoteOverrides: {},
+        spreadLevel: parseSpreadLevel(dbData.spread_level),
       };
       
       setImages(prev => [newImage, ...prev]);
@@ -2384,6 +2677,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
           karyotype={images.find(img => img.id === annotateImageId)?.karyotype}
           annotationComplete={images.find(img => img.id === annotateImageId)?.annotationComplete}
           difficulty={images.find(img => img.id === annotateImageId)?.difficulty}
+          spreadLevel={images.find(img => img.id === annotateImageId)?.spreadLevel ?? 1}
           bucketPairNotes={(() => {
             const bucketId = images.find(img => img.id === annotateImageId)?.bucketId;
             return bucketId ? bucketPairDescriptions[bucketId] : undefined;
@@ -2431,6 +2725,15 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
               throw err;
             }
           }}
+          onSetSpreadLevel={async (spreadLevel) => {
+            try {
+              await persistSpreadLevel(annotateImageId, spreadLevel);
+            } catch (err) {
+              console.error('Failed to update spread level:', err);
+              alert('Failed to update level.');
+              throw err;
+            }
+          }}
           onClose={() => {
             setAnnotateImageUrl(null);
             setAnnotateImageId(null);
@@ -2459,6 +2762,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ onClose, images, imagesLoaded, 
 
 interface SpreadSelectionScreenProps {
   images: AdminImage[];
+  buckets: Bucket[];
   imagesLoaded: boolean;
   loadError: string | null;
   progressBySample: Record<string, SampleLevelProgress>;
@@ -2466,27 +2770,107 @@ interface SpreadSelectionScreenProps {
   onBack: () => void;
 }
 
-const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, imagesLoaded, loadError, progressBySample, onSelect, onBack }) => {
+const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, buckets, imagesLoaded, loadError, progressBySample, onSelect, onBack }) => {
   const [extractingId, setExtractingId] = useState<string | null>(null);
-  const [difficultyFilter, setDifficultyFilter] = useState<'all' | SpreadDifficulty>('all');
+  const [selectedDifficulties, setSelectedDifficulties] = useState<Set<SpreadDifficulty | 'unrated'>>(new Set());
+  const [selectedLevels, setSelectedLevels] = useState<Set<SpreadLevel>>(new Set());
+  const [selectedBuckets, setSelectedBuckets] = useState<Set<string>>(new Set());
+
   const difficultyCounts = useMemo(() => {
-    const counts: Record<SpreadDifficulty, number> = { easy: 0, moderate: 0, hard: 0 };
+    const counts: Record<SpreadDifficulty | 'unrated', number> = { easy: 0, moderate: 0, hard: 0, unrated: 0 };
     for (const img of images) {
       if (img.difficulty) counts[img.difficulty] += 1;
+      else counts.unrated += 1;
     }
     return counts;
   }, [images]);
-  const visibleImages = difficultyFilter === 'all'
-    ? images
-    : images.filter(img => img.difficulty === difficultyFilter);
+
+  const levelCounts = useMemo(() => {
+    const counts: Record<SpreadLevel, number> = {
+      1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 0,
+    };
+    for (const img of images) {
+      const lvl = img.spreadLevel ?? 1;
+      counts[lvl] = (counts[lvl] ?? 0) + 1;
+    }
+    return counts;
+  }, [images]);
+
+  const bucketCounts = useMemo(() => {
+    const counts: Record<string, number> = { unassigned: 0 };
+    for (const b of buckets) counts[b.id] = 0;
+    for (const img of images) {
+      const key = img.bucketId && counts[img.bucketId] !== undefined ? img.bucketId : 'unassigned';
+      counts[key] = (counts[key] ?? 0) + 1;
+    }
+    return counts;
+  }, [images, buckets]);
+
+  const bucketById = useMemo(() => {
+    const map = new Map<string, Bucket>();
+    for (const b of buckets) map.set(b.id, b);
+    return map;
+  }, [buckets]);
+
+  const hasAnyFilter = selectedDifficulties.size > 0 || selectedLevels.size > 0 || selectedBuckets.size > 0;
+
+  const clearAllFilters = () => {
+    setSelectedDifficulties(new Set());
+    setSelectedLevels(new Set());
+    setSelectedBuckets(new Set());
+  };
+
+  const toggleDifficulty = (id: SpreadDifficulty | 'unrated') => {
+    setSelectedDifficulties(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleLevel = (lvl: SpreadLevel) => {
+    setSelectedLevels(prev => {
+      const next = new Set(prev);
+      if (next.has(lvl)) next.delete(lvl);
+      else next.add(lvl);
+      return next;
+    });
+  };
+
+  const toggleBucket = (bucketId: string) => {
+    setSelectedBuckets(prev => {
+      const next = new Set(prev);
+      if (next.has(bucketId)) next.delete(bucketId);
+      else next.add(bucketId);
+      return next;
+    });
+  };
+
+  const visibleImages = useMemo(() => {
+    return images.filter(img => {
+      if (selectedDifficulties.size > 0) {
+        const diffKey = img.difficulty ?? 'unrated';
+        if (!selectedDifficulties.has(diffKey)) return false;
+      }
+      if (selectedLevels.size > 0) {
+        const lvl = img.spreadLevel ?? 1;
+        if (!selectedLevels.has(lvl)) return false;
+      }
+      if (selectedBuckets.size > 0) {
+        const bKey = img.bucketId && bucketById.has(img.bucketId) ? img.bucketId : 'unassigned';
+        if (!selectedBuckets.has(bKey)) return false;
+      }
+      return true;
+    });
+  }, [images, selectedDifficulties, selectedLevels, selectedBuckets, bucketById]);
 
   const handleSelect = async (img: AdminImage) => {
     if (extractingId) return;
     setExtractingId(img.id);
     try {
       const sample = await sampleWithXml(img);
-      const extracted = await extractChromosomes(sample);
-      await onSelect(sample, extracted);
+      await onSelect(sample, []);
     } finally {
       setExtractingId(null);
     }
@@ -2500,10 +2884,15 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
       className="fixed inset-0 z-[100] bg-slate-50 flex flex-col p-8 overflow-y-auto"
     >
       <div className="max-w-6xl mx-auto w-full">
-        <header className="flex items-center justify-between mb-12">
+        <header className="flex items-center justify-between mb-8">
           <div>
-            <h2 className="text-4xl font-black text-slate-900 tracking-tighter">Select Sample</h2>
-            <p className="text-slate-500 font-medium mt-2">Choose a metaphase spread to start a level</p>
+            <div className="flex items-center gap-2">
+              <h2 className="text-4xl font-black text-slate-900 tracking-tighter">Select Sample</h2>
+              <span className="rounded-full bg-slate-900 px-2.5 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider text-white">
+                Admin Library
+              </span>
+            </div>
+            <p className="text-slate-500 font-medium mt-2">Filter by difficulty, level, or bucket — combine any filters at once</p>
           </div>
           <button onClick={onBack} className="p-3 hover:bg-slate-200 rounded-full transition-colors text-slate-500">
             <X className="w-6 h-6" />
@@ -2529,43 +2918,157 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
             </div>
           ) : (
             <>
-            <div className="flex flex-wrap items-center gap-2 mb-6">
-              {(['all', ...DIFFICULTIES] as const).map(id => {
-                const count = id === 'all' ? images.length : difficultyCounts[id];
-                const selected = difficultyFilter === id;
-                return (
+            <div className="mb-6 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                  Filters ({visibleImages.length} of {images.length} spreads)
+                </span>
+                {hasAnyFilter && (
                   <button
-                    key={id}
                     type="button"
-                    onClick={() => setDifficultyFilter(id)}
+                    onClick={clearAllFilters}
+                    className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-slate-900 text-white hover:bg-slate-800 transition-colors"
+                  >
+                    Clear All Filters
+                  </button>
+                )}
+              </div>
+
+              {/* Difficulty Filters */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="w-20 shrink-0 text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                  Difficulty
+                </span>
+                {DIFFICULTIES.map(id => {
+                  const count = difficultyCounts[id];
+                  const selected = selectedDifficulties.has(id);
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => toggleDifficulty(id)}
+                      className={cn(
+                        'px-3 py-1 rounded-full text-xs font-bold transition-colors',
+                        selected
+                          ? id === 'easy'
+                            ? 'bg-emerald-500 text-white'
+                            : id === 'moderate'
+                              ? 'bg-amber-500 text-white'
+                              : 'bg-rose-500 text-white'
+                          : 'bg-slate-50 border border-slate-200 text-slate-600 hover:bg-slate-100'
+                      )}
+                    >
+                      {DIFFICULTY_LABELS[id]} {count}
+                    </button>
+                  );
+                })}
+                {difficultyCounts.unrated > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => toggleDifficulty('unrated')}
                     className={cn(
-                      'px-3 py-1.5 rounded-full text-xs font-bold transition-colors',
-                      selected
-                        ? id === 'easy'
-                          ? 'bg-emerald-500 text-white'
-                          : id === 'moderate'
-                            ? 'bg-amber-500 text-white'
-                            : id === 'hard'
-                              ? 'bg-rose-500 text-white'
-                              : 'bg-slate-900 text-white'
-                        : 'bg-white border border-slate-200 text-slate-500 hover:bg-slate-100'
+                      'px-3 py-1 rounded-full text-xs font-bold transition-colors',
+                      selectedDifficulties.has('unrated')
+                        ? 'bg-slate-700 text-white'
+                        : 'bg-slate-50 border border-slate-200 text-slate-500 hover:bg-slate-100'
                     )}
                   >
-                    {id === 'all' ? 'All' : DIFFICULTY_LABELS[id]} {count}
+                    Unrated {difficultyCounts.unrated}
                   </button>
-                );
-              })}
+                )}
+              </div>
+
+              {/* Level Filters */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="w-20 shrink-0 text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                  Level
+                </span>
+                {SPREAD_LEVELS.map(lvl => {
+                  const count = levelCounts[lvl] ?? 0;
+                  const selected = selectedLevels.has(lvl);
+                  return (
+                    <button
+                      key={lvl}
+                      type="button"
+                      onClick={() => toggleLevel(lvl)}
+                      className={cn(
+                        'px-2.5 py-1 rounded-full text-xs font-bold transition-colors tabular-nums',
+                        selected
+                          ? 'bg-sky-500 text-white'
+                          : count > 0
+                            ? 'bg-slate-50 border border-slate-200 text-slate-600 hover:bg-slate-100'
+                            : 'bg-slate-50/50 border border-slate-100 text-slate-300 hover:bg-slate-100'
+                      )}
+                    >
+                      Level {lvl} ({count})
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Bucket Filters */}
+              {(buckets.length > 0 || bucketCounts.unassigned > 0) && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="w-20 shrink-0 text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400">
+                    Bucket
+                  </span>
+                  {buckets.map(bucket => {
+                    const count = bucketCounts[bucket.id] ?? 0;
+                    const selected = selectedBuckets.has(bucket.id);
+                    return (
+                      <button
+                        key={bucket.id}
+                        type="button"
+                        onClick={() => toggleBucket(bucket.id)}
+                        className={cn(
+                          'px-3 py-1 rounded-full text-xs font-bold transition-colors',
+                          selected
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-slate-50 border border-slate-200 text-slate-600 hover:bg-slate-100'
+                        )}
+                      >
+                        Bucket {bucket.bucketNumber}: {bucket.name} ({count})
+                      </button>
+                    );
+                  })}
+                  {bucketCounts.unassigned > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => toggleBucket('unassigned')}
+                      className={cn(
+                        'px-3 py-1 rounded-full text-xs font-bold transition-colors',
+                        selectedBuckets.has('unassigned')
+                          ? 'bg-indigo-600 text-white'
+                          : 'bg-slate-50 border border-slate-200 text-slate-500 hover:bg-slate-100'
+                      )}
+                    >
+                      Unassigned ({bucketCounts.unassigned})
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
+
             {visibleImages.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-64 text-slate-400 bg-white rounded-3xl border border-slate-200 shadow-sm p-8 text-center">
                 <p className="text-lg font-bold text-slate-700">
-                  No {difficultyFilter === 'all' ? '' : `${DIFFICULTY_LABELS[difficultyFilter].toLowerCase()} `}spreads
+                  No spreads match the selected filters
                 </p>
+                {hasAnyFilter && (
+                  <button
+                    type="button"
+                    onClick={clearAllFilters}
+                    className="mt-3 px-4 py-2 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 transition-colors"
+                  >
+                    Clear Filters
+                  </button>
+                )}
               </div>
             ) : (
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
               {visibleImages.map(img => {
                 const savedProgress = progressBySample[img.id];
+                const bucket = img.bucketId ? bucketById.get(img.bucketId) : undefined;
                 return (
                 <div
                   key={img.id}
@@ -2595,17 +3098,21 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
                     <div>
                       <p className="text-[10px] font-mono text-slate-400 font-bold">SAMPLE ID</p>
                       <p className="font-bold text-sm text-slate-700 truncate w-32">{img.id.slice(0, 12)}</p>
-                      {img.difficulty && (
-                        <div className="mt-1">
-                          <DifficultyBadge difficulty={img.difficulty} />
-                        </div>
-                      )}
-                      <div className="mt-1 space-y-0.5">
+                      <div className="mt-1 flex flex-wrap items-center gap-1">
+                        <SpreadLevelBadge level={img.spreadLevel} />
+                        {img.difficulty && <DifficultyBadge difficulty={img.difficulty} />}
+                        {bucket && (
+                          <span className="inline-flex items-center rounded-full bg-indigo-50 px-1.5 py-0.5 text-[9px] font-bold text-indigo-700">
+                            B{bucket.bucketNumber}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-1.5 space-y-0.5">
                         {LEVELS.map(level => {
                           if (level.id === LEARN_LEVEL) {
                             return (
                               <p key={level.id} className="text-[10px] font-bold text-slate-400">
-                                {level.title}
+                                Stage {level.label} {level.title}
                               </p>
                             );
                           }
@@ -2618,7 +3125,7 @@ const SpreadSelectionScreen: React.FC<SpreadSelectionScreenProps> = ({ images, i
                                 summary?.status === 'complete' ? "text-emerald-600" : summary ? "text-sky-600" : "text-slate-400"
                               )}
                             >
-                              {level.label} {level.title} · {levelProgressLabel(summary)}
+                              Stage {level.label} {level.title} · {levelProgressLabel(summary)}
                             </p>
                           );
                         })}
@@ -2672,7 +3179,7 @@ function LevelSidebarButton({
     >
       <div className="flex items-center justify-between gap-2">
         <p className="text-[10px] font-mono font-bold tracking-widest text-slate-400">
-          LEVEL {level.label}
+          STAGE {level.label}
         </p>
         {busy && <Loader className="w-3.5 h-3.5 text-sky-500 animate-spin shrink-0" />}
       </div>
@@ -2688,6 +3195,328 @@ function LevelSidebarButton({
     </button>
   );
 }
+
+/** Whether a spread has all 7 gameplay stages (Stages 2–8) completed. */
+function isSpreadCompleted(
+  sampleId: string,
+  progressBySample: Record<string, SampleLevelProgress>,
+): boolean {
+  const sampleProgress = progressBySample[sampleId];
+  if (!sampleProgress) return false;
+  return GAMEPLAY_LEVELS.every(stageId => sampleProgress[stageId]?.status === 'complete');
+}
+
+/** Count how many gameplay stages (Stages 2–8) are completed or started on a spread. */
+function countCompletedStagesOnSpread(
+  sampleId: string,
+  progressBySample: Record<string, SampleLevelProgress>,
+): { completed: number; started: number } {
+  const sampleProgress = progressBySample[sampleId];
+  if (!sampleProgress) return { completed: 0, started: 0 };
+  let completed = 0;
+  let started = 0;
+  for (const stageId of GAMEPLAY_LEVELS) {
+    const s = sampleProgress[stageId];
+    if (s?.status === 'complete') {
+      completed += 1;
+      started += 1;
+    } else if (s) {
+      started += 1;
+    }
+  }
+  return { completed, started };
+}
+
+/**
+ * Selects up to 3 metaphase spreads for a given Level (1–10):
+ * Target quota: 1 Easy, 1 Moderate, 1 Hard.
+ * Fallback priority:
+ *  - If Hard or Moderate is missing, fill open slots from remaining Easy spreads first
+ *    (e.g. if Hard is missing -> 2 Easy + 1 Moderate; if both Moderate & Hard missing -> 3 Easy).
+ *  - If Easy is also exhausted, fill from remaining Moderate, then Hard, then Unrated spreads.
+ * Prioritizes spreads where the user already has saved progress so returning users resume the same spreads.
+ */
+export function selectThreeSpreadsForLevel(
+  spreadsInLevel: AdminImage[],
+  progressBySample: Record<string, SampleLevelProgress>,
+  userSeed: string,
+): AdminImage[] {
+  if (spreadsInLevel.length === 0) return [];
+
+  const rankCandidate = (img: AdminImage): { completedStages: number; startedStages: number; tieHash: number } => {
+    const { completed, started } = countCompletedStagesOnSpread(img.id, progressBySample);
+    const tieHash = parseInt(annotationSignature(`${userSeed}:${img.id}`), 16) || 0;
+    return { completedStages: completed, startedStages: started, tieHash };
+  };
+
+  const sortPool = (pool: AdminImage[]): AdminImage[] => {
+    return [...pool].sort((a, b) => {
+      const ra = rankCandidate(a);
+      const rb = rankCandidate(b);
+      if (ra.completedStages !== rb.completedStages) return rb.completedStages - ra.completedStages;
+      if (ra.startedStages !== rb.startedStages) return rb.startedStages - ra.startedStages;
+      return ra.tieHash - rb.tieHash;
+    });
+  };
+
+  const easyPool = sortPool(spreadsInLevel.filter(img => img.difficulty === 'easy'));
+  const moderatePool = sortPool(spreadsInLevel.filter(img => img.difficulty === 'moderate'));
+  const hardPool = sortPool(spreadsInLevel.filter(img => img.difficulty === 'hard'));
+  const unratedPool = sortPool(spreadsInLevel.filter(img => !img.difficulty));
+
+  const pickedIds = new Set<string>();
+  const picked: AdminImage[] = [];
+
+  const takeOne = (pool: AdminImage[]): AdminImage | null => {
+    for (const candidate of pool) {
+      if (!pickedIds.has(candidate.id)) {
+        pickedIds.add(candidate.id);
+        picked.push(candidate);
+        return candidate;
+      }
+    }
+    return null;
+  };
+
+  // Step 1: Try to pick 1 Easy, 1 Moderate, 1 Hard
+  takeOne(easyPool);
+  takeOne(moderatePool);
+  takeOne(hardPool);
+
+  // Step 2: Fill any missing slots up to 3 using fallback order: Easy -> Moderate -> Hard -> Unrated
+  const fallbackPools = [easyPool, moderatePool, hardPool, unratedPool];
+  for (const pool of fallbackPools) {
+    while (picked.length < 3) {
+      const next = takeOne(pool);
+      if (!next) break;
+    }
+    if (picked.length >= 3) break;
+  }
+
+  // Order the chosen spreads Easy -> Moderate -> Hard -> Unrated so the user progresses smoothly
+  const diffOrder: Record<string, number> = { easy: 0, moderate: 1, hard: 2, unrated: 3 };
+  return picked.sort((a, b) => {
+    const da = diffOrder[a.difficulty ?? 'unrated'] ?? 3;
+    const db = diffOrder[b.difficulty ?? 'unrated'] ?? 3;
+    return da - db;
+  });
+}
+
+interface UserLevelSelectScreenProps {
+  images: AdminImage[];
+  imagesLoaded: boolean;
+  loadError: string | null;
+  progressBySample: Record<string, SampleLevelProgress>;
+  userSeed: string;
+  onSelectLevel: (level: SpreadLevel, levelSpreads: AdminImage[], initialSpread: AdminImage, extracted: ChromosomeData[]) => Promise<void>;
+  onBack: () => void;
+}
+
+const UserLevelSelectScreen: React.FC<UserLevelSelectScreenProps> = ({
+  images,
+  imagesLoaded,
+  loadError,
+  progressBySample,
+  userSeed,
+  onSelectLevel,
+  onBack,
+}) => {
+  const [openingLevel, setOpeningLevel] = useState<SpreadLevel | null>(null);
+
+  // Playable spreads are those with annotations (or if XML is still loading, annotationComplete or any uploaded spread)
+  const playableImages = useMemo(() => {
+    const annotated = images.filter(img => img.annotationComplete || hasAnnotations(img.xml));
+    return annotated.length > 0 ? annotated : images;
+  }, [images]);
+
+  // Dynamically determine levels up to the highest assigned spread_level (between 1 and 10)
+  const availableLevels = useMemo<SpreadLevel[]>(() => {
+    if (playableImages.length === 0) return [];
+    let maxLvl = 1;
+    for (const img of playableImages) {
+      const lvl = img.spreadLevel ?? 1;
+      if (lvl > maxLvl) maxLvl = lvl;
+    }
+    return SPREAD_LEVELS.filter(lvl => lvl <= maxLvl);
+  }, [playableImages]);
+
+  const spreadsByLevel = useMemo(() => {
+    const map = new Map<SpreadLevel, AdminImage[]>();
+    for (const lvl of availableLevels) {
+      const inLevel = playableImages.filter(img => (img.spreadLevel ?? 1) === lvl);
+      const selected = selectThreeSpreadsForLevel(inLevel, progressBySample, `${userSeed}:level-${lvl}`);
+      map.set(lvl, selected);
+    }
+    return map;
+  }, [availableLevels, playableImages, progressBySample, userSeed]);
+
+  const handleOpenLevel = async (lvl: SpreadLevel) => {
+    if (openingLevel !== null) return;
+    const levelSpreads = spreadsByLevel.get(lvl) ?? [];
+    if (levelSpreads.length === 0) return;
+
+    setOpeningLevel(lvl);
+    try {
+      // Pick the first incomplete spread in the level, or the first spread if all are complete
+      const targetSpread =
+        levelSpreads.find(s => !isSpreadCompleted(s.id, progressBySample)) ?? levelSpreads[0];
+      const sample = await sampleWithXml(targetSpread);
+      await onSelectLevel(lvl, levelSpreads, sample, []);
+    } finally {
+      setOpeningLevel(null);
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -20 }}
+      className="fixed inset-0 z-[100] bg-slate-50 flex flex-col p-8 overflow-y-auto"
+    >
+      <div className="max-w-5xl mx-auto w-full">
+        <header className="flex items-center justify-between mb-10">
+          <div>
+            <h2 className="text-4xl font-black text-slate-900 tracking-tighter">Select Level</h2>
+            <p className="text-slate-500 font-medium mt-2">
+              Complete 3 metaphase spreads (Easy, Moderate, Hard) across all 8 stages to master each level
+            </p>
+          </div>
+          <button onClick={onBack} className="p-3 hover:bg-slate-200 rounded-full transition-colors text-slate-500">
+            <X className="w-6 h-6" />
+          </button>
+        </header>
+
+        <div className="relative min-h-64 rounded-3xl overflow-hidden">
+          {!imagesLoaded && !loadError ? (
+            <div className="absolute inset-0 z-20 bg-slate-50 flex flex-col items-center justify-center">
+              <Loader className="w-12 h-12 text-sky-500 animate-spin" />
+              <p className="mt-4 text-sm font-bold text-slate-600">Loading levels...</p>
+            </div>
+          ) : loadError ? (
+            <div className="flex flex-col items-center justify-center h-64 text-slate-400 bg-white rounded-3xl border border-red-200 shadow-sm p-8 text-center">
+              <p className="text-lg font-bold text-slate-700">Could not load levels</p>
+              <p className="text-sm mt-1 text-red-600">{loadError}</p>
+            </div>
+          ) : availableLevels.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-64 text-slate-400 bg-white rounded-3xl border border-slate-200 shadow-sm p-8 text-center">
+              <ImageIcon className="w-12 h-12 mb-4 opacity-50 mx-auto" />
+              <p className="text-lg font-bold text-slate-700">No levels available yet</p>
+              <p className="text-sm mt-1">Please ask the administrator to upload and annotate metaphase spreads.</p>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-5 max-w-2xl mx-auto">
+              {availableLevels.map(lvl => {
+                const levelSpreads = spreadsByLevel.get(lvl) ?? [];
+                const targetCount = 3;
+                const completedSpreadsCount = levelSpreads.filter(s => isSpreadCompleted(s.id, progressBySample)).length;
+                const anyStarted = levelSpreads.some(s => countCompletedStagesOnSpread(s.id, progressBySample).started > 0);
+                const isLevelCleared = levelSpreads.length >= targetCount && completedSpreadsCount >= targetCount;
+                const isEmpty = levelSpreads.length === 0;
+                const isOpening = openingLevel === lvl;
+
+                return (
+                  <div
+                    key={lvl}
+                    onClick={() => !isEmpty && handleOpenLevel(lvl)}
+                    className={cn(
+                      "bg-white rounded-3xl border-2 p-6 flex flex-col justify-between transition-all relative overflow-hidden",
+                      isEmpty
+                        ? "border-slate-200 opacity-60 cursor-not-allowed"
+                        : isLevelCleared
+                          ? "border-emerald-400 shadow-sm cursor-pointer hover:shadow-xl hover:-translate-y-1"
+                          : "border-slate-200 shadow-sm cursor-pointer hover:border-sky-400 hover:shadow-xl hover:-translate-y-1",
+                      isOpening && "pointer-events-none opacity-80"
+                    )}
+                  >
+                    {isOpening && (
+                      <div className="absolute inset-0 z-10 bg-white/70 backdrop-blur-[2px] flex flex-col items-center justify-center">
+                        <Loader className="w-8 h-8 text-sky-500 animate-spin mb-2" />
+                        <span className="text-xs font-bold text-slate-700 bg-white px-3 py-1 rounded-full shadow-sm">
+                          Opening Level {lvl}...
+                        </span>
+                      </div>
+                    )}
+
+                    <div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-mono font-bold uppercase tracking-widest text-sky-600 bg-sky-50 px-2.5 py-1 rounded-full">
+                          LEVEL {lvl}
+                        </span>
+                        {isLevelCleared ? (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-emerald-700">
+                            <CheckCircle2 className="w-3.5 h-3.5" /> Complete
+                          </span>
+                        ) : anyStarted ? (
+                          <span className="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-amber-700">
+                            In Progress
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            {isEmpty ? 'No Spreads' : 'Not Started'}
+                          </span>
+                        )}
+                      </div>
+
+                      <h3 className="text-2xl font-black text-slate-900 mt-4">
+                        Level {lvl}
+                      </h3>
+                      <p className="text-xs text-slate-500 font-medium mt-1">
+                        {isEmpty
+                          ? 'No metaphase spreads assigned to this level yet.'
+                          : `${completedSpreadsCount} / ${targetCount} Metaphase Spreads Solved`}
+                      </p>
+
+                      {levelSpreads.length > 0 && (
+                        <div className="mt-5 space-y-2">
+                          {levelSpreads.map((spread, idx) => {
+                            const spreadDone = isSpreadCompleted(spread.id, progressBySample);
+                            const { completed: stagesDone } = countCompletedStagesOnSpread(spread.id, progressBySample);
+                            return (
+                              <div
+                                key={spread.id}
+                                className={cn(
+                                  "flex items-center justify-between rounded-xl border px-3 py-2 text-xs",
+                                  spreadDone
+                                    ? "border-emerald-200 bg-emerald-50/60 text-emerald-900"
+                                    : "border-slate-100 bg-slate-50 text-slate-700"
+                                )}
+                              >
+                                <div className="flex items-center gap-2">
+                                  <span className="font-black">Spread {idx + 1}</span>
+                                  <DifficultyBadge difficulty={spread.difficulty} unsetLabel="Standard" />
+                                </div>
+                                <span className={cn(
+                                  "font-mono text-[10px] font-bold",
+                                  spreadDone ? "text-emerald-600" : stagesDone > 0 ? "text-sky-600" : "text-slate-400"
+                                )}>
+                                  {spreadDone ? 'Solved' : `${stagesDone}/${GAMEPLAY_LEVELS.length} stages`}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="mt-6 pt-4 border-t border-slate-100 flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-700">
+                        {isEmpty ? 'Unavailable' : isLevelCleared ? 'Replay Level' : anyStarted ? 'Continue Level' : 'Start Level'}
+                      </span>
+                      <div className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center">
+                        <ChevronRight className="w-4 h-4 text-slate-600" />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  );
+};
 
 // --- Main App ---
 
@@ -2881,7 +3710,7 @@ const AuthForm = () => {
   );
 };
 
-type AppScreen = 'welcome' | 'select' | 'levels' | 'learning' | 'playing' | 'admin';
+type AppScreen = 'welcome' | 'select' | 'user_levels' | 'levels' | 'learning' | 'playing' | 'admin';
 
 interface ScreenHistoryEntry {
   screen: AppScreen;
@@ -2892,6 +3721,7 @@ interface ScreenHistoryEntry {
 const SCREEN_DEPTH: Record<AppScreen, number> = {
   welcome: 0,
   select: 1,
+  user_levels: 1,
   admin: 1,
   levels: 2,
   learning: 2,
@@ -2899,7 +3729,7 @@ const SCREEN_DEPTH: Record<AppScreen, number> = {
 };
 
 function isAppScreen(value: unknown): value is AppScreen {
-  return value === 'welcome' || value === 'select' || value === 'levels'
+  return value === 'welcome' || value === 'select' || value === 'user_levels' || value === 'levels'
     || value === 'learning' || value === 'playing' || value === 'admin';
 }
 
@@ -2912,9 +3742,13 @@ function readScreenHistory(state: unknown): ScreenHistoryEntry | null {
 
 function LevelBriefModal({
   level,
+  onStartTrial,
+  onStartQuiz,
   onClose,
 }: {
   level: (typeof LEVELS)[number];
+  onStartTrial?: () => void;
+  onStartQuiz?: () => void;
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -2922,11 +3756,15 @@ function LevelBriefModal({
       event.stopPropagation();
       if (event.key !== 'Escape' && event.key !== 'Enter') return;
       event.preventDefault();
+      if (event.key === 'Enter' && onStartQuiz) {
+        onStartQuiz();
+        return;
+      }
       onClose();
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose]);
+  }, [onClose, onStartQuiz]);
 
   return (
     <div
@@ -2937,10 +3775,10 @@ function LevelBriefModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="level-brief-title"
-        className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl"
+        className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl"
         onClick={(event) => event.stopPropagation()}
       >
-        <p className="font-mono text-[10px] font-bold tracking-widest text-slate-400">LEVEL {level.label}</p>
+        <p className="font-mono text-[10px] font-bold tracking-widest text-slate-400">STAGE {level.label}</p>
         <h2 id="level-brief-title" className="mt-1 text-xl font-black text-slate-900">{level.title}</h2>
         <ul className="mt-4 space-y-2.5">
           {level.pointers.map((point) => (
@@ -2950,13 +3788,39 @@ function LevelBriefModal({
             </li>
           ))}
         </ul>
-        <button
-          type="button"
-          onClick={onClose}
-          className="mt-6 w-full rounded-xl bg-slate-900 py-3 text-sm font-bold text-white transition-colors hover:bg-slate-800"
-        >
-          Start
-        </button>
+        {level.id === LEARN_LEVEL ? (
+          <button
+            type="button"
+            onClick={onClose}
+            className="mt-6 w-full rounded-xl bg-slate-900 py-3 text-sm font-bold text-white transition-colors hover:bg-slate-800"
+          >
+            Start
+          </button>
+        ) : (
+          <div className="mt-6 space-y-2.5">
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={onStartTrial ?? onClose}
+                className="flex flex-col items-center justify-center rounded-xl border-2 border-amber-300 bg-amber-50 px-3 py-3 text-center transition-colors hover:bg-amber-100"
+              >
+                <span className="text-sm font-black text-amber-900">Trial Run</span>
+                <span className="mt-0.5 text-[10px] font-bold text-amber-700">Practice spread (not in quiz) · Hints on</span>
+              </button>
+              <button
+                type="button"
+                onClick={onStartQuiz ?? onClose}
+                className="flex flex-col items-center justify-center rounded-xl bg-slate-900 px-3 py-3 text-center text-white transition-colors hover:bg-slate-800"
+              >
+                <span className="text-sm font-black">Take Quiz</span>
+                <span className="mt-0.5 text-[10px] font-bold text-slate-300">Your quiz spread · No hints</span>
+              </button>
+            </div>
+            <p className="rounded-xl border border-amber-200/80 bg-amber-50/70 px-3 py-2 text-center text-[11px] font-medium leading-snug text-amber-900">
+              <span className="font-black">Note:</span> Trial Run uses a separate practice metaphase spread that is <span className="font-bold underline decoration-amber-400 underline-offset-2">not part of the quiz</span>.
+            </p>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -3120,10 +3984,49 @@ function SourceSpreadModal({ imageUrl, onClose }: { imageUrl: string; onClose: (
   );
 }
 
+/** Slots and the tray win when the pointer is over them. The spread only catches a drop that misses both. */
+const pluckSpreadCollision: CollisionDetection = (args) => {
+  const hits = pointerWithin(args);
+  const specific = hits.filter(hit => hit.id !== PLUCK_SPREAD_DROP_ID);
+  return specific.length > 0 ? specific : hits;
+};
+
+/**
+ * Picks a random annotated metaphase spread that is NOT in `excludedSpreadIds`
+ * (the 3 quiz spreads for the level and the active quiz spread).
+ */
+export function pickRandomTrialSpread(
+  allImages: AdminImage[],
+  excludedSpreadIds: ReadonlySet<string>,
+  targetSpreadLevel?: SpreadLevel | null,
+  currentTrialId?: string | null,
+): AdminImage | null {
+  const annotated = allImages.filter(img => img.annotationComplete || hasAnnotations(img.xml));
+  const basePool = annotated.length > 0 ? annotated : allImages;
+  const nonExcluded = basePool.filter(img => !excludedSpreadIds.has(img.id));
+  const pool = nonExcluded.length > 0 ? nonExcluded : basePool.filter(img => img.id !== currentTrialId);
+  if (pool.length === 0) return basePool[0] ?? null;
+
+  const avoidingCurrent = currentTrialId && pool.length > 1
+    ? pool.filter(img => img.id !== currentTrialId)
+    : pool;
+
+  const sameLevel = targetSpreadLevel != null
+    ? avoidingCurrent.filter(img => (img.spreadLevel ?? 1) === targetSpreadLevel)
+    : [];
+  const candidates = sameLevel.length > 0 ? sameLevel : avoidingCurrent;
+  const randomIndex = Math.floor(Math.random() * candidates.length);
+  return candidates[randomIndex] ?? candidates[0] ?? null;
+}
+
 export default function Chromy() {
   const [session, setSession] = useState<Session | null>(null);
   const [userRole, setUserRole] = useState<'SUPER ADMIN' | 'ADMIN' | 'USER' | null>(null);
+  const [testAsUser, setTestAsUser] = useState(false);
+  const isActualAdmin = userRole === 'ADMIN' || userRole === 'SUPER ADMIN';
+  const effectiveRole: 'SUPER ADMIN' | 'ADMIN' | 'USER' | null = testAsUser ? 'USER' : userRole;
   const [images, setImages] = useState<AdminImage[]>([]);
+  const [buckets, setBuckets] = useState<Bucket[]>([]);
   const imagesRef = useRef(images);
   imagesRef.current = images;
   const annotationSignatureCacheRef = useRef(new Map<string, { xml: string; signature: string }>());
@@ -3131,17 +4034,30 @@ export default function Chromy() {
   const [imagesLoaded, setImagesLoaded] = useState(false);
   const [samplesLoadError, setSamplesLoadError] = useState<string | null>(null);
   const [gameState, setGameState] = useState<AppScreen>('welcome');
+  const [activeSpreadLevel, setActiveSpreadLevel] = useState<SpreadLevel | null>(null);
+  const [levelSpreads, setLevelSpreads] = useState<AdminImage[]>([]);
+  const activeSpreadLevelRef = useRef<SpreadLevel | null>(null);
+  activeSpreadLevelRef.current = activeSpreadLevel;
   const [selectedImage, setSelectedImage] = useState<AdminImage | null>(null);
   const [levelChromosomes, setLevelChromosomes] = useState<ChromosomeData[]>([]);
+  const [playMode, setPlayMode] = useState<'trial' | 'quiz'>('quiz');
+  const [trialImage, setTrialImage] = useState<AdminImage | null>(null);
+  const [quizPhase, setQuizPhase] = useState<'playing' | 'checked'>('playing');
+  const [buildingQuiz, setBuildingQuiz] = useState(false);
+  const wasTrialBeforeBriefRef = useRef(false);
+  const [retryLockedIds, setRetryLockedIds] = useState<Set<string>>(new Set());
+  const [orientationLockSlotIds, setOrientationLockSlotIds] = useState<Set<string>>(new Set());
   const [startingLevel, setStartingLevel] = useState<number | null>(null);
   const [activeLevel, setActiveLevel] = useState<number>(ARRANGE_LEVEL);
   const [spreadBusy, setSpreadBusy] = useState(false);
   const [sourceImageLoaded, setSourceImageLoaded] = useState(false);
   const [sourcePreviewOpen, setSourcePreviewOpen] = useState(false);
   const [levelBriefOpen, setLevelBriefOpen] = useState(false);
+  const [spreadReady, setSpreadReady] = useState(true);
   const [originalExtracted, setOriginalExtracted] = useState<ChromosomeData[]>([]);
   const [jumbled, setJumbled] = useState<ChromosomeData[]>([]);
   const [placed, setPlaced] = useState<Record<string, ChromosomeData>>({});
+  const [trayReturns, setTrayReturns] = useState<TrayReturnFlightData[]>([]);
   const [history, setHistory] = useState<{ jumbled: ChromosomeData[], placed: Record<string, ChromosomeData> }[]>([]);
   const [placements, setPlacements] = useState<NumberPlacement[]>([]);
   const [placementHistory, setPlacementHistory] = useState<NumberPlacement[][]>([]);
@@ -3171,7 +4087,7 @@ export default function Chromy() {
   const showScreenFromHistory = (screen: AppScreen) => {
     const needsSample = screen === 'levels' || screen === 'learning' || screen === 'playing';
     if (needsSample && !selectedImageRef.current) {
-      setGameState('select');
+      setGameState(activeSpreadLevelRef.current !== null ? 'user_levels' : 'select');
       return;
     }
     if (screen === 'learning' || screen === 'levels') {
@@ -3191,7 +4107,7 @@ export default function Chromy() {
   useLayoutEffect(() => {
     if (gameState !== 'levels') return;
     if (!selectedImageRef.current) {
-      setGameState('select');
+      setGameState(activeSpreadLevelRef.current !== null ? 'user_levels' : 'select');
       return;
     }
     setActiveLevel(LEARN_LEVEL);
@@ -3222,9 +4138,12 @@ export default function Chromy() {
     window.history.back();
   };
 
-  const jumpToScreen = (screen: 'welcome' | 'select') => {
+  const jumpToScreen = (screen: 'welcome' | 'select' | 'user_levels') => {
     const delta = SCREEN_DEPTH[screen] - screenDepthRef.current;
-    if (delta >= 0) return;
+    if (delta >= 0) {
+      setGameState(screen);
+      return;
+    }
     fromHistoryRef.current = true;
     window.history.go(delta);
   };
@@ -3298,15 +4217,17 @@ export default function Chromy() {
       libraryLoadedForUserRef.current = null;
       progressSignatureRef.current = {};
       setImages([]);
+      setBuckets([]);
       setBucketPairDescriptions({});
       setImagesLoaded(false);
       setSamplesLoadError(null);
       setProgressBySample({});
+      setTestAsUser(false);
     }
     previousUserIdRef.current = userId;
 
     if (!userId) return;
-    if (gameState !== 'select' && gameState !== 'admin') return;
+    if (gameState !== 'select' && gameState !== 'user_levels' && gameState !== 'admin') return;
     if (libraryLoadedForUserRef.current === userId) return;
 
     let cancelled = false;
@@ -3315,7 +4236,7 @@ export default function Chromy() {
 
     const loadLibrary = async () => {
       try {
-        const [samplesResult, progressResult, descriptionsResult] = await Promise.all([
+        const [samplesResult, progressResult, descriptionsResult, bucketsResult] = await Promise.all([
           supabase
             .from('samples')
             .select(SAMPLE_LIST_COLUMNS)
@@ -3327,6 +4248,10 @@ export default function Chromy() {
           supabase
             .from('bucket_pair_descriptions')
             .select('bucket_id, pair_id, description'),
+          supabase
+            .from('buckets')
+            .select('id, bucket_number, name, description')
+            .order('bucket_number', { ascending: true }),
         ]);
 
         if (cancelled) return;
@@ -3342,6 +4267,7 @@ export default function Chromy() {
           annotationComplete: row.annotation_complete === true,
           pairNoteOverrides: parsePairNoteOverrides(row.pair_note_overrides),
           difficulty: parseSpreadDifficulty(row.difficulty),
+          spreadLevel: parseSpreadLevel((row as { spread_level?: unknown }).spread_level),
         }));
 
         const signatures: Record<string, string> = {};
@@ -3369,6 +4295,14 @@ export default function Chromy() {
         progressSignatureRef.current = signatures;
         setImages(loadedImages);
         setProgressBySample(summaries);
+        if (!bucketsResult.error && bucketsResult.data) {
+          setBuckets(bucketsResult.data.map(row => ({
+            id: row.id,
+            bucketNumber: row.bucket_number,
+            name: row.name,
+            description: row.description,
+          })));
+        }
         if (descriptionsResult.error) {
           console.error('Failed to load bucket pair descriptions', descriptionsResult.error);
           setBucketPairDescriptions({});
@@ -3406,7 +4340,7 @@ export default function Chromy() {
   // This must not restart when `images` updates, or the first result cancels the rest.
   useEffect(() => {
     if (!imagesLoaded) return;
-    if (gameState !== 'admin' && gameState !== 'select') return;
+    if (gameState !== 'admin' && gameState !== 'select' && gameState !== 'user_levels') return;
 
     let cancelled = false;
     const claimed = new Set<string>();
@@ -3506,7 +4440,30 @@ export default function Chromy() {
   useEffect(() => {
     setSourceImageLoaded(false);
     setSourcePreviewOpen(false);
-  }, [selectedImage?.id]);
+  }, [selectedImage?.id, trialImage?.id, playMode]);
+
+  useLayoutEffect(() => {
+    if (!trayReturns.some(item => item.to == null)) return;
+    setTrayReturns(current => {
+      let changed = false;
+      const next: TrayReturnFlightData[] = [];
+      for (const item of current) {
+        if (item.to) {
+          next.push(item);
+          continue;
+        }
+        const to = measureChromosomeAnchor(item.id);
+        changed = true;
+        if (to) next.push({ ...item, to });
+      }
+      return changed ? next : current;
+    });
+  }, [trayReturns]);
+
+  useEffect(() => {
+    if (gameState === 'playing') return;
+    setTrayReturns(current => current.length === 0 ? current : []);
+  }, [gameState]);
 
   const handleDragStart = (event: DragStartEvent) => {
     setActiveId(event.active.id as string);
@@ -3517,15 +4474,34 @@ export default function Chromy() {
     setActiveId(null);
 
     const chromosome = active.data.current as ChromosomeData;
-    if (!chromosome || lockedChromosomeIds.has(chromosome.id)) return;
+    if (!chromosome || lockedChromosomeIds.has(chromosome.id) || retryLockedIds.has(chromosome.id)) return;
+    if (playMode === 'quiz' && quizPhase === 'checked') return;
 
-    const slotId = over && over.id !== 'raw-sample-panel' ? String(over.id) : null;
-    if (slotId) {
-      const occupant = placed[slotId];
-      if (occupant && lockedChromosomeIds.has(occupant.id)) return;
-    }
+    const droppedOnSpread = over?.id === PLUCK_SPREAD_DROP_ID;
+    const slotId = over && over.id !== 'raw-sample-panel' && !droppedOnSpread ? String(over.id) : null;
+    const occupant = slotId ? placed[slotId] : undefined;
+    // A locked scaffold or retry-verified slot stays put. Dropping a chromosome on itself is a no-op.
+    if (occupant && (lockedChromosomeIds.has(occupant.id) || retryLockedIds.has(occupant.id) || occupant.id === chromosome.id)) return;
+    if (slotId && orientationLockSlotIds.has(slotId)) return;
 
     setProgressReady(true);
+
+    const stillOnSpread = pluckLevel
+      && !jumbled.some(item => item.id === chromosome.id)
+      && !(Object.values(placed) as ChromosomeData[]).some(item => item.id === chromosome.id);
+    const dragDistance = Math.hypot(event.delta?.x ?? 0, event.delta?.y ?? 0);
+    // A chromosome already lifted off the spread goes back when dropped here.
+    // A short press on one that is still in place plucks it into the tray.
+    if (droppedOnSpread) {
+      if (!stillOnSpread) returnChromosomeToSpread(chromosome.id);
+      else if (dragDistance <= 5) pluckChromosome(chromosome.id);
+      return;
+    }
+    // A short press plucks into the tray. A real drag can land on a slot.
+    if (stillOnSpread && (!slotId || dragDistance <= 5)) {
+      pluckChromosome(chromosome.id);
+      return;
+    }
 
     // Handle dropping back to "Raw Sample" panel
     if (!slotId) {
@@ -3559,27 +4535,42 @@ export default function Chromy() {
     // Save history before change
     setHistory(prev => [...prev.slice(-19), { jumbled: [...jumbled], placed: { ...placed } }]);
 
+    const displaced = occupant && occupant.id !== chromosome.id ? occupant : null;
+    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const displacedFrom = displaced && !prefersReducedMotion ? measureChromosomeAnchor(displaced.id) : null;
+
     setPlaced(prev => {
       const newPlaced = { ...prev };
-      
-      // If it was already placed somewhere, remove it from old position
-      Object.keys(newPlaced).forEach(key => {
-        if (newPlaced[key].id === chromosome.id) {
+      let moving = chromosome;
+
+      // Leave the previous slot, and bump out whoever already occupies the target.
+      for (const key of Object.keys(newPlaced)) {
+        const placedChromosome = newPlaced[key];
+        if (placedChromosome.id === chromosome.id) moving = placedChromosome;
+        if (placedChromosome.id === chromosome.id || placedChromosome.id === displaced?.id) {
           delete newPlaced[key];
         }
-      });
+      }
 
-      // Add to new position
-      newPlaced[slotId] = chromosome;
-      
+      newPlaced[slotId] = moving;
       return newPlaced;
     });
 
-    // Remove from jumbled if it was there
-    setJumbled(prev => prev.filter(c => c.id !== chromosome.id));
+    setJumbled(prev => {
+      const next = prev.filter(item => item.id !== chromosome.id && item.id !== displaced?.id);
+      return displaced ? [...next, displaced] : next;
+    });
+
+    if (displaced && displacedFrom) {
+      setTrayReturns(prev => [
+        ...prev.filter(item => item.id !== displaced.id),
+        { id: displaced.id, chromosome: displaced, from: displacedFrom, to: null },
+      ]);
+    }
   };
 
   const updatePlaced = (slotId: string, updates: Partial<ChromosomeData>) => {
+    if (playMode === 'quiz' && quizPhase === 'checked') return;
     setProgressReady(true);
     setPlaced(prev => {
       const existing = prev[slotId];
@@ -3592,12 +4583,14 @@ export default function Chromy() {
   };
 
   const commitPlacements = (next: NumberPlacement[]) => {
+    if (playMode === 'quiz' && quizPhase === 'checked') return;
     setProgressReady(true);
     setPlacementHistory(prev => [...prev.slice(-19), placements]);
     setPlacements(next);
   };
 
   const undo = () => {
+    if (playMode === 'quiz' && quizPhase === 'checked') return;
     if (isLabelLevel(activeLevel)) {
       if (placementHistory.length === 0) return;
       setProgressReady(true);
@@ -3610,26 +4603,31 @@ export default function Chromy() {
     const lastState = history[history.length - 1];
     setJumbled(lastState.jumbled);
     setPlaced(lastState.placed);
+    setTrayReturns([]);
     setHistory(prev => prev.slice(0, -1));
   };
 
   const resetGame = () => {
     setProgressReady(false);
+    setQuizPhase('playing');
+    setRetryLockedIds(new Set());
+    setOrientationLockSlotIds(new Set());
     const source = originalExtracted.length > 0 ? originalExtracted : createInitialChromosomes();
     if (originalExtracted.length === 0) setOriginalExtracted(source);
     if (isLabelLevel(activeLevel)) {
       setPlacements([]);
       setPlacementHistory([]);
     } else {
-      const seed = selectedImage?.id ?? 'default';
+      const seed = (playMode === 'trial' ? trialImage?.id : selectedImage?.id) ?? 'default';
       const board = buildFreshBoard(activeLevel, source, seed);
       setJumbled(board.jumbled);
       setPlaced(board.placed);
+      setTrayReturns([]);
     }
     setHistory([]);
     setGameState('playing');
 
-    if (session?.user && selectedImage) {
+    if (playMode === 'quiz' && session?.user && selectedImage) {
       const sampleId = selectedImage.id;
       const userId = session.user.id;
       const levelId = activeLevel;
@@ -3672,8 +4670,12 @@ export default function Chromy() {
 
   const currentActiveChromosome = useMemo(() => {
     if (!activeId) return null;
-    return (jumbled.find(c => c.id === activeId) || Object.values(placed).find((c: ChromosomeData) => c.id === activeId)) as ChromosomeData | undefined;
-  }, [activeId, jumbled, placed]);
+    return (
+      jumbled.find(c => c.id === activeId) ||
+      (Object.values(placed) as ChromosomeData[]).find(c => c.id === activeId) ||
+      originalExtracted.find(c => c.id === activeId)
+    );
+  }, [activeId, jumbled, originalExtracted, placed]);
 
   const chromosomeDisplayScale = useMemo(
     () => uniformDisplayScale(
@@ -3683,20 +4685,90 @@ export default function Chromy() {
     [jumbled, placed]
   );
 
-  // Derive the board's pair groups (and their slot IDs) from the full set of
-  // chromosomes for this sample. Slot IDs are opaque (`slot-${pairIndex}-${slotIndex}`)
-  // so a pair ID containing arbitrary characters (custom names) can never
-  // corrupt lookup logic - the pair ID is looked up via slotPairMap instead
-  // of being parsed back out of the slot ID string.
+  // Slots come from pair-labeled chromosomes. Overlap decoys stay on the
+  // spread and in the tray, but they never form a pair row.
+  const gradedChromosomes = useMemo(
+    () => originalExtracted.filter(chromosome => !chromosome.invalid),
+    [originalExtracted],
+  );
+
   const pairGroups = useMemo(
-    () => pairSlotGroups(originalExtracted).map(({ pairId, slotIds }) => ({ pairId, slotIds })),
-    [originalExtracted]
+    () => pairSlotGroups(gradedChromosomes).map(({ pairId, slotIds }) => ({ pairId, slotIds })),
+    [gradedChromosomes]
   );
 
   const lockedChromosomeIds = useMemo(
-    () => activeLevel === MATCH_LEVEL ? scaffoldChromosomeIds(originalExtracted) : new Set<string>(),
-    [activeLevel, originalExtracted]
+    () => activeLevel === MATCH_LEVEL ? scaffoldChromosomeIds(gradedChromosomes) : new Set<string>(),
+    [activeLevel, gradedChromosomes]
   );
+
+  const pluckLevel = isPluckLevel(activeLevel);
+  const pluckInFlight = useRef(new Set<string>());
+
+  /** Chromosomes already lifted off the spread: in the tray or on the board. */
+  const pluckedIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!pluckLevel) return ids;
+    jumbled.forEach(chromosome => ids.add(chromosome.id));
+    (Object.values(placed) as ChromosomeData[]).forEach(chromosome => ids.add(chromosome.id));
+    return ids;
+  }, [pluckLevel, jumbled, placed]);
+
+  const realPluckedCount = useMemo(() => {
+    let count = 0;
+    for (const chromosome of gradedChromosomes) {
+      if (pluckedIds.has(chromosome.id)) count++;
+    }
+    return count;
+  }, [gradedChromosomes, pluckedIds]);
+
+  const returnChromosomeToSpread = (chromosomeId: string) => {
+    if (playMode === 'quiz' && quizPhase === 'checked') return;
+    if (lockedChromosomeIds.has(chromosomeId) || retryLockedIds.has(chromosomeId)) return;
+    const lockedInOrientationSlot = (Object.entries(placed) as [string, ChromosomeData][]).some(
+      ([slotId, chrom]) => chrom.id === chromosomeId && orientationLockSlotIds.has(slotId)
+    );
+    if (lockedInOrientationSlot) return;
+    const inTray = jumbled.some(item => item.id === chromosomeId);
+    const inSlot = (Object.values(placed) as ChromosomeData[]).some(item => item.id === chromosomeId);
+    if (!inTray && !inSlot) return;
+    pluckInFlight.current.delete(chromosomeId);
+    setProgressReady(true);
+    setHistory(prev => [...prev.slice(-19), { jumbled: [...jumbled], placed: { ...placed } }]);
+    setJumbled(prev => prev.filter(item => item.id !== chromosomeId));
+    setPlaced(prev => {
+      let changed = false;
+      const next = { ...prev };
+      for (const key of Object.keys(next)) {
+        if (next[key].id === chromosomeId) {
+          delete next[key];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  };
+
+  const pluckChromosome = (chromosomeId: string) => {
+    if (playMode === 'quiz' && quizPhase === 'checked') return;
+    if (pluckedIds.has(chromosomeId) || pluckInFlight.current.has(chromosomeId)) return;
+    const chromosome = originalExtracted.find(item => item.id === chromosomeId);
+    if (!chromosome) return;
+    pluckInFlight.current.add(chromosomeId);
+    setProgressReady(true);
+    setHistory(prev => [...prev.slice(-19), { jumbled: [...jumbled], placed: { ...placed } }]);
+    setJumbled(prev => prev.some(item => item.id === chromosomeId) ? prev : [...prev, chromosome]);
+  };
+
+  useEffect(() => {
+    if (!pluckLevel) {
+      pluckInFlight.current.clear();
+      return;
+    }
+    for (const id of pluckInFlight.current) {
+      if (!pluckedIds.has(id)) pluckInFlight.current.delete(id);
+    }
+  }, [pluckLevel, pluckedIds]);
 
   const labelScaffoldIds = useMemo(
     () => activeLevel === LABEL_MATE_LEVEL ? scaffoldChromosomeIds(originalExtracted) : new Set<string>(),
@@ -3718,14 +4790,21 @@ export default function Chromy() {
     return () => window.clearTimeout(timer);
   }, [highlightedRowId]);
 
+  const holdSpread = !spreadReady;
+  const previewPairGroups = useMemo(
+    () => (holdSpread ? slotGroupsFromXml(selectedImage?.xml) : []),
+    [holdSpread, selectedImage?.xml]
+  );
+  const boardPairGroups = holdSpread ? previewPairGroups : pairGroups;
+
   const pairGroupsById = useMemo(
-    () => new Map(pairGroups.map(group => [group.pairId, group] as const)),
-    [pairGroups]
+    () => new Map(boardPairGroups.map(group => [group.pairId, group] as const)),
+    [boardPairGroups]
   );
 
   const customPairGroups = useMemo(
-    () => pairGroups.filter(group => !STANDARD_PAIR_IDS.includes(group.pairId)),
-    [pairGroups]
+    () => boardPairGroups.filter(group => !STANDARD_PAIR_IDS.includes(group.pairId)),
+    [boardPairGroups]
   );
 
   const slotPairMap = useMemo(() => {
@@ -3756,6 +4835,7 @@ export default function Chromy() {
     ];
 
     return orderedCurrent
+      .filter(current => !current.invalid)
       .map(current => {
         const original = originalById.get(current.id) ?? current;
         const slotId = placedSlotByChromosomeId.get(current.id);
@@ -3783,7 +4863,7 @@ export default function Chromy() {
   }, [jumbled, originalExtracted, placed, slotPairMap]);
 
   const fullHintKaryotype = useMemo<KaryotypeHintChromosome[]>(
-    () => originalExtracted.map(chromosome => ({
+    () => gradedChromosomes.map(chromosome => ({
       id: chromosome.id,
       imageUrl: chromosome.imageUrl,
       width: chromosome.width,
@@ -3797,77 +4877,228 @@ export default function Chromy() {
       expectedFlipX: !!chromosome.expectedFlipX,
       expectedFlipY: !!chromosome.expectedFlipY,
     })),
-    [originalExtracted]
+    [gradedChromosomes]
   );
 
-  // Calculate score: a chromosome is correct if it's placed in a slot
-  // belonging to its own pair (position within the pair no longer matters)
-  // and, for real annotated images, its orientation matches the orientation
-  // recorded for that specific chromosome during annotation.
-  // Mate and Label count every numbered chromosome, including ones given at the start.
+  // Completion counts only the chromosomes the player still has to place or number.
+  // Match and Mate give one chromosome of each pair at the start; those do not
+  // add to the total or the starting percentage.
   useEffect(() => {
+    const given = activeLevel === MATCH_LEVEL || activeLevel === LABEL_MATE_LEVEL
+      ? scaffoldChromosomeIds(gradedChromosomes)
+      : new Set<string>();
+    const total = Math.max(0, gradedChromosomes.length - given.size);
+    const correctCount = isLabelLevel(activeLevel)
+      ? countCorrectLabels(gradedChromosomes, placements, given)
+      : countArrangedCorrect(gradedChromosomes, placed, activeLevel === MATCH_LEVEL ? given : new Set());
+    setScore(prev => (
+      prev.correct === correctCount && prev.total === total ? prev : { correct: correctCount, total }
+    ));
+  }, [placed, activeLevel, placements, gradedChromosomes]);
+
+  const activeGameplayImage = playMode === 'trial' && activeLevel !== LEARN_LEVEL
+    ? (trialImage ?? selectedImage)
+    : selectedImage;
+  const showFeedback = playMode === 'trial' || quizPhase === 'checked';
+  const progress = score.total > 0 ? (score.correct / score.total) * 100 : 0;
+  const isBoard100PercentCorrect = score.correct === score.total && score.total > 0;
+  const isComplete = isBoard100PercentCorrect && (playMode === 'trial' || quizPhase === 'checked');
+
+  const placedPlayerCount = useMemo(() => {
     if (isLabelLevel(activeLevel)) {
-      const given = activeLevel === LABEL_MATE_LEVEL ? scaffoldChromosomeIds(originalExtracted) : new Set<string>();
-      const correctCount = countCorrectLabels(originalExtracted, placements, given);
-      setScore(prev => prev.correct === correctCount ? prev : { ...prev, correct: correctCount });
+      return placements.filter(p => !labelScaffoldIds.has(p.chromosomeId)).length;
+    }
+    return (Object.values(placed) as ChromosomeData[]).filter(c => !lockedChromosomeIds.has(c.id)).length;
+  }, [activeLevel, placements, labelScaffoldIds, placed, lockedChromosomeIds]);
+
+  const canCheckQuiz = score.total > 0 && placedPlayerCount >= score.total;
+
+  const checkSummary = useMemo(() => {
+    if (isLabelLevel(activeLevel)) {
+      const byId = new Map<string, ChromosomeData>(gradedChromosomes.map(c => [c.id, c]));
+      let correct = 0;
+      let wrongPair = 0;
+      for (const placement of placements) {
+        if (labelScaffoldIds.has(placement.chromosomeId)) continue;
+        const chrom = byId.get(placement.chromosomeId);
+        if (chrom && chrom.type === placement.pairId) correct++;
+        else wrongPair++;
+      }
+      return { correct, orientationOnly: 0, wrongPair };
+    }
+    let correct = 0;
+    let orientationOnly = 0;
+    let wrongPair = 0;
+    for (const [slotId, chrom] of Object.entries(placed) as [string, ChromosomeData][]) {
+      if (lockedChromosomeIds.has(chrom.id)) continue;
+      const expectedPair = slotPairMap.get(slotId);
+      if (!expectedPair || chrom.invalid || chrom.type !== expectedPair) {
+        wrongPair++;
+      } else if (!chrom.imageUrl || (
+        rotationsMatch(chrom.userRotation, chrom.expectedRotation) &&
+        chrom.userFlipX === chrom.expectedFlipX &&
+        chrom.userFlipY === chrom.expectedFlipY
+      )) {
+        correct++;
+      } else {
+        orientationOnly++;
+      }
+    }
+    return { correct, orientationOnly, wrongPair };
+  }, [activeLevel, gradedChromosomes, placements, labelScaffoldIds, placed, lockedChromosomeIds, slotPairMap]);
+
+  const handleCheckAndEnd = () => {
+    setProgressReady(true);
+    setQuizPhase('checked');
+  };
+
+  const handleQuizRetry = () => {
+    if (isLabelLevel(activeLevel)) {
+      const byId = new Map<string, ChromosomeData>(gradedChromosomes.map(c => [c.id, c]));
+      const nextPlacements: NumberPlacement[] = [];
+      const nextLocked = new Set(retryLockedIds);
+      for (const placement of placements) {
+        if (labelScaffoldIds.has(placement.chromosomeId)) continue;
+        const chrom = byId.get(placement.chromosomeId);
+        if (chrom && chrom.type === placement.pairId) {
+          nextPlacements.push(placement);
+          nextLocked.add(placement.chromosomeId);
+        }
+      }
+      setRetryLockedIds(nextLocked);
+      setPlacements(nextPlacements);
+      setPlacementHistory([]);
+      setQuizPhase('playing');
+      setProgressReady(true);
       return;
     }
-    let correctCount = 0;
-    Object.entries(placed).forEach(([slotId, chrom]: [string, ChromosomeData]) => {
-      const expectedPairId = slotPairMap.get(slotId);
-      if (expectedPairId === undefined || chrom.type !== expectedPairId) return;
 
-      if (chrom.imageUrl) {
-        if (rotationsMatch(chrom.userRotation, chrom.expectedRotation) && 
-            chrom.userFlipX === chrom.expectedFlipX && 
-            chrom.userFlipY === chrom.expectedFlipY) {
-          correctCount++;
-        }
-      } else {
-        correctCount++;
+    const nextPlaced: Record<string, ChromosomeData> = {};
+    const returnedToTray: ChromosomeData[] = [];
+    const nextLocked = new Set(retryLockedIds);
+    const nextOrientationSlots = new Set<string>();
+
+    for (const [slotId, chrom] of Object.entries(placed) as [string, ChromosomeData][]) {
+      if (lockedChromosomeIds.has(chrom.id)) {
+        nextPlaced[slotId] = chrom;
+        continue;
       }
-    });
-    setScore(prev => ({ ...prev, correct: correctCount }));
-  }, [placed, slotPairMap, activeLevel, placements, originalExtracted]);
+      const expectedPair = slotPairMap.get(slotId);
+      if (!expectedPair || chrom.invalid || chrom.type !== expectedPair) {
+        returnedToTray.push(chrom);
+        continue;
+      }
+      const orientOk = !chrom.imageUrl || (
+        rotationsMatch(chrom.userRotation, chrom.expectedRotation) &&
+        chrom.userFlipX === chrom.expectedFlipX &&
+        chrom.userFlipY === chrom.expectedFlipY
+      );
+      nextPlaced[slotId] = chrom;
+      if (orientOk) {
+        nextLocked.add(chrom.id);
+      } else {
+        nextOrientationSlots.add(slotId);
+      }
+    }
 
-  const progress = (score.correct / score.total) * 100;
-  const isComplete = progress === 100 && score.total > 0;
-  const spreadComplete = !!selectedImage && GAMEPLAY_LEVELS.every(levelId => (
+    setRetryLockedIds(nextLocked);
+    setOrientationLockSlotIds(nextOrientationSlots);
+    setPlaced(nextPlaced);
+    setJumbled(prev => {
+      const existingIds = new Set(prev.map(c => c.id));
+      const additions = returnedToTray.filter(c => !existingIds.has(c.id));
+      return [...prev, ...additions];
+    });
+    setTrayReturns([]);
+    setHistory([]);
+    setQuizPhase('playing');
+    setProgressReady(true);
+  };
+
+  const summaryFor = (levelId: number): KaryotypeProgressSummary | undefined => {
+    const saved = selectedImage ? progressBySample[selectedImage.id]?.[levelId] : undefined;
+    if (playMode === 'quiz' && activeLevel === levelId && score.total > 0) {
+      if (saved?.status === 'complete' && quizPhase !== 'checked') return saved;
+      const moved = playerHasProgress(activeLevel, placed, jumbled, placements, lockedChromosomeIds);
+      if (!isComplete && !moved) return saved;
+      return {
+        status: isComplete ? 'complete' : 'in_progress',
+        correctCount: isComplete ? score.total : (quizPhase === 'checked' ? score.correct : 0),
+        totalCount: score.total,
+      };
+    }
+    return saved;
+  };
+  const spreadComplete = playMode === 'quiz' && !!selectedImage && GAMEPLAY_LEVELS.every(levelId => (
     levelId === activeLevel
-      ? isComplete
+      ? (isComplete || progressBySample[selectedImage.id]?.[levelId]?.status === 'complete')
       : progressBySample[selectedImage.id]?.[levelId]?.status === 'complete'
   ));
   const finishedLevel = LEVELS.find(level => level.id === activeLevel);
 
   useEffect(() => {
     if (!isComplete) setLevelCompleteDismissed(false);
-  }, [isComplete, activeLevel, selectedImage?.id]);
+  }, [isComplete, activeLevel, selectedImage?.id, playMode]);
 
   useEffect(() => {
     if (
       gameState !== 'playing' ||
+      playMode !== 'quiz' ||
+      activeLevel === LEARN_LEVEL ||
       !progressReady ||
       !session?.user ||
       !selectedImage ||
       score.total === 0
     ) return;
 
+    const userId = session.user.id;
+    const sampleId = selectedImage.id;
+    const levelId = activeLevel;
+
+    const moved = playerHasProgress(levelId, placed, jumbled, placements, lockedChromosomeIds);
+    if (!moved) {
+      delete progressSignatureRef.current[`${sampleId}:${levelId}`];
+      setProgressBySample(prev => {
+        const sample = prev[sampleId];
+        if (!sample?.[levelId]) return prev;
+        const nextSample = { ...sample };
+        delete nextSample[levelId];
+        return { ...prev, [sampleId]: nextSample };
+      });
+      progressSaveQueueRef.current = progressSaveQueueRef.current
+        .catch(() => undefined)
+        .then(async () => {
+          const { error } = await supabase
+            .from('karyotype_progress')
+            .delete()
+            .eq('user_id', userId)
+            .eq('sample_id', sampleId)
+            .eq('level', levelId);
+          if (error) {
+            console.error('Failed to clear karyotyping progress', error);
+            setProgressError('Your progress could not be saved. Your current board is still available in this session.');
+            throw error;
+          }
+          setProgressError(null);
+        });
+      return;
+    }
+
     const status: KaryotypeProgressSummary['status'] = isComplete ? 'complete' : 'in_progress';
-    const savedState = isLabelLevel(activeLevel)
+    const savedCorrectCount = isComplete ? score.total : (quizPhase === 'checked' ? score.correct : 0);
+    const savedState = isLabelLevel(levelId)
       ? { placements }
       : serializeKaryotypeState(jumbled, placed);
     const now = new Date().toISOString();
-    const userId = session.user.id;
-    const sampleId = selectedImage.id;
-    progressSignatureRef.current[`${sampleId}:${activeLevel}`] = annotationSignature(selectedImage.xml);
+    progressSignatureRef.current[`${sampleId}:${levelId}`] = annotationSignature(selectedImage.xml);
 
     setProgressBySample(prev => ({
       ...prev,
       [sampleId]: {
         ...prev[sampleId],
-        [activeLevel]: {
+        [levelId]: {
           status,
-          correctCount: score.correct,
+          correctCount: savedCorrectCount,
           totalCount: score.total,
         },
       },
@@ -3881,11 +5112,11 @@ export default function Chromy() {
           .upsert({
             user_id: userId,
             sample_id: sampleId,
-            level: activeLevel,
+            level: levelId,
             state: savedState,
             annotation_signature: annotationSignature(selectedImage.xml),
             status,
-            correct_count: score.correct,
+            correct_count: savedCorrectCount,
             total_count: score.total,
             completed_at: isComplete ? now : null,
             updated_at: now,
@@ -3900,6 +5131,8 @@ export default function Chromy() {
       });
   }, [
     gameState,
+    playMode,
+    quizPhase,
     isComplete,
     jumbled,
     placements,
@@ -3916,8 +5149,12 @@ export default function Chromy() {
     () => images.filter(img => hasAnnotations(img.xml)),
     [images]
   );
+  const learnSpreadList = useMemo(
+    () => (activeSpreadLevel !== null && levelSpreads.length > 0 ? levelSpreads : annotatedSpreads),
+    [activeSpreadLevel, levelSpreads, annotatedSpreads]
+  );
   const learnSpreadIndex = selectedImage
-    ? annotatedSpreads.findIndex(img => img.id === selectedImage.id)
+    ? learnSpreadList.findIndex(img => img.id === selectedImage.id)
     : -1;
   const learnChromosomes = useMemo(() => {
     if (!selectedImage) return levelChromosomes;
@@ -3926,54 +5163,104 @@ export default function Chromy() {
     return withResolvedPairSentences(levelChromosomes, latest.pairNoteOverrides, bucketNotes);
   }, [bucketPairDescriptions, images, levelChromosomes, selectedImage]);
 
-  const openPlayLevel = async (levelId: number) => {
-    if (!selectedImage) return;
+  const openPlayLevel = async (
+    levelId: number,
+    options?: { skipBrief?: boolean; imageOverride?: AdminImage; chromosomesOverride?: ChromosomeData[] }
+  ) => {
+    const targetImage = options?.imageOverride ?? selectedImage;
+    if (!targetImage) return;
+    wasTrialBeforeBriefRef.current = !options?.skipBrief && playMode === 'trial';
+
+    if (!options?.skipBrief) {
+      await progressSaveQueueRef.current.catch(() => undefined);
+      setProgressReady(false);
+      setPlayMode('quiz');
+      setTrialImage(null);
+      setQuizPhase('playing');
+      setRetryLockedIds(new Set());
+      setOrientationLockSlotIds(new Set());
+      setActiveLevel(levelId);
+      setLevelBriefOpen(true);
+      setSpreadReady(false);
+      setSourcePreviewOpen(false);
+      setHighlightedRowId(null);
+      setOriginalExtracted([]);
+      setJumbled([]);
+      setPlaced({});
+      setTrayReturns([]);
+      setPlacements([]);
+      setPlacementHistory([]);
+      setScore({ correct: 0, total: 0 });
+      setHistory([]);
+      setCertificateName('');
+      setIsReviewingCertificate(false);
+      setShowHints(false);
+      pushScreen('playing');
+      return;
+    }
+
     setProgressReady(false);
-    const playableChromosomes = levelChromosomes.length > 0
-      ? levelChromosomes
-      : createInitialChromosomes();
+    setPlayMode('quiz');
+    setTrialImage(null);
+    setQuizPhase('playing');
+    setRetryLockedIds(new Set());
+    setOrientationLockSlotIds(new Set());
+    let sample = targetImage;
+    let playableChromosomes = options?.chromosomesOverride ?? [];
+    if (playableChromosomes.length === 0) {
+      sample = targetImage.xml !== undefined ? targetImage : await sampleWithXml(targetImage);
+      if (sample.xml !== undefined) {
+        setImages(prev => {
+          const index = prev.findIndex(item => item.id === sample.id);
+          if (index < 0 || prev[index].xml === sample.xml) return prev;
+          const next = prev.slice();
+          next[index] = { ...prev[index], xml: sample.xml };
+          return next;
+        });
+      }
+      const extracted = await extractChromosomes(sample, {
+        includeInvalid: levelId === PLUCK_OVERLAP_LEVEL,
+      });
+      playableChromosomes = extracted.some(chromosome => !chromosome.invalid)
+        ? extracted
+        : createInitialChromosomes();
+      setLevelChromosomes(playableChromosomes);
+      setSelectedImage(sample);
+      selectedImageRef.current = sample;
+    }
     const labeling = isLabelLevel(levelId);
     const labelScaffold = levelId === LABEL_MATE_LEVEL
       ? scaffoldChromosomeIds(playableChromosomes)
       : new Set<string>();
     let restored: { jumbled: ChromosomeData[]; placed: Record<string, ChromosomeData> } | null = null;
     let restoredPlacements: NumberPlacement[] | null = null;
-    let restoredCorrectCount = 0;
+    let restoredStatus: KaryotypeProgressSummary['status'] | undefined = progressBySample[sample.id]?.[levelId]?.status;
 
     if (session?.user) {
       await progressSaveQueueRef.current.catch(() => undefined);
       const { data, error } = await supabase
         .from('karyotype_progress')
-        .select('state, annotation_signature, correct_count')
+        .select('state, annotation_signature, correct_count, status')
         .eq('user_id', session.user.id)
-        .eq('sample_id', selectedImage.id)
+        .eq('sample_id', sample.id)
         .eq('level', levelId)
         .maybeSingle();
 
       if (error) {
         console.error('Failed to load karyotyping progress', error);
         setProgressError('Saved progress could not be loaded. A new board was started instead.');
-      } else if (data?.annotation_signature === annotationSignature(selectedImage.xml)) {
-        progressSignatureRef.current[`${selectedImage.id}:${levelId}`] = data.annotation_signature ?? '';
+      } else if (data?.annotation_signature === annotationSignature(sample.xml)) {
+        progressSignatureRef.current[`${sample.id}:${levelId}`] = data.annotation_signature ?? '';
+        if (data.status === 'complete' || data.status === 'in_progress') {
+          restoredStatus = data.status;
+        }
         if (labeling) {
           restoredPlacements = hydrateLabelState(playableChromosomes, data.state, labelScaffold);
-          if (restoredPlacements) {
-            restoredCorrectCount = Math.min(
-              playableChromosomes.length,
-              countCorrectLabels(playableChromosomes, restoredPlacements, labelScaffold)
-            );
-          }
         } else {
-          restored = hydrateKaryotypeState(playableChromosomes, data.state);
-          if (restored) {
-            restoredCorrectCount = Math.max(
-              0,
-              Math.min(Number(data.correct_count) || 0, playableChromosomes.length)
-            );
-          }
+          restored = hydrateKaryotypeState(playableChromosomes, data.state, isPluckLevel(levelId));
         }
       } else if (data) {
-        const sampleId = selectedImage.id;
+        const sampleId = sample.id;
         delete progressSignatureRef.current[`${sampleId}:${levelId}`];
         setProgressBySample(prev => {
           const sample = prev[sampleId];
@@ -3985,27 +5272,140 @@ export default function Chromy() {
       }
     }
 
-    const fresh = buildFreshBoard(levelId, playableChromosomes, selectedImage.id);
+    const fresh = buildFreshBoard(levelId, playableChromosomes, sample.id);
+    const matchScaffold = levelId === MATCH_LEVEL
+      ? scaffoldChromosomeIds(playableChromosomes)
+      : new Set<string>();
+    const given = levelId === LABEL_MATE_LEVEL ? labelScaffold : matchScaffold;
+    const placedNow = restored?.placed ?? fresh.placed;
+    const graded = playableChromosomes.filter(chromosome => !chromosome.invalid);
+    const totalCount = Math.max(0, graded.length - given.size);
+    const correct = labeling
+      ? countCorrectLabels(graded, restoredPlacements ?? [], labelScaffold)
+      : countArrangedCorrect(graded, placedNow, matchScaffold);
+
+    if (restoredStatus === 'complete' && correct === totalCount && totalCount > 0) {
+      setQuizPhase('checked');
+      setLevelCompleteDismissed(true);
+    }
 
     setActiveLevel(levelId);
-    setLevelBriefOpen(true);
+    setLevelBriefOpen(false);
+    setSpreadReady(true);
     setHighlightedRowId(null);
     setOriginalExtracted(playableChromosomes);
     setJumbled(restored?.jumbled ?? fresh.jumbled);
-    setPlaced(restored?.placed ?? fresh.placed);
+    setPlaced(placedNow);
+    setTrayReturns([]);
     setPlacements(restoredPlacements ?? []);
     setPlacementHistory([]);
     setScore({
-      correct: labeling
-        ? (restoredPlacements ? restoredCorrectCount : labelScaffold.size)
-        : (restored ? restoredCorrectCount : Object.keys(fresh.placed).length),
-      total: playableChromosomes.length,
+      correct,
+      total: totalCount,
     });
     setHistory([]);
     setCertificateName('');
     setIsReviewingCertificate(false);
     setProgressReady(false);
     pushScreen('playing');
+  };
+
+  const startTrialRun = async (levelId: number = activeLevel) => {
+    if (levelId === LEARN_LEVEL || spreadBusyRef.current) return;
+    spreadBusyRef.current = true;
+    setSpreadBusy(true);
+    setProgressError(null);
+    setProgressReady(false);
+    try {
+      await progressSaveQueueRef.current.catch(() => undefined);
+      const excludedIds = new Set<string>(levelSpreads.map(s => s.id));
+      if (selectedImage?.id) excludedIds.add(selectedImage.id);
+      const candidate = pickRandomTrialSpread(
+        imagesRef.current,
+        excludedIds,
+        activeSpreadLevel,
+        trialImage?.id
+      ) ?? selectedImage;
+      if (!candidate) return;
+
+      const sample = candidate.xml !== undefined ? candidate : await sampleWithXml(candidate);
+      if (sample.xml !== undefined) {
+        setImages(prev => {
+          const index = prev.findIndex(item => item.id === sample.id);
+          if (index < 0 || prev[index].xml === sample.xml) return prev;
+          const next = prev.slice();
+          next[index] = { ...prev[index], xml: sample.xml };
+          return next;
+        });
+      }
+      const extracted = await extractChromosomes(sample, {
+        includeInvalid: levelId === PLUCK_OVERLAP_LEVEL,
+      });
+      const playableChromosomes = extracted.some(c => !c.invalid)
+        ? extracted
+        : (levelChromosomes.length > 0 ? levelChromosomes : createInitialChromosomes());
+      const fresh = buildFreshBoard(levelId, playableChromosomes, sample.id);
+      const labeling = isLabelLevel(levelId);
+      const labelScaffold = levelId === LABEL_MATE_LEVEL
+        ? scaffoldChromosomeIds(playableChromosomes)
+        : new Set<string>();
+      const matchScaffold = levelId === MATCH_LEVEL
+        ? scaffoldChromosomeIds(playableChromosomes)
+        : new Set<string>();
+      const given = labeling ? labelScaffold : matchScaffold;
+      const graded = playableChromosomes.filter(c => !c.invalid);
+
+      setTrialImage(sample);
+      setPlayMode('trial');
+      setQuizPhase('playing');
+      setRetryLockedIds(new Set());
+      setOrientationLockSlotIds(new Set());
+      setActiveLevel(levelId);
+      setLevelBriefOpen(false);
+      setHighlightedRowId(null);
+      setOriginalExtracted(playableChromosomes);
+      setJumbled(fresh.jumbled);
+      setPlaced(fresh.placed);
+      setTrayReturns([]);
+      setPlacements([]);
+      setPlacementHistory([]);
+      setScore({
+        correct: 0,
+        total: Math.max(0, graded.length - given.size),
+      });
+      setHistory([]);
+      setCertificateName('');
+      setIsReviewingCertificate(false);
+      setShowHints(false);
+      setProgressReady(false);
+      setSpreadReady(true);
+      pushScreen('playing');
+    } catch (error) {
+      console.error('Failed to start trial run', error);
+      setProgressError('Could not load a random trial spread. Please try again.');
+    } finally {
+      spreadBusyRef.current = false;
+      setSpreadBusy(false);
+    }
+  };
+
+  const startQuizMode = async (levelId: number = activeLevel) => {
+    if (spreadBusyRef.current) return;
+    spreadBusyRef.current = true;
+    setSpreadBusy(true);
+    setShowHints(false);
+    setLevelBriefOpen(false);
+    setBuildingQuiz(true);
+    try {
+      await Promise.all([
+        openPlayLevel(levelId, { skipBrief: true }),
+        new Promise<void>(resolve => window.setTimeout(resolve, 1450)),
+      ]);
+    } finally {
+      setBuildingQuiz(false);
+      spreadBusyRef.current = false;
+      setSpreadBusy(false);
+    }
   };
 
   const openLearnLevel = async () => {
@@ -4015,7 +5415,78 @@ export default function Chromy() {
     setIsReviewingCertificate(false);
     setActiveLevel(LEARN_LEVEL);
     setLevelBriefOpen(true);
+    setSpreadReady(false);
+    setSourcePreviewOpen(false);
+    setOriginalExtracted([]);
+    setJumbled([]);
+    setPlaced({});
+    setPlacements([]);
+    setTrayReturns([]);
     pushScreen('playing');
+  };
+
+  const beginLearnSpread = async () => {
+    const image = selectedImageRef.current;
+    if (!image || spreadBusyRef.current) return;
+    setLevelBriefOpen(false);
+    spreadBusyRef.current = true;
+    setSpreadBusy(true);
+    setProgressError(null);
+    try {
+      const sample = image.xml !== undefined ? image : await sampleWithXml(image);
+      const extracted = await extractChromosomes(sample);
+      const playable = extracted.length > 0 ? extracted : createInitialChromosomes();
+      if (sample.xml !== undefined) {
+        setImages(prev => {
+          const index = prev.findIndex(item => item.id === sample.id);
+          if (index < 0 || prev[index].xml === sample.xml) return prev;
+          const next = prev.slice();
+          next[index] = { ...prev[index], xml: sample.xml };
+          return next;
+        });
+      }
+      setSelectedImage(sample);
+      selectedImageRef.current = sample;
+      setLevelChromosomes(playable);
+      setSpreadReady(true);
+    } catch (error) {
+      console.error('Failed to open learn spread', error);
+      setProgressError('That metaphase spread could not be opened.');
+      setLevelBriefOpen(true);
+    } finally {
+      spreadBusyRef.current = false;
+      setSpreadBusy(false);
+    }
+  };
+
+  const confirmQuizSpread = async (levelId: number = activeLevel) => {
+    const shouldAnimate = wasTrialBeforeBriefRef.current;
+    wasTrialBeforeBriefRef.current = false;
+    if (shouldAnimate) {
+      try {
+        await startQuizMode(levelId);
+      } catch (error) {
+        console.error('Failed to open quiz spread', error);
+        setProgressError('That metaphase spread could not be opened.');
+        setLevelBriefOpen(true);
+      }
+      return;
+    }
+    if (spreadBusyRef.current) return;
+    spreadBusyRef.current = true;
+    setSpreadBusy(true);
+    setLevelBriefOpen(false);
+    setProgressError(null);
+    try {
+      await openPlayLevel(levelId, { skipBrief: true });
+    } catch (error) {
+      console.error('Failed to open quiz spread', error);
+      setProgressError('That metaphase spread could not be opened.');
+      setLevelBriefOpen(true);
+    } finally {
+      spreadBusyRef.current = false;
+      setSpreadBusy(false);
+    }
   };
 
   const switchLearnSpread = async (image: AdminImage) => {
@@ -4066,17 +5537,107 @@ export default function Chromy() {
   };
 
   const finishLearn = () => {
+    if (activeSpreadLevel !== null) {
+      void openLevel(MATCH_LEVEL);
+      return;
+    }
     backScreen();
   };
 
   const finishLearnAndOpenNext = () => {
-    const next = annotatedSpreads[learnSpreadIndex + 1];
+    const next = learnSpreadList[learnSpreadIndex + 1];
     if (!next) {
       finishLearn();
       return;
     }
     void switchLearnSpread(next);
   };
+
+  const switchActiveLevelSpread = async (targetSpread: AdminImage) => {
+    if (spreadBusyRef.current) return;
+    if (playMode === 'trial' && targetSpread.id === selectedImage?.id && activeLevel !== LEARN_LEVEL) {
+      await startQuizMode(activeLevel);
+      return;
+    }
+    if (targetSpread.id === selectedImage?.id) return;
+    const switchingFromTrial = playMode === 'trial' && activeLevel !== LEARN_LEVEL;
+    spreadBusyRef.current = true;
+    setSpreadBusy(true);
+    if (switchingFromTrial) {
+      setShowHints(false);
+      setLevelBriefOpen(false);
+      setBuildingQuiz(true);
+    }
+    setProgressError(null);
+    try {
+      const minQuizBuildDelay = switchingFromTrial
+        ? new Promise<void>(resolve => window.setTimeout(resolve, 1450))
+        : Promise.resolve();
+      await progressSaveQueueRef.current.catch(() => undefined);
+      const sample = await sampleWithXml(targetSpread);
+      setSelectedImage(sample);
+      selectedImageRef.current = sample;
+      setPlayMode('quiz');
+      setTrialImage(null);
+      if (sample.xml !== undefined) {
+        setImages(prev => {
+          const index = prev.findIndex(item => item.id === sample.id);
+          if (index < 0 || prev[index].xml === sample.xml) return prev;
+          const next = prev.slice();
+          next[index] = { ...prev[index], xml: sample.xml };
+          return next;
+        });
+      }
+      if (switchingFromTrial) {
+        const extracted = await extractChromosomes(sample);
+        const playableChromosomes = extracted.length > 0 ? extracted : createInitialChromosomes();
+        setLevelChromosomes(playableChromosomes);
+        await Promise.all([
+          openPlayLevel(activeLevel, {
+            skipBrief: true,
+            imageOverride: sample,
+            chromosomesOverride: playableChromosomes,
+          }),
+          minQuizBuildDelay,
+        ]);
+      } else {
+        setLevelChromosomes([]);
+        await openLearnLevel();
+      }
+    } catch (error) {
+      console.error('Failed to switch level spread', error);
+      setProgressError('That metaphase spread could not be opened.');
+    } finally {
+      setBuildingQuiz(false);
+      spreadBusyRef.current = false;
+      setSpreadBusy(false);
+    }
+  };
+
+  const isSpreadSolvedNow = (sampleId: string) => {
+    return GAMEPLAY_LEVELS.every(stageId => {
+      if (playMode === 'quiz' && selectedImage?.id === sampleId && stageId === activeLevel && isComplete) {
+        return true;
+      }
+      return progressBySample[sampleId]?.[stageId]?.status === 'complete';
+    });
+  };
+
+  const levelSpreadsSolvedCount = activeSpreadLevel !== null
+    ? levelSpreads.filter(s => isSpreadSolvedNow(s.id)).length
+    : 0;
+  const userLevelComplete = activeSpreadLevel !== null
+    && levelSpreads.length > 0
+    && levelSpreadsSolvedCount >= Math.min(3, levelSpreads.length)
+    && levelSpreads.every(s => isSpreadSolvedNow(s.id));
+  const nextIncompleteSpreadInLevel = activeSpreadLevel !== null
+    ? levelSpreads.find(s => !isSpreadSolvedNow(s.id)) ?? null
+    : null;
+  const nextStageInOrder = useMemo(() => {
+    const idx = LEVELS.findIndex(l => l.id === activeLevel);
+    if (idx < 0 || idx >= LEVELS.length - 1) return null;
+    return LEVELS[idx + 1];
+  }, [activeLevel]);
 
   const toggleRowHighlight = (rowId: string) => {
     setHasUsedRowHighlight(true);
@@ -4096,31 +5657,91 @@ export default function Chromy() {
         <AuthForm />
       ) : (
         <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-sky-100 overflow-hidden">
+          {isActualAdmin && testAsUser && (
+            <div className="fixed bottom-4 right-4 z-[600] flex items-center gap-3 rounded-full border border-amber-300 bg-amber-50/95 backdrop-blur px-4 py-2 shadow-xl print:hidden">
+              <span className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-amber-800">
+                <Beaker className="w-3.5 h-3.5 text-amber-600" />
+                Testing as User
+              </span>
+              <button
+                type="button"
+                onClick={() => setTestAsUser(false)}
+                className="rounded-full bg-amber-600 px-3 py-1 text-[11px] font-bold text-white hover:bg-amber-700 transition-colors"
+              >
+                Exit Test Mode
+              </button>
+            </div>
+          )}
           <AnimatePresence mode="wait">
         {gameState === 'welcome' && (
           <WelcomeScreen 
             key="welcome" 
-            onStart={() => pushScreen('select')} 
+            onStart={() => pushScreen('user_levels')} 
+            onSelectSample={() => {
+              setActiveSpreadLevel(null);
+              setLevelSpreads([]);
+              pushScreen('select');
+            }}
             onAdmin={() => pushScreen('admin')} 
+              onToggleTestAsUser={() => {
+                setTestAsUser(prev => {
+                  const next = !prev;
+                  if (next && (gameState === 'select' || gameState === 'admin')) {
+                    jumpToScreen('welcome');
+                  }
+                  return next;
+                });
+              }}
             onSignOut={async () => {
               await supabase.auth.signOut();
             }}
-            userRole={userRole}
+            effectiveRole={effectiveRole}
+            isActualAdmin={isActualAdmin}
+            testAsUser={testAsUser}
           />
         )}
-        {gameState === 'select' && (
+        {gameState === 'user_levels' && (
+          <UserLevelSelectScreen
+            key="user_levels"
+            images={images}
+            imagesLoaded={imagesLoaded}
+            loadError={samplesLoadError}
+            progressBySample={progressBySample}
+            userSeed={session.user.id}
+            onBack={() => backScreen()}
+            onSelectLevel={async (lvl, spreadsForLevel, initialSpread, extracted) => {
+              setProgressError(null);
+              setActiveSpreadLevel(lvl);
+              setLevelSpreads(spreadsForLevel);
+              setSelectedImage(initialSpread);
+              if (initialSpread.xml !== undefined) {
+                setImages(prev => {
+                  const index = prev.findIndex(item => item.id === initialSpread.id);
+                  if (index < 0 || prev[index].xml === initialSpread.xml) return prev;
+                  const next = prev.slice();
+                  next[index] = { ...prev[index], xml: initialSpread.xml };
+                  return next;
+                });
+              }
+              setLevelChromosomes(extracted);
+              selectedImageRef.current = initialSpread;
+              void openLearnLevel();
+            }}
+          />
+        )}
+        {gameState === 'select' && (effectiveRole === 'ADMIN' || effectiveRole === 'SUPER ADMIN') && (
           <SpreadSelectionScreen
             key="select"
             images={images}
+            buckets={buckets}
             imagesLoaded={imagesLoaded}
             loadError={samplesLoadError}
             progressBySample={progressBySample}
             onBack={() => backScreen()}
             onSelect={async (img, extracted) => {
-              const playableChromosomes = extracted.length > 0
-                ? extracted
-                : createInitialChromosomes();
               setProgressError(null);
+              setActiveSpreadLevel(null);
+              setLevelSpreads([]);
               setSelectedImage(img);
               if (img.xml !== undefined) {
                 setImages(prev => {
@@ -4131,20 +5752,20 @@ export default function Chromy() {
                   return next;
                 });
               }
-              setLevelChromosomes(playableChromosomes);
+              setLevelChromosomes(extracted);
               selectedImageRef.current = img;
               void openLearnLevel();
             }}
           />
         )}
-        {gameState === 'admin' && (
+        {gameState === 'admin' && (effectiveRole === 'ADMIN' || effectiveRole === 'SUPER ADMIN') && (
           <AdminPanel 
             key="admin" 
             images={images}
             imagesLoaded={imagesLoaded}
             setImages={setImages}
             session={session}
-            userRole={userRole}
+            userRole={effectiveRole}
             bucketPairDescriptions={bucketPairDescriptions}
             onBucketPairDescriptionsChange={(bucketId, notes) => {
               setBucketPairDescriptions(prev => ({ ...prev, [bucketId]: notes }));
@@ -4159,6 +5780,7 @@ export default function Chromy() {
         <DndContext
           sensors={sensors}
           autoScroll={false}
+          collisionDetection={pluckLevel ? pluckSpreadCollision : rectIntersection}
           onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
         >
@@ -4178,8 +5800,8 @@ export default function Chromy() {
                 <Dna className="w-6 h-6" />
               </div>
               <div>
-                <h1 className="text-xl font-black tracking-tight flex items-center gap-1.5">
-                  CHROMY <span className="text-[10px] bg-slate-100 px-1.5 py-0.5 rounded uppercase font-bold text-slate-500">v1.0</span>
+                <h1 className="text-xl font-black tracking-tight">
+                  CHROMY
                 </h1>
                 <p className="text-[10px] text-slate-400 font-mono tracking-widest uppercase">Karyotype Diagnostic Tool</p>
               </div>
@@ -4187,28 +5809,100 @@ export default function Chromy() {
           </div>
 
           {activeLevel !== LEARN_LEVEL && (
-          <div className="flex items-center gap-6">
-             <div className="flex flex-col items-end">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-mono text-slate-400">COMPLETION</span>
-                  <span className={cn(
-                    "text-lg font-black font-mono",
-                    progress > 90 ? "text-emerald-600" : progress > 50 ? "text-amber-600" : "text-slate-900"
-                  )}>
-                    {Math.round(progress)}%
-                  </span>
-                </div>
-                <div className="w-32 h-1 bg-slate-100 rounded-full overflow-hidden">
-                  <motion.div 
-                    initial={{ width: 0 }}
-                    animate={{ width: `${progress}%` }}
-                    className="h-full bg-slate-900"
-                  />
-                </div>
-             </div>
+          <div className="flex items-center gap-4">
+             {playMode === 'trial' ? (
+               <div className="flex items-center gap-2.5 rounded-xl border border-amber-200 bg-amber-50/90 px-3 py-1.5">
+                 <Beaker className="w-4 h-4 text-amber-700 shrink-0" />
+                 <span className="text-xs font-medium text-amber-900">
+                   <span className="font-black uppercase tracking-wide mr-1">Trial Mode:</span>
+                   Practice spread (<span className="font-bold underline decoration-amber-400 underline-offset-2">not a part of the quiz</span>) · Hints on
+                 </span>
+                 <button
+                   type="button"
+                   disabled={spreadBusy || buildingQuiz}
+                   onClick={() => { void startTrialRun(activeLevel); }}
+                   className="rounded-lg border border-amber-300 bg-white px-2.5 py-1 text-[11px] font-bold text-amber-800 hover:bg-amber-100 transition-colors disabled:opacity-50 shrink-0"
+                   title="Pick another random practice spread (not part of the quiz)"
+                 >
+                   New Trial Spread
+                 </button>
+                 <button
+                   type="button"
+                   disabled={spreadBusy || buildingQuiz}
+                   onClick={() => { void startQuizMode(activeLevel); }}
+                   className="rounded-lg bg-slate-900 px-3 py-1 text-[11px] font-bold text-white hover:bg-sky-600 transition-colors disabled:opacity-50 shrink-0"
+                   title="Switch to Quiz Mode on your assigned quiz spread"
+                 >
+                   Take Quiz →
+                 </button>
+               </div>
+             ) : (
+               <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5">
+                 <span className="text-[11px] font-black uppercase tracking-wider text-slate-700">
+                   Quiz Mode
+                 </span>
+                 {!spreadReady && (
+                   <button
+                     type="button"
+                     disabled={spreadBusy || buildingQuiz}
+                     onClick={() => { void confirmQuizSpread(activeLevel); }}
+                     className="rounded-lg bg-slate-900 px-3 py-1 text-[11px] font-bold text-white hover:bg-sky-600 transition-colors disabled:opacity-50"
+                     title="Load your quiz metaphase spread"
+                   >
+                     Take Quiz
+                   </button>
+                 )}
+                 <button
+                   type="button"
+                   disabled={spreadBusy || buildingQuiz}
+                   onClick={() => { void startTrialRun(activeLevel); }}
+                   className="rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1 text-[11px] font-bold text-amber-800 hover:bg-amber-100 transition-colors disabled:opacity-50"
+                   title="Practice on a separate metaphase spread (not part of the quiz) with hints and live feedback"
+                 >
+                   Trial Run
+                 </button>
+               </div>
+             )}
+
+             {playMode === 'trial' || quizPhase === 'checked' ? (
+               <div className="flex flex-col items-end">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono text-slate-400">COMPLETION</span>
+                    <span className={cn(
+                      "text-lg font-black font-mono",
+                      progress > 90 ? "text-emerald-600" : progress > 50 ? "text-amber-600" : "text-slate-900"
+                    )}>
+                      {Math.round(progress)}%
+                    </span>
+                  </div>
+                  <div className="w-32 h-1 bg-slate-100 rounded-full overflow-hidden">
+                    <motion.div 
+                      initial={{ width: 0 }}
+                      animate={{ width: `${progress}%` }}
+                      className="h-full bg-slate-900"
+                    />
+                  </div>
+               </div>
+             ) : (
+               <div className="flex flex-col items-end">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono text-slate-400">PLACED</span>
+                    <span className="text-lg font-black font-mono text-slate-900">
+                      {placedPlayerCount} / {score.total}
+                    </span>
+                  </div>
+                  <div className="w-32 h-1 bg-slate-100 rounded-full overflow-hidden">
+                    <motion.div 
+                      initial={{ width: 0 }}
+                      animate={{ width: `${score.total > 0 ? Math.min(100, (placedPlayerCount / score.total) * 100) : 0}%` }}
+                      className="h-full bg-sky-500"
+                    />
+                  </div>
+               </div>
+             )}
 
              <div className="flex items-center gap-2">
-               {!isLabelLevel(activeLevel) && (
+               {playMode === 'trial' && (
                <button
                   onClick={() => setShowHints(true)}
                   className="px-3 py-2 hover:bg-amber-50 rounded-lg transition-colors text-xs font-bold text-amber-600 hover:text-amber-700 flex items-center gap-1.5"
@@ -4219,9 +5913,39 @@ export default function Chromy() {
                </button>
                )}
 
+               {playMode === 'quiz' && quizPhase === 'playing' && (
+                 <button
+                   type="button"
+                   onClick={handleCheckAndEnd}
+                   disabled={!canCheckQuiz}
+                   title={canCheckQuiz ? 'Check your arrangement and end quiz attempt' : `Place all ${score.total} items to check your answer (${placedPlayerCount}/${score.total} placed)`}
+                   className={cn(
+                     "px-3.5 py-2 rounded-xl text-xs font-black tracking-wide transition-colors flex items-center gap-1.5",
+                     canCheckQuiz
+                       ? "bg-emerald-600 text-white hover:bg-emerald-700 shadow-sm"
+                       : "bg-slate-100 text-slate-400 cursor-not-allowed"
+                   )}
+                 >
+                   <CheckCircle2 className="w-4 h-4" />
+                   Check &amp; End
+                 </button>
+               )}
+
+               {playMode === 'quiz' && quizPhase === 'checked' && !isComplete && (
+                 <button
+                   type="button"
+                   onClick={handleQuizRetry}
+                   className="px-3.5 py-2 rounded-xl text-xs font-black tracking-wide bg-amber-500 text-white hover:bg-amber-600 transition-colors shadow-sm flex items-center gap-1.5"
+                   title="Keep correct pairs, fix yellow orientations in place, and retry wrong pairs"
+                 >
+                   <RotateCcw className="w-4 h-4" />
+                   Retry Mistakes
+                 </button>
+               )}
+
                <button 
                   onClick={undo}
-                  disabled={isLabelLevel(activeLevel) ? placementHistory.length === 0 : history.length === 0}
+                  disabled={(playMode === 'quiz' && quizPhase === 'checked') || (isLabelLevel(activeLevel) ? placementHistory.length === 0 : history.length === 0)}
                   className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-400 hover:text-slate-900 disabled:opacity-30 disabled:hover:bg-transparent"
                   title="Undo last placement"
                 >
@@ -4246,13 +5970,13 @@ export default function Chromy() {
           </div>
         )}
 
-        {!isReviewingCertificate && activeLevel !== LEARN_LEVEL && selectedImage?.karyotype && (
+        {!isReviewingCertificate && spreadReady && activeLevel !== LEARN_LEVEL && activeGameplayImage?.karyotype && (
           <footer className="fixed bottom-0 left-0 right-0 h-10 bg-white border-t border-slate-200 z-50 px-6 flex items-center justify-center gap-2 print:hidden">
             <span className="text-[10px] font-mono tracking-widest uppercase text-slate-400">
               ISCN Karyotype Designation
             </span>
             <span className="text-sm font-mono font-bold text-slate-900">
-              {selectedImage.karyotype}
+              {activeGameplayImage.karyotype}
             </span>
           </footer>
         )}
@@ -4263,20 +5987,22 @@ export default function Chromy() {
             ? "pt-6 h-screen grid-cols-1"
             : cn(
                 "pt-16 pb-4 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] lg:grid-cols-[16rem_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]",
-                selectedImage?.karyotype && activeLevel !== LEARN_LEVEL ? "h-[calc(100vh-2.5rem)]" : "h-screen"
+                spreadReady && activeGameplayImage?.karyotype && activeLevel !== LEARN_LEVEL ? "h-[calc(100vh-2.5rem)]" : "h-screen"
               )
         )}>
 
-          {!isReviewingCertificate && selectedImage && (
+          {!isReviewingCertificate && selectedImage && activeGameplayImage && (
             <aside className="min-h-0 h-full flex flex-row lg:flex-col gap-3 overflow-x-auto lg:overflow-x-hidden lg:overflow-y-auto print:hidden lg:col-start-1 lg:row-start-1">
               <div className="w-28 lg:w-full h-20 lg:h-28 shrink-0 rounded-xl overflow-hidden border border-slate-200 relative shadow-sm bg-black group/source">
+                {spreadReady ? (
+                <>
                 {!sourceImageLoaded && (
                   <div className="absolute inset-0 z-10 bg-slate-100 flex items-center justify-center">
                     <Loader className="w-6 h-6 text-sky-500 animate-spin" />
                   </div>
                 )}
                 <img
-                  src={selectedImage.originalUrl}
+                  src={activeGameplayImage.originalUrl}
                   alt="Selected metaphase spread"
                   onLoad={() => setSourceImageLoaded(true)}
                   onError={() => setSourceImageLoaded(true)}
@@ -4285,10 +6011,21 @@ export default function Chromy() {
                     sourceImageLoaded ? "opacity-100" : "opacity-0"
                   )}
                 />
-                <div className="absolute top-1.5 left-1.5 bg-slate-900/80 backdrop-blur text-white text-[10px] font-bold px-1.5 py-0.5 rounded">
-                  SOURCE
-                </div>
-                <div className="absolute bottom-1.5 right-1.5 flex gap-1 opacity-0 group-hover/source:opacity-100 transition-opacity">
+                </>
+                ) : (
+                  <div className="absolute inset-0 bg-slate-100 flex items-center justify-center px-3">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 text-center">
+                      {activeLevel === LEARN_LEVEL ? 'Spread loads when you start' : 'Spread loads after you choose'}
+                    </span>
+                  </div>
+                )}
+                {spreadReady && <div className={cn(
+                  "absolute top-1.5 left-1.5 backdrop-blur text-white text-[9px] font-bold px-1.5 py-0.5 rounded leading-tight",
+                  playMode === 'trial' && activeLevel !== LEARN_LEVEL ? "bg-amber-600/95" : "bg-slate-900/80"
+                )}>
+                  {playMode === 'trial' && activeLevel !== LEARN_LEVEL ? 'TRIAL SPREAD · NOT IN QUIZ' : 'SOURCE'}
+                </div>}
+                {spreadReady && <div className="absolute bottom-1.5 right-1.5 flex gap-1 opacity-0 group-hover/source:opacity-100 transition-opacity">
                   <button
                     type="button"
                     onClick={() => setSourcePreviewOpen(true)}
@@ -4298,73 +6035,88 @@ export default function Chromy() {
                   >
                     <Expand className="w-3.5 h-3.5" />
                   </button>
-                  {(userRole === 'ADMIN' || userRole === 'SUPER ADMIN') && (
+                  {(effectiveRole === 'ADMIN' || effectiveRole === 'SUPER ADMIN') && (
                     <a
-                      href={selectedImage.originalUrl}
-                      download={`chromy-sample-${selectedImage.id}.png`}
+                      href={activeGameplayImage.originalUrl}
+                      download={`chromy-sample-${activeGameplayImage.id}.png`}
                       className="w-7 h-7 rounded-lg bg-white text-slate-900 hover:bg-sky-50 flex items-center justify-center"
                       title="Download source image"
                     >
                       <Download className="w-3.5 h-3.5" />
                     </a>
                   )}
-                </div>
+                </div>}
               </div>
+
+              {activeSpreadLevel !== null && levelSpreads.length > 0 && (
+                <div className="shrink-0 rounded-xl border border-slate-200 bg-white p-2.5 space-y-2 min-w-52 lg:min-w-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-sky-600">
+                      LEVEL {activeSpreadLevel}
+                    </span>
+                    <span className="text-[10px] font-mono font-bold text-slate-500">
+                      {levelSpreadsSolvedCount}/{Math.min(3, levelSpreads.length)} Spreads
+                    </span>
+                  </div>
+                  {playMode === 'trial' && activeLevel !== LEARN_LEVEL && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] font-bold text-amber-800 leading-snug">
+                      Practicing on a separate spread not part of the quiz. Click a quiz spread below or &ldquo;Take Quiz&rdquo; when ready.
+                    </div>
+                  )}
+                  <div className="flex flex-row lg:flex-col gap-1.5">
+                    {levelSpreads.map((spread, idx) => {
+                      const active = (playMode === 'quiz' || activeLevel === LEARN_LEVEL) && selectedImage.id === spread.id;
+                      const solved = isSpreadSolvedNow(spread.id);
+                      return (
+                        <button
+                          key={spread.id}
+                          type="button"
+                          disabled={spreadBusy || startingLevel !== null || active}
+                          onClick={() => { void switchActiveLevelSpread(spread); }}
+                          className={cn(
+                            "flex items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 text-left transition-colors",
+                            active
+                              ? "border-sky-400 bg-sky-50 cursor-default"
+                              : solved
+                                ? "border-emerald-200 bg-emerald-50/50 hover:border-emerald-300"
+                                : "border-slate-200 bg-slate-50/60 hover:border-sky-300 hover:bg-sky-50/30"
+                          )}
+                        >
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <span className="text-xs font-black text-slate-800 whitespace-nowrap">
+                              Spread {idx + 1}
+                            </span>
+                            <DifficultyBadge difficulty={spread.difficulty} unsetLabel="Standard" />
+                          </div>
+                          {solved ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          ) : (
+                            <span className="text-[9px] font-mono font-bold text-slate-400 shrink-0">
+                              {countCompletedStagesOnSpread(spread.id, progressBySample).completed}/{GAMEPLAY_LEVELS.length}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               <div className="flex flex-row lg:flex-col gap-2 min-w-0">
                 <h2 className="hidden lg:block text-sm font-bold uppercase tracking-wider text-slate-400">
-                  Levels
+                  Stages
                 </h2>
-                <LevelSidebarButton
-                  level={LEVELS.find(level => level.id === LEARN_LEVEL)!}
-                  summary={progressBySample[selectedImage.id]?.[LEARN_LEVEL]}
-                  current={activeLevel === LEARN_LEVEL}
-                  busy={startingLevel === LEARN_LEVEL}
-                  disabled={startingLevel !== null || activeLevel === LEARN_LEVEL}
-                  onStart={() => { void openLevel(LEARN_LEVEL); }}
-                />
-                <div className="flex flex-row lg:flex-col gap-2 min-w-0">
-                  <p className={cn(
-                    "shrink-0 self-center lg:self-start px-1 text-[10px] font-mono font-bold tracking-widest",
-                    activeLevel === MATCH_LEVEL || activeLevel === PAIR_LEVEL || activeLevel === ARRANGE_LEVEL ? "text-sky-600" : "text-slate-400"
-                  )}>
-                    LEVEL 2
-                  </p>
-                  <div className="flex flex-row lg:flex-col gap-2 min-w-0 lg:ml-2 lg:pl-3 lg:border-l lg:border-slate-200">
-                    {LEVELS.filter(level => level.id === MATCH_LEVEL || level.id === PAIR_LEVEL || level.id === ARRANGE_LEVEL).map(level => (
-                      <LevelSidebarButton
-                        key={level.id}
-                        level={level}
-                        summary={progressBySample[selectedImage.id]?.[level.id]}
-                        current={activeLevel === level.id}
-                        busy={startingLevel === level.id}
-                        disabled={startingLevel !== null || activeLevel === level.id}
-                        onStart={() => { void openLevel(level.id); }}
-                      />
-                    ))}
-                  </div>
-                </div>
-                <div className="flex flex-row lg:flex-col gap-2 min-w-0">
-                  <p className={cn(
-                    "shrink-0 self-center lg:self-start px-1 text-[10px] font-mono font-bold tracking-widest",
-                    activeLevel === LABEL_MATE_LEVEL || activeLevel === LABEL_ALL_LEVEL ? "text-sky-600" : "text-slate-400"
-                  )}>
-                    LEVEL 3
-                  </p>
-                  <div className="flex flex-row lg:flex-col gap-2 min-w-0 lg:ml-2 lg:pl-3 lg:border-l lg:border-slate-200">
-                    {LEVELS.filter(level => level.id === LABEL_MATE_LEVEL || level.id === LABEL_ALL_LEVEL).map(level => (
-                      <LevelSidebarButton
-                        key={level.id}
-                        level={level}
-                        summary={progressBySample[selectedImage.id]?.[level.id]}
-                        current={activeLevel === level.id}
-                        busy={startingLevel === level.id}
-                        disabled={startingLevel !== null || activeLevel === level.id}
-                        onStart={() => { void openLevel(level.id); }}
-                      />
-                    ))}
-                  </div>
-                </div>
+                {LEVELS.map(level => (
+                  <LevelSidebarButton
+                    key={level.id}
+                    level={level}
+                    summary={level.id === LEARN_LEVEL ? progressBySample[selectedImage.id]?.[LEARN_LEVEL] : summaryFor(level.id)}
+                    current={activeLevel === level.id}
+                    busy={startingLevel === level.id}
+                    disabled={startingLevel !== null || spreadBusy || activeLevel === level.id}
+                    onStart={() => { void openLevel(level.id); }}
+                  />
+                ))}
               </div>
             </aside>
           )}
@@ -4373,57 +6125,115 @@ export default function Chromy() {
             "min-h-0 min-w-0 max-w-full h-full overflow-x-hidden flex flex-col gap-4",
             !isReviewingCertificate && "lg:col-start-2 lg:row-start-1"
           )}>
-          {activeLevel === LEARN_LEVEL && selectedImage ? (
+          {playMode === 'quiz' && quizPhase === 'checked' && !isComplete && activeLevel !== LEARN_LEVEL && !isReviewingCertificate && (
+            <div className="shrink-0 rounded-2xl border border-amber-200 bg-white px-4 py-3 shadow-sm flex flex-wrap items-center justify-between gap-3 print:hidden">
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="text-xs font-black uppercase tracking-wider text-slate-900">
+                  Check Results
+                </span>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-bold text-emerald-700">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                  {checkSummary.correct} Correct (Green)
+                </span>
+                {!isLabelLevel(activeLevel) && !orientationPreset && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs font-bold text-amber-800">
+                    <span className="w-2 h-2 rounded-full bg-amber-400" />
+                    {checkSummary.orientationOnly} Right Pair · Fix Orientation (Yellow)
+                  </span>
+                )}
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-bold text-rose-700">
+                  <span className="w-2 h-2 rounded-full bg-rose-500" />
+                  {checkSummary.wrongPair} Wrong {isLabelLevel(activeLevel) ? 'Number' : 'Pair'} (Red)
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleQuizRetry}
+                  className="px-4 py-2 rounded-xl bg-amber-500 text-white text-xs font-black tracking-wide hover:bg-amber-600 transition-colors shadow-sm flex items-center gap-1.5"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  Retry (Keep Right Pairs)
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmResetGame}
+                  className="px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition-colors"
+                >
+                  Reset All
+                </button>
+              </div>
+            </div>
+          )}
+          {activeLevel === LEARN_LEVEL && selectedImage && spreadReady ? (
             <LearnLevel
               key={selectedImage.id}
               embedded
               chromosomes={learnChromosomes}
               karyotype={selectedImage.karyotype}
               spreadIndex={learnSpreadIndex}
-              spreadCount={annotatedSpreads.length}
+              spreadCount={learnSpreadList.length}
               spreadBusy={spreadBusy}
               onPreviousSpread={() => {
-                const previous = annotatedSpreads[learnSpreadIndex - 1];
+                const previous = learnSpreadList[learnSpreadIndex - 1];
                 if (previous) void switchLearnSpread(previous);
               }}
               onNextSpread={() => {
-                const next = annotatedSpreads[learnSpreadIndex + 1];
+                const next = learnSpreadList[learnSpreadIndex + 1];
                 if (next) void switchLearnSpread(next);
               }}
               onFinishSpread={
-                learnSpreadIndex >= 0 && learnSpreadIndex < annotatedSpreads.length - 1
+                learnSpreadIndex >= 0 && learnSpreadIndex < learnSpreadList.length - 1
                   ? finishLearnAndOpenNext
                   : undefined
               }
               onBack={() => backScreen()}
               onFinish={finishLearn}
             />
-          ) : isLabelLevel(activeLevel) && selectedImage ? (
+          ) : isLabelLevel(activeLevel) && activeGameplayImage && spreadReady ? (
             <>
             {isReviewingCertificate && (
               <div className="text-center mb-4 shrink-0">
                 <h1 className="text-4xl font-black text-slate-900 tracking-tighter mb-2">KARYOTYPE DIAGNOSTIC CERTIFICATE</h1>
                 <p className="text-lg text-slate-500 font-medium">Assembled and verified by <span className="font-black text-slate-800">{certificateName}</span></p>
-                {selectedImage.karyotype && (
+                {activeGameplayImage.karyotype && (
                   <p className="text-sm font-mono font-bold text-slate-700 mt-2">
-                    ISCN: {selectedImage.karyotype}
+                    ISCN: {activeGameplayImage.karyotype}
                   </p>
                 )}
                 <div className="w-24 h-1 bg-slate-200 mx-auto mt-4 rounded-full" />
               </div>
             )}
             <LabelSpreadLevel
-              key={`${selectedImage.id}:${activeLevel}`}
-              imageUrl={selectedImage.originalUrl}
+              key={`${activeGameplayImage.id}:${activeLevel}:${playMode}`}
+              imageUrl={activeGameplayImage.originalUrl}
               chromosomes={originalExtracted}
               placements={placements}
               scaffoldIds={labelScaffoldIds}
+              verifiedIds={retryLockedIds}
               assisted={activeLevel === LABEL_MATE_LEVEL}
+              showFeedback={showFeedback}
+              readOnly={playMode === 'quiz' && quizPhase === 'checked'}
               onPlacementsChange={commitPlacements}
             />
             </>
           ) : (
-          <>
+          <div className={cn(pluckLevel && spreadReady && !isReviewingCertificate ? "flex flex-col lg:flex-row gap-4 flex-1 min-h-0" : "contents")}>
+          {pluckLevel && spreadReady && !isReviewingCertificate && activeGameplayImage && (
+            <div className="relative h-[45vh] lg:h-auto lg:self-stretch lg:w-[42%] lg:shrink-0 min-h-0 print:hidden">
+              <div className="absolute inset-0">
+              <PluckSpreadLevel
+                key={`${activeGameplayImage.id}:${playMode}`}
+                imageUrl={activeGameplayImage.originalUrl}
+                chromosomes={originalExtracted}
+                pluckedIds={pluckedIds}
+                progress={{ plucked: realPluckedCount, total: gradedChromosomes.length }}
+                onPluck={pluckChromosome}
+              />
+              </div>
+            </div>
+          )}
+          <div className={cn(pluckLevel && spreadReady && !isReviewingCertificate ? "flex flex-col gap-4 flex-1 min-w-0 min-h-0" : "contents")}>
           {/* Diagnostic Board */}
           <div className={cn(
             "bg-white rounded-2xl border border-slate-200 p-4 lg:p-6 shadow-sm overflow-y-auto print:border-none print:shadow-none print:p-0 flex flex-col print:overflow-visible print:h-auto min-h-0 flex-1",
@@ -4433,9 +6243,9 @@ export default function Chromy() {
                <div className="text-center mb-4 hidden print:block !block shrink-0">
                 <h1 className="text-4xl font-black text-slate-900 tracking-tighter mb-2">KARYOTYPE DIAGNOSTIC CERTIFICATE</h1>
                 <p className="text-lg text-slate-500 font-medium">Assembled and verified by <span className="font-black text-slate-800">{certificateName}</span></p>
-                {selectedImage?.karyotype && (
+                {activeGameplayImage?.karyotype && (
                   <p className="text-sm font-mono font-bold text-slate-700 mt-2">
-                    ISCN: {selectedImage.karyotype}
+                    ISCN: {activeGameplayImage.karyotype}
                   </p>
                 )}
                 <div className="w-24 h-1 bg-slate-200 mx-auto mt-4 rounded-full" />
@@ -4501,6 +6311,10 @@ export default function Chromy() {
                                  isReviewing={isReviewingCertificate}
                                  displayScale={chromosomeDisplayScale}
                                  lockedIds={lockedChromosomeIds}
+                                 retryLockedIds={retryLockedIds}
+                                 orientationLockSlotIds={orientationLockSlotIds}
+                                 showFeedback={showFeedback}
+                                 readOnly={playMode === 'quiz' && quizPhase === 'checked'}
                                  allowOrientation={!orientationPreset}
                                />
                              </div>
@@ -4523,6 +6337,10 @@ export default function Chromy() {
                            isReviewing={isReviewingCertificate}
                            displayScale={chromosomeDisplayScale}
                            lockedIds={lockedChromosomeIds}
+                           retryLockedIds={retryLockedIds}
+                           orientationLockSlotIds={orientationLockSlotIds}
+                           showFeedback={showFeedback}
+                           readOnly={playMode === 'quiz' && quizPhase === 'checked'}
                            allowOrientation={!orientationPreset}
                          />
                        </div>
@@ -4552,6 +6370,7 @@ export default function Chromy() {
                       jumbled.map((chrom) => {
                         const lit = highlightedPairIds?.has(chrom.type) ?? false;
                         const dimmed = highlightedPairIds != null && !lit;
+                        const returningToTray = trayReturns.some(item => item.id === chrom.id);
                         return (
                           <div
                             key={chrom.id}
@@ -4559,7 +6378,8 @@ export default function Chromy() {
                             className={cn(
                               'rounded-xl transition-opacity duration-300',
                               lit && 'bg-sky-100/90',
-                              dimmed && 'opacity-25'
+                              dimmed && 'opacity-25',
+                              returningToTray && 'invisible pointer-events-none'
                             )}
                           >
                             <DraggableChromosome
@@ -4576,7 +6396,15 @@ export default function Chromy() {
                     ) : (
                       <div className="w-full flex items-center justify-center gap-2 py-4 text-slate-300">
                         <CheckCircle2 className="w-5 h-5 opacity-40" />
-                        <p className="text-sm font-medium">Sample fully processed</p>
+                        <p className="text-sm font-medium">
+                          {holdSpread
+                            ? (activeLevel === LEARN_LEVEL
+                              ? 'Click Start to load this spread'
+                              : 'Choose Trial Run or Take Quiz to load the spread')
+                            : pluckLevel && realPluckedCount < gradedChromosomes.length
+                            ? 'Drag a chromosome off the spread'
+                            : 'Sample fully processed'}
+                        </p>
                       </div>
                     )}
                   </div>
@@ -4584,7 +6412,8 @@ export default function Chromy() {
               </div>
             </RawSampleDroppable>
           )}
-          </>
+          </div>
+          </div>
           )}
           </div>
         </main>
@@ -4640,15 +6469,33 @@ export default function Chromy() {
                 </div>
                 
                 <h3 className="text-3xl font-black text-emerald-900 mt-10 mb-3">
-                  {spreadComplete ? successPhrase : 'Level complete'}
+                  {playMode === 'trial'
+                    ? 'Trial Run Complete!'
+                    : activeSpreadLevel !== null
+                      ? userLevelComplete
+                        ? `Level ${activeSpreadLevel} Complete!`
+                        : spreadComplete
+                          ? `Spread Complete (${levelSpreadsSolvedCount}/${Math.min(3, levelSpreads.length)})`
+                          : 'Stage complete'
+                      : spreadComplete
+                        ? successPhrase
+                        : 'Stage complete'}
                 </h3>
                 <p className="text-slate-500 text-lg mb-6 leading-relaxed font-medium">
-                  {spreadComplete
-                    ? 'Every level on this metaphase spread is complete.'
-                    : `${finishedLevel ? `${finishedLevel.label} ${finishedLevel.title}` : 'This level'} is finished. The certificate is ready after every level on this spread.`}
+                  {playMode === 'trial'
+                    ? `You solved the practice spread for Stage ${finishedLevel ? `${finishedLevel.label} (${finishedLevel.title})` : ''}! This practice spread is not part of the quiz — ready to switch to your quiz metaphase spread?`
+                    : activeSpreadLevel !== null
+                      ? userLevelComplete
+                        ? `You solved all ${levelSpreads.length} metaphase spreads in Level ${activeSpreadLevel}!`
+                        : spreadComplete
+                          ? `Every stage on this spread is finished. Solve ${Math.max(0, Math.min(3, levelSpreads.length) - levelSpreadsSolvedCount)} more spread${Math.min(3, levelSpreads.length) - levelSpreadsSolvedCount === 1 ? '' : 's'} to clear Level ${activeSpreadLevel}.`
+                          : `Stage ${finishedLevel ? `${finishedLevel.label} (${finishedLevel.title})` : ''} is finished.`
+                      : spreadComplete
+                        ? 'Every stage on this metaphase spread is complete.'
+                        : `Stage ${finishedLevel ? `${finishedLevel.label} (${finishedLevel.title})` : ''} is finished. The certificate is ready after every stage on this spread.`}
                 </p>
 
-                {spreadComplete && (
+                {playMode === 'quiz' && spreadComplete && (activeSpreadLevel === null || userLevelComplete) && (
                 <div className="w-full mb-8 flex flex-col items-center">
                   <label htmlFor="cert-name" className="text-sm font-bold text-slate-700 mb-2">Print Karyogram Certificate</label>
                   <input
@@ -4663,11 +6510,34 @@ export default function Chromy() {
                 )}
                 
                 <div className="flex gap-4 w-full">
+                  {playMode === 'trial' ? (
+                    <>
+                      <button
+                        onClick={() => {
+                          setLevelCompleteDismissed(true);
+                          void startTrialRun(activeLevel);
+                        }}
+                        className="flex-1 flex items-center justify-center gap-2 bg-amber-50 text-amber-800 px-4 py-4 rounded-xl font-bold hover:bg-amber-100 transition-colors text-sm"
+                      >
+                        NEW TRIAL SPREAD
+                      </button>
+                      <button
+                        onClick={() => {
+                          setLevelCompleteDismissed(true);
+                          void startQuizMode(activeLevel);
+                        }}
+                        className="flex-[1.5] flex items-center justify-center gap-2 bg-slate-900 text-white px-4 py-4 rounded-xl font-bold hover:bg-sky-600 transition-colors shadow-lg text-sm"
+                      >
+                        TAKE QUIZ
+                      </button>
+                    </>
+                  ) : (
+                    <>
                   <button 
-                    onClick={() => jumpToScreen('select')}
+                    onClick={() => jumpToScreen(activeSpreadLevel !== null ? 'user_levels' : 'select')}
                     className="flex-1 flex items-center justify-center gap-2 bg-slate-100 text-slate-600 px-4 py-4 rounded-xl font-bold hover:bg-slate-200 transition-colors text-sm"
                   >
-                    NEW SAMPLE
+                    {activeSpreadLevel !== null ? 'ALL LEVELS' : 'NEW SAMPLE'}
                   </button>
                   <button 
                     onClick={resetGame}
@@ -4675,21 +6545,43 @@ export default function Chromy() {
                   >
                     RESTART
                   </button>
-                  {spreadComplete ? (
-                  <button 
-                    onClick={() => setIsReviewingCertificate(true)}
-                    disabled={!certificateName.trim()}
-                    className="flex-[1.5] flex items-center justify-center gap-2 bg-emerald-500 text-white px-4 py-4 rounded-xl font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/30 text-sm disabled:opacity-50 disabled:hover:bg-emerald-500 disabled:shadow-none"
-                  >
-                    REVIEW & PRINT
-                  </button>
+                  {spreadComplete && activeSpreadLevel !== null && !userLevelComplete && nextIncompleteSpreadInLevel ? (
+                    <button
+                      onClick={() => {
+                        setLevelCompleteDismissed(true);
+                        void switchActiveLevelSpread(nextIncompleteSpreadInLevel);
+                      }}
+                      className="flex-[1.5] flex items-center justify-center gap-2 bg-emerald-500 text-white px-4 py-4 rounded-xl font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/30 text-sm"
+                    >
+                      NEXT SPREAD
+                    </button>
+                  ) : spreadComplete ? (
+                    <button 
+                      onClick={() => setIsReviewingCertificate(true)}
+                      disabled={!certificateName.trim()}
+                      className="flex-[1.5] flex items-center justify-center gap-2 bg-emerald-500 text-white px-4 py-4 rounded-xl font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/30 text-sm disabled:opacity-50 disabled:hover:bg-emerald-500 disabled:shadow-none"
+                    >
+                      REVIEW & PRINT
+                    </button>
+                  ) : nextStageInOrder ? (
+                    <button
+                      onClick={() => {
+                        setLevelCompleteDismissed(true);
+                        void openLevel(nextStageInOrder.id);
+                      }}
+                      className="flex-[1.5] flex items-center justify-center gap-2 bg-emerald-500 text-white px-4 py-4 rounded-xl font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/30 text-sm"
+                    >
+                      STAGE {nextStageInOrder.label}: {nextStageInOrder.title.toUpperCase()}
+                    </button>
                   ) : (
-                  <button
-                    onClick={() => setLevelCompleteDismissed(true)}
-                    className="flex-[1.5] flex items-center justify-center gap-2 bg-emerald-500 text-white px-4 py-4 rounded-xl font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/30 text-sm"
-                  >
-                    CONTINUE
-                  </button>
+                    <button
+                      onClick={() => setLevelCompleteDismissed(true)}
+                      className="flex-[1.5] flex items-center justify-center gap-2 bg-emerald-500 text-white px-4 py-4 rounded-xl font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-500/30 text-sm"
+                    >
+                      CONTINUE
+                    </button>
+                  )}
+                    </>
                   )}
                 </div>
               </motion.div>
@@ -4708,14 +6600,65 @@ export default function Chromy() {
               </div>
             ) : null}
           </DragOverlay>
+          {trayReturns.map(flight => flight.to ? (
+            <TrayReturnFlight
+              key={flight.id}
+              flight={{ ...flight, to: flight.to }}
+              displayScale={chromosomeDisplayScale}
+              onDone={(id) => setTrayReturns(current => current.filter(item => item.id !== id))}
+            />
+          ) : null)}
         </DndContext>
         {levelBriefOpen && finishedLevel && createPortal(
-          <LevelBriefModal level={finishedLevel} onClose={() => setLevelBriefOpen(false)} />,
+          <LevelBriefModal
+            level={finishedLevel}
+            onClose={() => {
+              if (activeLevel === LEARN_LEVEL) {
+                void beginLearnSpread();
+                return;
+              }
+              wasTrialBeforeBriefRef.current = false;
+              setLevelBriefOpen(false);
+            }}
+            onStartTrial={() => {
+              wasTrialBeforeBriefRef.current = false;
+              void startTrialRun(activeLevel);
+            }}
+            onStartQuiz={activeLevel === LEARN_LEVEL ? undefined : () => { void confirmQuizSpread(activeLevel); }}
+          />,
           document.body
         )}
-        {sourcePreviewOpen && selectedImage && createPortal(
+        {createPortal(
+          <AnimatePresence>
+            {buildingQuiz && (
+              <motion.div
+                key="building-quiz-overlay"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.2 }}
+                className="fixed inset-0 z-[500] bg-slate-900/65 backdrop-blur-sm flex items-center justify-center p-6 print:hidden"
+              >
+                <motion.div
+                  initial={{ scale: 0.92, y: 16, opacity: 0 }}
+                  animate={{ scale: 1, y: 0, opacity: 1 }}
+                  exit={{ scale: 0.95, y: -10, opacity: 0 }}
+                  transition={{ duration: 0.25 }}
+                  className="bg-white rounded-3xl px-8 py-7 max-w-xs w-full shadow-2xl border border-slate-100 flex flex-col items-center text-center gap-4"
+                >
+                  <Loader className="w-8 h-8 text-sky-500 animate-spin" />
+                  <h3 className="text-xl font-black text-slate-900 tracking-tight">
+                    Building Your Quiz...
+                  </h3>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>,
+          document.body
+        )}
+        {sourcePreviewOpen && spreadReady && activeGameplayImage && createPortal(
           <SourceSpreadModal
-            imageUrl={selectedImage.originalUrl}
+            imageUrl={activeGameplayImage.originalUrl}
             onClose={() => setSourcePreviewOpen(false)}
           />,
           document.body

@@ -33,8 +33,9 @@ export const MATCH_ROW_HIGHLIGHTS: { id: string; label: string; groupIds: string
   { id: 'AB', label: 'A–B', groupIds: ['A', 'B'] },
   { id: 'C', label: 'C', groupIds: ['C'] },
   { id: 'DE', label: 'D–E', groupIds: ['D', 'E'] },
-  { id: 'FG', label: 'F–G', groupIds: ['F', 'G'] },
-  { id: 'XY', label: 'X–Y', groupIds: ['SEX'] },
+  // F, G and X-Y are intentionally grouped: a standalone X-Y button would make
+  // the answer a trivial 50-50 guess between the two sex chromosomes.
+  { id: 'FGXY', label: 'F–G–X–Y', groupIds: ['F', 'G', 'SEX'] },
 ];
 
 export function matchRowHighlightForGroup(groupId: string) {
@@ -55,9 +56,29 @@ export function pairIdsForMatchRow(rowId: string): string[] {
 
 export const MAX_CHROMOSOMES_PER_PAIR = 4;
 
+/** Stroke with no pair yet. Ignored by every level. */
+export const UNASSIGNED_LABEL = 'Unassigned';
+/** Overlapping decoy outline. Clippable on level 4.2 only. Not a pair. */
+export const INVALID_LABEL = 'Invalid';
+
 const STANDARD_PAIR_ID_SET = new Set(STANDARD_PAIR_IDS);
 
 export const isStandardPairId = (id: string) => STANDARD_PAIR_ID_SET.has(id);
+
+export function isInvalidLabel(label: string | null | undefined): boolean {
+  return label === INVALID_LABEL;
+}
+
+/** A stroke label that names a real pair, including legacy "1L" / "1R" forms. */
+export function isPairLabel(label: string | null | undefined): label is string {
+  return !!label && label !== UNASSIGNED_LABEL && label !== INVALID_LABEL;
+}
+
+/** Names that cannot be used for a custom pair. */
+export function isReservedPairName(name: string): boolean {
+  const trimmed = name.trim().toLowerCase();
+  return trimmed === UNASSIGNED_LABEL.toLowerCase() || trimmed === INVALID_LABEL.toLowerCase();
+}
 
 /**
  * Recovers a pair ID from a stroke label.

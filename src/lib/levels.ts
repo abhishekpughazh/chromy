@@ -1,16 +1,20 @@
 import { CLINICAL_KARYOTYPE_ROWS, comparePairIds } from './chromosomePairs';
 
 export const LEARN_LEVEL = 1;
-/** Shown as 2.1. Stored as 2 so existing Match progress stays with this level. */
+/** Stage 2 (formerly 2.1). Stored as 2 so existing Match progress stays with this stage. */
 export const MATCH_LEVEL = 2;
-/** Shown as 2.3. Stored as 3 so existing Arrange progress stays with this level. */
+/** Stage 4 (formerly 2.3). Stored as 3 so existing Arrange progress stays with this stage. */
 export const ARRANGE_LEVEL = 3;
-/** Shown as 2.2. Stored as 4 so it does not collide with Match (2) or Arrange (3). */
+/** Stage 3 (formerly 2.2). Stored as 4 so it does not collide with Match (2) or Arrange (3). */
 export const PAIR_LEVEL = 4;
-/** Shown as 3.1. Stored as 5. One chromosome of each pair starts numbered. */
+/** Stage 5 (formerly 3.1). Stored as 5. One chromosome of each pair starts numbered. */
 export const LABEL_MATE_LEVEL = 5;
-/** Shown as 3.2. Stored as 6. Every chromosome starts unnumbered. */
+/** Stage 6 (formerly 3.2). Stored as 6. Every chromosome starts unnumbered. */
 export const LABEL_ALL_LEVEL = 6;
+/** Stage 7 (formerly 4.1). Stored as 7 so existing Pluck progress stays with this stage. */
+export const PLUCK_ARRANGE_LEVEL = 7;
+/** Stage 8 (formerly 4.2). Stored as 8. Pluck, including overlapping decoy outlines. */
+export const PLUCK_OVERLAP_LEVEL = 8;
 
 export const LOREM_IPSUM_SENTENCE =
   'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.';
@@ -29,7 +33,7 @@ export const LEVELS = [
   },
   {
     id: MATCH_LEVEL,
-    label: '2.1',
+    label: '2',
     title: 'Match',
     description: 'One chromosome of each pair is already in place.',
     pointers: [
@@ -40,7 +44,7 @@ export const LEVELS = [
   },
   {
     id: PAIR_LEVEL,
-    label: '2.2',
+    label: '3',
     title: 'Pair',
     description: 'Every slot starts empty.',
     pointers: [
@@ -51,29 +55,29 @@ export const LEVELS = [
   },
   {
     id: ARRANGE_LEVEL,
-    label: '2.3',
+    label: '4',
     title: 'Arrange',
     description: 'Place each chromosome in the correct pair and match its orientation.',
     pointers: [
       'Drag each chromosome into the correct pair.',
       'Rotate and flip it until the orientation matches.',
-      'The hint button walks you through one chromosome.',
+      'Use Trial Run to practice with hints and live feedback, or Take Quiz and click Check & End.',
     ],
   },
   {
     id: LABEL_MATE_LEVEL,
-    label: '3.1',
+    label: '5',
     title: 'Mate',
     description: 'One chromosome of each pair is already numbered. Place the number on the other.',
     pointers: [
       'One chromosome of each pair is already numbered.',
       'Drag the matching number into the dashed slot beside the other.',
-      'A wrong number stays there until you move it.',
+      'In Trial Run, wrong numbers light up right away. In Quiz Mode, click Check & End when all numbers are placed.',
     ],
   },
   {
     id: LABEL_ALL_LEVEL,
-    label: '3.2',
+    label: '6',
     title: 'Label',
     description: 'Place a number beside every chromosome.',
     pointers: [
@@ -82,9 +86,36 @@ export const LEVELS = [
       'Scroll to zoom. Drag the image to pan once you are zoomed in.',
     ],
   },
+  {
+    id: PLUCK_ARRANGE_LEVEL,
+    label: '7',
+    title: 'Pluck',
+    description: 'Pluck each chromosome off the spread, then build the karyotype yourself.',
+    pointers: [
+      'Drag a chromosome off the spread to pick it up.',
+      'Drop it on the right pair, then rotate or flip it to match.',
+      'Drop a chromosome back on the spread to return it. Drag empty space to pan.',
+    ],
+  },
+  {
+    id: PLUCK_OVERLAP_LEVEL,
+    label: '8',
+    title: 'Overlap',
+    description: 'Pluck each chromosome off the spread. Some outlines take a neighbor with them.',
+    pointers: [
+      'The outline you grab is the piece you get. Some outlines include a neighbor.',
+      'A piece that includes a neighbor does not belong in a pair.',
+      'Drop a chromosome back on the spread to return it. Drag empty space to pan.',
+    ],
+  },
 ] as const;
 
-export const GAMEPLAY_LEVELS = [MATCH_LEVEL, PAIR_LEVEL, ARRANGE_LEVEL, LABEL_MATE_LEVEL, LABEL_ALL_LEVEL] as const;
+export const GAMEPLAY_LEVELS = [MATCH_LEVEL, PAIR_LEVEL, ARRANGE_LEVEL, LABEL_MATE_LEVEL, LABEL_ALL_LEVEL, PLUCK_ARRANGE_LEVEL, PLUCK_OVERLAP_LEVEL] as const;
+
+/** Pluck starts with an empty tray; chromosomes join it as they are plucked off the spread. */
+export function isPluckLevel(levelId: number): boolean {
+  return levelId === PLUCK_ARRANGE_LEVEL || levelId === PLUCK_OVERLAP_LEVEL;
+}
 
 /** Match and Pair show chromosomes already flipped and rotated. Arrange does not. */
 export function isPresetOrientationLevel(levelId: number): boolean {

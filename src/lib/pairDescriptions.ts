@@ -1,4 +1,4 @@
-import { isStandardPairId, normalizePairId, STANDARD_PAIR_IDS } from './chromosomePairs';
+import { isPairLabel, isStandardPairId, normalizePairId, STANDARD_PAIR_IDS } from './chromosomePairs';
 
 export const PAIR_DESCRIPTION_CSV_HEADERS = ['Chromosomal Pair Number', 'Description'] as const;
 
@@ -25,7 +25,7 @@ interface CsvRecord {
 /** "01" and "x" become "1" and "X". Blank input stays blank. */
 export function normalizeCsvPairId(raw: string): string {
   const trimmed = raw.trim();
-  if (!trimmed || trimmed === 'Unassigned') return '';
+  if (!isPairLabel(trimmed)) return '';
   if (/^\d+$/.test(trimmed)) {
     const n = parseInt(trimmed, 10);
     if (!Number.isFinite(n)) return '';
@@ -112,7 +112,7 @@ export function customPairIdsFromXml(xmlDocuments: string[]): string[] {
   for (const xml of xmlDocuments) {
     for (const match of xml.matchAll(/label="([^"]*)"/g)) {
       const pairId = normalizeCsvPairId(match[1] ?? '');
-      if (!pairId || pairId === 'Unassigned' || isStandardPairId(pairId) || known.has(pairId)) continue;
+      if (!isPairLabel(pairId) || isStandardPairId(pairId) || known.has(pairId)) continue;
       known.add(pairId);
       seen.push(pairId);
     }
